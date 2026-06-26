@@ -379,12 +379,60 @@ def test_f5_cycles_watch_health_favorites(config_path):
             app.action_cycle_utility()  # -> Health
             await pilot.pause()
             assert app.query_one("#main").current == "health-view"
+            app.action_cycle_utility()  # -> Logs
+            await pilot.pause()
+            assert app.query_one("#main").current == "logs-view"
             app.action_cycle_utility()  # -> Favorites
             await pilot.pause()
             assert app.query_one("#main").current == "favorites-view"
             app.action_cycle_utility()  # -> back to Watch
             await pilot.pause()
             assert app.query_one("#main").current == "monitor-view"
+
+    asyncio.run(run())
+
+
+def test_logs_surface_renders_and_filters(config_path):
+    import logging as _logging
+
+    from radio_app.logging_setup import get_ring_handler
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            ring = get_ring_handler()
+            assert ring is not None
+            # Emit one INFO and one WARNING record through the root logger.
+            log = _logging.getLogger("radio_app.test")
+            log.info("hello info")
+            log.warning("careful warning")
+            await pilot.pause()
+            # Opening the Logs surface shows the feed and clears the peak badge.
+            app._show_logs()
+            await pilot.pause()
+            assert app.query_one("#main").current == "logs-view"
+            assert ring.peak_level() == 0  # reset on view
+            # /loglevel error hides the INFO/WARNING rows.
+            app._set_log_level("error")
+            await pilot.pause()
+            assert app._logs_min_level == _logging.ERROR
+
+    asyncio.run(run())
+
+
+def test_log_badge_appears_for_warning(config_path):
+    import logging as _logging
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # No badge initially (peak below WARNING after startup view).
+            app._select_mode("js8call")
+            _logging.getLogger("radio_app.test").error("boom")
+            await pilot.pause()
+            assert "ERR" in app._log_badge_markup()
 
     asyncio.run(run())
 

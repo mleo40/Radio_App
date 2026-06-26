@@ -55,14 +55,18 @@ def test_configure_logging_no_console_when_file_disabled(tmp_path):
     root.addHandler(logging.StreamHandler())  # pretend a lib added one
     try:
         # File logging off + no stderr (the TUI case): no console handler should
-        # survive, and a NullHandler keeps Python's lastResort from firing.
+        # survive. The in-memory ring handler is always installed (feeding the
+        # Logs surface) and also keeps Python's lastResort from firing, so no
+        # NullHandler is needed.
         logging_setup.configure_logging(_fresh_config(tmp_path, file=""), stderr=False)
         assert not any(
             isinstance(h, logging.StreamHandler)
             and not isinstance(h, logging.FileHandler)
             for h in root.handlers
         )
-        assert any(isinstance(h, logging.NullHandler) for h in root.handlers)
+        assert any(
+            isinstance(h, logging_setup.RingBufferHandler) for h in root.handlers
+        )
     finally:
         _reset_logging()
 

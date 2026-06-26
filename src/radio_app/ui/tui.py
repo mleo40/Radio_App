@@ -1,8 +1,8 @@
 """Textual terminal UI (TUI) for Radio_App — a single pane of glass.
 
 A persistent **mode selector** (top bar) is the primary control: each configured
-transport is one operating **mode** with its own workspace, plus two utility
-views — **Watch** and **Health**. Selecting a mode re-skins the workspace and
+transport is one operating **mode** with its own workspace, plus utility views —
+**Watch**, **Health** and **Logs**. Selecting a mode re-skins the workspace and
 binds sending to that transport. See DESIGN.md for the full model.
 
 Surfaces:
@@ -15,19 +15,24 @@ Surfaces:
   mode to its transport.
 * HEALTH (verify): passive per-transport reachability probes (no transmission) —
   "can we reach rnsd / the JS8Call API / the modem socket right now?".
+* LOGS (diagnose): a live, level-filterable view of the in-memory application
+  log (follow/pause). A WARN/ERR badge in the status bar flags new problems and
+  jumps here when clicked.
 
 Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ unknown.
 
 Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
-       F5 = cycle Watch/Health/Favorites   Ctrl+R = refresh
+       F5 = cycle Watch/Health/Logs/Favorites   Ctrl+R = refresh
        Ctrl+C / Ctrl+Q / q = quit
 Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
-  /favorites,  /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
+  /favorites,  /logs,  /loglevel <level>,  /browse <hash>[:/page/x.mu],
+  /nodes,  /peers,  /help,  /quit
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
 import os
 from collections import deque
 from datetime import UTC, datetime, timedelta
@@ -725,6 +730,12 @@ class RadioTUI(App):
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
     #health-log { height: 1fr; padding: 0 1; }
+    #logs-view { height: 1fr; }
+    #logs-bar { height: 1; }
+    #logs-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #logs-spacer { width: 1fr; height: 1; }
+    #logs-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #logs-log { height: 1fr; padding: 0 1; }
     #favorites-view { height: 1fr; }
     #fav-help { height: auto; color: $text-muted; padding: 0 1; }
     #fav-bar { height: 1; padding: 0 1; }
@@ -876,6 +887,12 @@ class RadioTUI(App):
         # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
         # endpoint up/down), shown under its line on the Health board.
         self._winlink_paths: list[dict] = []
+        # Logs surface state. ``_logs_min_level`` is the severity floor the live
+        # log feed renders at (cycled by the Level button / set by /loglevel).
+        # ``_logs_paused`` freezes the live feed so the operator can scroll back
+        # without new lines pushing the view.
+        self._logs_min_level = logging.INFO
+        self._logs_paused = False
 
     # -- layout ---------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -977,6 +994,20 @@ class RadioTUI(App):
                 yield RichLog(
                     id="health-log", wrap=True, markup=True, highlight=False
                 )
+            with Vertical(id="logs-view"):
+                with Horizontal(id="logs-bar"):
+                    yield Static(
+                        "Logs - live application log (in-memory). "
+                        "[F5] cycle · '/loglevel <level>' to filter.",
+                        id="logs-help",
+                    )
+                    yield Static("", id="logs-spacer")
+                    yield Button("\u23f8 Pause", id="logs-pause", classes="modebtn")
+                    yield Button("\u2191 Level", id="logs-level", classes="modebtn")
+                    yield Button("\u2716 Clear", id="logs-clear", classes="modebtn")
+                yield RichLog(
+                    id="logs-log", wrap=True, markup=True, highlight=False
+                )
             with Vertical(id="favorites-view"):
                 yield Static(
                     "Favorites - saved NomadNet servers, callsigns, JS8Call "
@@ -1033,6 +1064,10 @@ class RadioTUI(App):
         # Passively probe each transport's reachability for the health dots.
         self.set_interval(5.0, self._refresh_health)
         self.call_after_refresh(self._refresh_health)
+        # Keep the live Logs feed flowing and the status-bar WARN/ERR badge
+        # current even when the operator is on another surface.
+        self.set_interval(1.0, self._refresh_logs)
+        self.set_interval(2.0, self._update_status)
         self.call_after_refresh(self._initial_flow)
         # Start transports in the background so the UI is interactive immediately
         # — a slow/unreachable transport (e.g. an offline JS8Call host whose TCP
@@ -1822,6 +1857,18 @@ class RadioTUI(App):
             self.action_health()
         elif bid == "view-favorites":
             self._show_favorites()
+        elif bid == "view-logs":
+            self.action_logs()
+        elif bid == "logs-pause":
+            self._toggle_logs_pause()
+        elif bid == "logs-level":
+            self._cycle_log_level()
+        elif bid == "logs-clear":
+            ring = self._log_ring()
+            if ring is not None:
+                ring.clear()
+            self._render_logs()
+            self._update_status()
         elif bid == "watch-pause":
             self._toggle_watch_pause()
         elif bid == "watch-sort":
@@ -1913,12 +1960,13 @@ class RadioTUI(App):
         self._update_status()
 
     def action_cycle_utility(self) -> None:
-        """Cycle the utility surfaces with F5: Watch -> Health -> Favorites.
+        """Cycle the utility surfaces with F5: Watch -> Health -> Logs -> Favorites.
 
         From an operating (chat/NomadNet) mode, F5 jumps into the cycle at
-        Watch. Pressing it again advances Watch -> Health -> Favorites -> Watch.
+        Watch. Pressing it again advances Watch -> Health -> Logs -> Favorites
+        -> Watch.
         """
-        order = ["monitor", "health", "favorites"]
+        order = ["monitor", "health", "logs", "favorites"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -1927,6 +1975,8 @@ class RadioTUI(App):
             self._show_watch()
         elif nxt == "health":
             self._show_health()
+        elif nxt == "logs":
+            self._show_logs()
         else:
             self._show_favorites()
 
@@ -1942,6 +1992,150 @@ class RadioTUI(App):
         self._render_health()
         self._refresh_health()
         self._update_modebar()
+        self._update_status()
+
+    # -- logs surface ---------------------------------------------------------
+
+    # Severity floors the Logs surface can cycle through (with the Level button).
+    _LOG_LEVELS = (
+        logging.DEBUG,
+        logging.INFO,
+        logging.WARNING,
+        logging.ERROR,
+    )
+
+    def action_logs(self) -> None:
+        """Open the Logs surface directly (used by the Logs chip / status badge)."""
+        self._show_logs()
+
+    def _show_logs(self) -> None:
+        """Show the Logs surface: the live, in-memory application log feed.
+
+        Viewing the logs is treated as "acknowledging" any WARN/ERR that has
+        accumulated, so the status-bar badge resets when the surface is opened.
+        """
+        self.view = "logs"
+        self.query_one("#main", ContentSwitcher).current = "logs-view"
+        self._enable_composer(False)
+        ring = self._log_ring()
+        if ring is not None:
+            ring.reset_peak()
+        self._render_logs()
+        self._update_logs_buttons()
+        self._update_modebar()
+        self._update_status()
+
+    def _log_ring(self):
+        """Return the process-wide in-memory log handler, or None if absent."""
+        from ..logging_setup import get_ring_handler
+
+        return get_ring_handler()
+
+    def _log_level_colour(self, level_no: int) -> str:
+        if level_no >= logging.ERROR:
+            return "red"
+        if level_no >= logging.WARNING:
+            return "yellow"
+        if level_no >= logging.INFO:
+            return "green"
+        return "dim"
+
+    def _render_logs(self) -> None:
+        """Render the retained log records at/above the current severity floor."""
+        try:
+            log = self.query_one("#logs-log", RichLog)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        log.clear()
+        ring = self._log_ring()
+        if ring is None:
+            log.write("[dim]In-memory logging is not active.[/dim]")
+            return
+        records = ring.snapshot(self._logs_min_level)
+        if not records:
+            level_name = logging.getLevelName(self._logs_min_level)
+            log.write(
+                f"[dim]No log records at {level_name} or above yet.[/dim]"
+            )
+            return
+        for r in records:
+            ts = datetime.fromtimestamp(r.created).strftime("%H:%M:%S")
+            colour = self._log_level_colour(r.level_no)
+            log.write(
+                f"[dim]{ts}[/dim] [{colour}]{r.level_name:<7}[/{colour}] "
+                f"[dim]{r.name}:[/dim] {r.message}"
+            )
+
+    def _refresh_logs(self) -> None:
+        """Timer hook: redraw the Logs feed when visible and not paused.
+
+        Re-rendering the whole bounded buffer is cheap and side-steps tracking a
+        per-record cursor; pausing simply skips the redraw so the operator can
+        scroll back without the view jumping.
+        """
+        if self.view != "logs" or self._logs_paused:
+            return
+        self._render_logs()
+
+    def _update_logs_buttons(self) -> None:
+        """Sync the Logs toolbar labels with the pause + level-filter state."""
+        try:
+            pause = self.query_one("#logs-pause", Button)
+            level = self.query_one("#logs-level", Button)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        pause.label = "\u25b6 Follow" if self._logs_paused else "\u23f8 Pause"
+        level.label = f"\u2191 {logging.getLevelName(self._logs_min_level)}"
+
+    def _cycle_log_level(self) -> None:
+        """Advance the Logs severity floor (DEBUG -> INFO -> WARNING -> ERROR)."""
+        idx = (
+            self._LOG_LEVELS.index(self._logs_min_level)
+            if self._logs_min_level in self._LOG_LEVELS
+            else 1
+        )
+        self._logs_min_level = self._LOG_LEVELS[
+            (idx + 1) % len(self._LOG_LEVELS)
+        ]
+        self._update_logs_buttons()
+        self._render_logs()
+        self._update_status()
+
+    def _toggle_logs_pause(self) -> None:
+        self._logs_paused = not self._logs_paused
+        self._update_logs_buttons()
+        if not self._logs_paused:
+            self._render_logs()
+
+    def _set_log_level(self, arg: str) -> None:
+        """Handle ``/loglevel [<level>]``: set the Logs severity floor.
+
+        With no argument, reports the current floor. Accepts DEBUG/INFO/WARNING
+        (or WARN)/ERROR, case-insensitively.
+        """
+        arg = arg.strip().upper()
+        if not arg:
+            self._log_system(
+                "Log filter: "
+                f"{logging.getLevelName(self._logs_min_level)}. "
+                "Usage: /loglevel <debug|info|warning|error>"
+            )
+            return
+        alias = {"WARN": "WARNING", "ERR": "ERROR"}
+        arg = alias.get(arg, arg)
+        level = logging.getLevelName(arg)
+        if not isinstance(level, int):
+            self._log_system(
+                f"unknown level: {arg} (use debug|info|warning|error)"
+            )
+            return
+        self._logs_min_level = level
+        if self.view == "logs":
+            self._update_logs_buttons()
+            self._render_logs()
+        else:
+            self._show_logs()
+        self._log_system(f"Log filter set to {arg}.")
         self._update_status()
 
     def _transport_identity(self, t) -> str:
@@ -3257,6 +3451,8 @@ class RadioTUI(App):
                 btn.set_class(self.view == "monitor", "-active")
             elif bid == "view-health":
                 btn.set_class(self.view == "health", "-active")
+            elif bid == "view-logs":
+                btn.set_class(self.view == "logs", "-active")
             elif bid == "view-favorites":
                 btn.set_class(self.view == "favorites", "-active")
         self._update_input_indicator()
@@ -4015,6 +4211,7 @@ class RadioTUI(App):
         bar.mount(Static("", id="modebar-spacer"))
         bar.mount(Button("\u25f7 Watch", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
+        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
@@ -4861,6 +5058,7 @@ class RadioTUI(App):
                 "/favorites (F6), /mode (cycle, like F3), "
                 "/fav add|rm|list|only [<id> [label]], "
                 "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
+                "/logs, /loglevel <debug|info|warning|error>, "
                 "/channel list|add <index> <#name> [secret], "
                 "/freq [<MHz|Hz>], /band [<name>], "
                 "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
@@ -4892,6 +5090,10 @@ class RadioTUI(App):
             self._show_watch()
         elif cmd in ("/favorites", "/favs"):
             self._show_favorites()
+        elif cmd == "/logs":
+            self._show_logs()
+        elif cmd in ("/loglevel", "/loglvl"):
+            self._set_log_level(arg)
         elif cmd == "/mode":
             # Typed convenience: cycle modes just like the F3 key.
             self.action_choose_mode()
@@ -5136,6 +5338,27 @@ class RadioTUI(App):
         who = f"{name} {shown}" if name else shown
         return f"{who} ({sec})"
 
+    def _log_badge_markup(self) -> str:
+        """Status-bar WARN/ERR badge from the in-memory log's peak severity.
+
+        Shows nothing while the Logs surface is open (the operator is already
+        looking at them, and opening it clears the peak). Clicking the badge
+        jumps straight to the Logs surface.
+        """
+        if self.view == "logs":
+            return ""
+        ring = self._log_ring()
+        if ring is None:
+            return ""
+        peak = ring.peak_level()
+        if peak >= logging.ERROR:
+            label, colour = "ERR", "red"
+        elif peak >= logging.WARNING:
+            label, colour = "WARN", "yellow"
+        else:
+            return ""
+        return f"    [@click=app.logs()][{colour}]\u26a0 {label}[/{colour}][/]"
+
     def _update_status(self) -> None:
         if self.core is None:
             return
@@ -5169,9 +5392,10 @@ class RadioTUI(App):
         else:
             filt = ""
         counter = self._compose_counter_markup()
+        badge = self._log_badge_markup()
         self.query_one("#statusbar", Static).update(
             f" view: {self.view}    mode: {mode}{ident_part}    target: {target}    "
-            f"up: {up}{filt}{counter}"
+            f"up: {up}{filt}{badge}{counter}"
         )
 
 def run(config_path: str | None = None) -> None:
