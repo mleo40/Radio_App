@@ -2,6 +2,46 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Offline NomadNet page cache + "sync favorites now"
+
+**Requested:** 2026-06-26
+**Status:** Queued
+**Area:** `core/nomadnet.py`, `core/store.py` (or new `core/nomad_cache.py`),
+`core/favorites.py`, `ui/tui.py`, `cli.py`
+
+Sync NomadNet pages locally so favorite nodes are viewable offline, with a
+"sync favorites now" action to pull the latest once Reticulum is back up. The
+pieces already exist: `NomadnetBrowser.fetch()` returns a `PageResult` with the
+decoded micron `content` (a clean seam to cache), favorites already tag NomadNet
+servers via `Favorite.kind == "node"`, the TUI NomadNet surface has node lists +
+an F4 favorites filter + an `f`/"Save node" binding, and the Reticulum transport
+now auto-reconnects (so a sync can fire when the stack comes online).
+
+**Sketch of work:**
+1. **Page cache** — a small `nomad_pages(dest, path, content, fetched_at, ok)`
+   table (PK `(dest, path)`) in the existing SQLite DB, or a dedicated
+   `core/nomad_cache.py`.
+2. **Wire caching into `fetch()`** — upsert `content` on every successful fetch;
+   add an `allow_cache`/`prefer_cache` flag so that when offline (or a live fetch
+   fails) it serves the cached page, clearly flagged with its `fetched_at` age.
+3. **`sync_favorites()`** — iterate `favorites.all()` filtered to `kind == "node"`,
+   fetch each node's `/page/index.mu` (optionally follow same-node `/page/*.mu`
+   links one level deep), cache the results, return `(ok, failed, skipped)`.
+4. **Surfaces** — TUI "Sync favorites now" button/action in the NomadNet view
+   (optionally auto-run on reconnect, opt-in via config); CLI `radioapp nomad
+   sync`, plus a transparent cache fallback for `browse`/the viewer when the link
+   can't be opened (e.g. `--offline`).
+
+**Caveats / scope decisions:**
+- **Dynamic pages** (rendered from `field_data` `var=value`) only cache a single
+  snapshot — label them as such; static `/page/*.mu` pages are the real win.
+- **Link-following depth** — default to index-only (cheap); deeper mirroring
+  multiplies link round-trips, expensive over LoRa, so make it opt-in.
+- **Staleness** — cached views must visibly show their `fetched_at` age so a
+  cached page is never mistaken for live.
+- **No change-detection** — NomadNet can't signal that a page changed, so sync is
+  a manual/periodic pull; "latest" means "as of the last sync."
+
 ## Past-chats history view + searchable message archive
 
 **Requested:** 2026-06-26
