@@ -2,6 +2,44 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Past-chats history view + searchable message archive
+
+**Requested:** 2026-06-26
+**Status:** Queued
+**Area:** `core/store.py`, `cli.py`, `ui/tui.py`
+
+Give users a way to browse and search their full conversation history offline.
+The foundation already exists: every message from every transport is normalized
+to a `UnifiedMessage` and persisted in one SQLite table (`conversations.db` →
+`messages`), with `sender, recipient, group, content, transport, status,
+metadata, timestamp` indexed by `(thread_key, timestamp)`. This is a
+read/query feature, not a data-model change.
+
+**Possibilities (rough easiest → most involved):**
+1. **CLI history/search** — `radioapp history [--thread <key>] [--mode <transport>]
+   [--since/--until] [--limit N]` and `radioapp search "<text>" [--from <sender>]
+   [--mode] [--since ...]`. Thin layer over `MessageStore`; immediately useful
+   offline.
+2. **Full-text search (FTS5)** — add a SQLite FTS5 virtual table mirroring
+   `content` (+ sender/group), synced via triggers/on-insert, for fast ranked
+   queries with `snippet()` highlighting. FTS5 ships with Python's `sqlite3` (no
+   new dependency).
+3. **TUI history/search surface** — a search box (`/search <text>` or a `Ctrl+F`
+   palette) listing matches with mode + timestamp that jump into the thread at the
+   hit; plus a cross-mode "All chats" archive view (the thread list scopes by
+   transport — this is the superset) with mode/date/group/unread filters and
+   lazy-loaded scroll-back for huge threads.
+4. **Richer filters** — query by captured `metadata` (SNR, hops, frequency,
+   delivery status), date-bucketed "jump to date", per-contact stats.
+5. **Export/backup** — `radioapp export --thread <key> --format {json,txt,md,
+   maildir}` and a global `export --all`.
+6. **Retention/housekeeping** — optional age/size-based pruning, per-thread
+   "keep forever" pins, and VACUUM so history doesn't bloat small devices.
+
+**Suggested sequencing:** start with #1 (CLI history+search) over `MessageStore`,
+add #2 (FTS5) under the same query API as volume grows, then surface it in the
+TUI (#3).
+
 ## Reticulum file transfer (attachments)
 
 **Requested:** 2026-06-26
