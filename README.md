@@ -533,6 +533,8 @@ The router, message model, selection, filtering, persistence and UI are untouche
 - **NomadNet node hosting** (publishing pages). Read-only **page viewing is
   implemented** — see below.
 - **Desktop GUI** + visual config editor over the same single config file.
+  See [`docs/gui_mockup.svg`](docs/gui_mockup.svg) for an early concept mockup
+  (illustrative only — not yet implemented).
 
 See [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md) for the queued feature backlog.
 
