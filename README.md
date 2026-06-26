@@ -330,6 +330,9 @@ radioapp winlink gateways         # list nearby RMS gateways via Pat
 radioapp winlink connect [CALL]   # run a Winlink session (send outbox, get mail)
 radioapp winlink forms            # list installed Winlink form templates
 radioapp winlink forms-update     # download the latest standard forms
+radioapp js8 inbox                # list JS8Call's store-and-forward inbox
+radioapp js8 cmd W1AW SNR?        # send a directed command to a station
+radioapp js8 relay W1AW "qsy 40m" # leave a store-and-forward message for W1AW
 radioapp send --to N0CALL --mode secure --encrypt "x"  # guarded on HF
 ```
 
@@ -366,6 +369,11 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     **SNR?**, **HEARING?**, **STATUS?**, **INFO?**. Open a callsign to ask one
     station, or an `@GROUP` to ask the whole group (the target prefix is added
     for you, e.g. `@TTP SNR?`).
+  - **JS8Call inbox & relay:** `/inbox` lists the messages JS8Call is holding
+    for **store-and-forward** relay; `/relay <CALL> <text>` leaves a message
+    JS8Call forwards when it next hears that station; and `/cmd [<CALL>] <SNR?|
+    GRID?|INFO?|…>` sends any JS8 directed command (the same set is available
+    from the CLI: `radioapp js8 inbox|cmd|relay`).
   - **All-messages view:** when **no** callsign or `@group` is selected, the
     JS8 window shows a live **firehose of every JS8Call message** (across all
     conversations) instead of an empty pane, so you can watch the band at a

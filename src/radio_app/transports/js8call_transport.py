@@ -52,6 +52,9 @@ _JS8_COMMANDS = (
     "STATUS?", "STATUS", "HEARING?", "HEARING", "QSL?", "QSL",
     "AGN?", "ACK", "NACK", "73", "YES", "NO",
 )
+# Directed commands the operator may *send* to a station/group (e.g. "W1AW SNR?").
+# JS8Call encodes these in the message text; we transmit them via TX.SEND_MESSAGE.
+JS8_DIRECTED_COMMANDS = frozenset(_JS8_COMMANDS)
 # Decibel value following an SNR token in a report, e.g. "... SNR -07" -> -7.
 _SNR_VALUE_RE = re.compile(r"SNR[\s:]*([+-]?\d{1,2})", re.IGNORECASE)
 
@@ -295,6 +298,9 @@ class JS8CallTransport(Transport):
         # Fuller rig snapshot from STATION.STATUS (submode/speed + selected call).
         self._speed: str = ""
         self._selected_call: str = ""
+        # JS8Call's store-and-forward inbox, refreshed on demand via
+        # INBOX.GET_MESSAGES and cached from the INBOX.MESSAGES reply.
+        self._inbox: list[dict] = []
 
     def set_identity(self, callsign: str, groups: tuple[str, ...] = ()) -> None:
         """Update the local callsign/groups used for inbound address routing.
@@ -473,6 +479,80 @@ class JS8CallTransport(Transport):
             "cat": dial is not None,
         }
 
+    # -- inbox (store-and-forward relay) --------------------------------------
+
+    async def request_inbox(self) -> bool:
+        """Ask JS8Call for its stored inbox messages (reply updates the cache)."""
+        return await self._send_api({"type": "INBOX.GET_MESSAGES", "value": ""})
+
+    def inbox_messages(self) -> list[dict]:
+        """Last-known JS8Call inbox as ``[{"id","from","to","text","utc"}]``."""
+        return list(self._inbox)
+
+    async def store_relay_message(self, callsign: str, text: str) -> bool:
+        """Leave a store-and-forward message for ``callsign`` in JS8Call's inbox.
+
+        JS8Call relays it on the air when it next hears that station (its native
+        store-and-forward messaging). Returns True once handed to JS8Call.
+        """
+        call = (callsign or "").strip().upper()
+        body = (text or "").strip()
+        if not call or not body:
+            return False
+        return await self._send_api(
+            {
+                "type": "INBOX.STORE_MESSAGE",
+                "params": {"CALLSIGN": call, "TEXT": body},
+            }
+        )
+
+    def _update_inbox(self, params: dict) -> None:
+        """Cache the JS8Call inbox from an INBOX.MESSAGES reply.
+
+        JS8Call returns ``params["MESSAGES"]`` as a list; each entry carries the
+        stored message fields (directly, or nested under its own ``params``). We
+        normalise to ``{"id","from","to","text","utc"}``.
+        """
+        raw = params.get("MESSAGES")
+        if not isinstance(raw, list):
+            return
+        out: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            fields = item.get("params") if isinstance(
+                item.get("params"), dict
+            ) else item
+            out.append({
+                "id": str(fields.get("_ID") or fields.get("ID") or ""),
+                "from": str(fields.get("FROM") or "").upper(),
+                "to": str(fields.get("TO") or "").upper(),
+                "text": str(fields.get("TEXT") or fields.get("MESSAGE") or ""),
+                "utc": fields.get("UTC"),
+            })
+        self._inbox = out
+
+    # -- directed commands ----------------------------------------------------
+
+    async def send_directed_command(self, target: str, command: str) -> bool:
+        """Transmit a JS8Call directed command (e.g. ``SNR?``) to a station/group.
+
+        JS8Call encodes directed commands in the message text (``CALL CMD``); we
+        validate the token against :data:`JS8_DIRECTED_COMMANDS` and transmit it
+        via TX.SEND_MESSAGE. ``target`` is a callsign or ``@GROUP``. Returns True
+        once handed to JS8Call.
+        """
+        tgt = (target or "").strip().upper()
+        cmd = (command or "").strip().upper()
+        if not tgt:
+            return False
+        if cmd not in JS8_DIRECTED_COMMANDS:
+            log.warning("JS8Call: unknown directed command %r", command)
+            return False
+        return await self._send_api(
+            {"type": "TX.SEND_MESSAGE", "value": f"{tgt} {cmd}"}
+        )
+
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
             return False
@@ -517,6 +597,11 @@ class JS8CallTransport(Transport):
         if etype == "STATION.STATUS":
             self._update_freq(params)
             self._update_status(params)
+            return
+        # Store-and-forward inbox: cache the reply to our INBOX.GET_MESSAGES so
+        # the UI can list messages JS8Call is holding for relay.
+        if etype == "INBOX.MESSAGES":
+            self._update_inbox(params)
             return
         # Track stations we hear for the reachability heuristic, and surface a
         # presence "announce" (like RNS) when a station resurfaces, so the UI's

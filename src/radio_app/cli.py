@@ -128,6 +128,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_wl.set_defaults(func=_cmd_winlink)
 
+    p_js8 = sub.add_parser(
+        "js8", help="JS8Call utilities (inbox / directed commands / relay)"
+    )
+    p_js8.add_argument(
+        "action",
+        choices=["inbox", "cmd", "relay"],
+        help="inbox: list JS8Call's stored messages; cmd: send a directed "
+        "command (e.g. SNR?) to a station; relay: leave a store-and-forward "
+        "message for a station",
+    )
+    p_js8.add_argument(
+        "target", nargs="?", help="callsign or @GROUP for 'cmd'/'relay'"
+    )
+    p_js8.add_argument(
+        "rest",
+        nargs="*",
+        help="command token for 'cmd' (e.g. SNR?), or message text for 'relay'",
+    )
+    p_js8.set_defaults(func=_cmd_js8)
+
     p_fav = sub.add_parser(
         "favorites",
         help="manage favorite peers (callsigns / RNS hex hashes) for alerts",
@@ -855,6 +875,82 @@ def _cmd_winlink(args: argparse.Namespace) -> int:
         return 0
 
     return _run(_with_app(args.config, run))
+
+
+def _cmd_js8(args: argparse.Namespace) -> int:
+    """JS8Call utilities: read the inbox, send directed commands, leave relays.
+
+    Requires a running JS8Call with its TCP/JSON API enabled (default
+    127.0.0.1:2442). Everything here is passive except 'cmd'/'relay', which
+    transmit on the air per JS8Call's normal turn-taking.
+    """
+    import asyncio as _asyncio
+
+    async def run(app: App) -> int:
+        t = next((x for x in app.transports if x.name == "js8call"), None)
+        if t is None:
+            print(
+                "JS8Call transport is not enabled. Add a [transports.js8call] "
+                "block (run 'radioapp setup')."
+            )
+            return 1
+        if not getattr(t, "running", False):
+            print(
+                "JS8Call API is not reachable. Start JS8Call and enable its API "
+                "(File → Settings → Reporting → API)."
+            )
+            return 1
+
+        if args.action == "inbox":
+            await t.request_inbox()
+            await _asyncio.sleep(1.5)  # let the async INBOX.MESSAGES reply land
+            msgs = t.inbox_messages()
+            if not msgs:
+                print("JS8Call inbox is empty.")
+                return 0
+            print(f"JS8Call inbox ({len(msgs)}):")
+            for m in msgs:
+                who = f"{m['from'] or '?'} -> {m['to'] or '?'}"
+                print(f"  [{who}] {m['text']}")
+            return 0
+
+        if args.action == "cmd":
+            if not args.target or not args.rest:
+                print("usage: radioapp js8 cmd <CALL|@GROUP> <SNR?|GRID?|...>")
+                return 1
+            command = args.rest[0]
+            ok = await t.send_directed_command(args.target, command)
+            if not ok:
+                print(
+                    f"Could not send '{command}'. Known commands: "
+                    + ", ".join(sorted(_js8_known_commands()))
+                )
+                return 1
+            print(f"Sent directed command: {args.target.upper()} {command.upper()}")
+            return 0
+
+        # relay
+        if not args.target or not args.rest:
+            print("usage: radioapp js8 relay <CALL> <message text>")
+            return 1
+        text = " ".join(args.rest)
+        ok = await t.store_relay_message(args.target, text)
+        if not ok:
+            print("Could not store the relay message.")
+            return 1
+        print(
+            f"Stored relay message for {args.target.upper()} — JS8Call will "
+            "forward it when it next hears that station."
+        )
+        return 0
+
+    return _run(_with_app(args.config, run))
+
+
+def _js8_known_commands() -> frozenset[str]:
+    from .transports.js8call_transport import JS8_DIRECTED_COMMANDS
+
+    return JS8_DIRECTED_COMMANDS
 
 
 def _cmd_favorites(args: argparse.Namespace) -> int:

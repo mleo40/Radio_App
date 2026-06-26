@@ -2881,6 +2881,71 @@ class RadioTUI(App):
         self._send(f"{name}?")
 
     @work
+    async def _js8_show_inbox(self) -> None:
+        """``/inbox`` — list the messages JS8Call is holding for store-and-forward."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        await t.request_inbox()
+        await asyncio.sleep(1.2)  # let the async INBOX.MESSAGES reply land
+        msgs = t.inbox_messages()
+        if not msgs:
+            self._log_system("JS8Call inbox is empty.")
+            return
+        self._log_system(f"JS8Call inbox ({len(msgs)}):")
+        for m in msgs:
+            who = f"{m['from'] or '?'} \u2192 {m['to'] or '?'}"
+            self._log_system(f"  [{who}] {m['text']}")
+
+    @work
+    async def _js8_relay(self, arg: str) -> None:
+        """``/relay <CALL> <text>`` — leave a store-and-forward message in JS8Call."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            self._log_system("usage: /relay <CALL> <message text>")
+            return
+        call, body = parts[0], parts[1]
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        if await t.store_relay_message(call, body):
+            self._log_system(
+                f"Stored relay for {call.upper()} \u2014 JS8Call will forward it "
+                "when it next hears that station."
+            )
+        else:
+            self._log_system("Could not store the relay message.")
+
+    @work
+    async def _js8_directed_cmd(self, arg: str) -> None:
+        """``/cmd [<CALL|@GROUP>] <COMMAND>`` — send a JS8 directed command."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        parts = arg.split()
+        if len(parts) == 1 and self.current_target:
+            target, command = self.current_target, parts[0]
+        elif len(parts) >= 2:
+            target, command = parts[0], parts[1]
+        else:
+            self._log_system("usage: /cmd [<CALL|@GROUP>] <SNR?|GRID?|INFO?|...>")
+            return
+        if await t.send_directed_command(target, command):
+            self._log_system(f"Sent directed command: {target.upper()} "
+                             f"{command.upper()}")
+        else:
+            self._log_system(f"Unknown/failed JS8 command: {command}")
+
+    @work
     async def _js8_set_freq(self, hz: int) -> None:
         """Move the radio's dial via JS8Call (requires CAT/rig control there)."""
         t = self._js8_transport()
@@ -3736,6 +3801,7 @@ class RadioTUI(App):
                 "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
                 "/channel list|add <index> <#name> [secret], "
                 "/freq [<MHz|Hz>], /band [<name>], "
+                "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
                 "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
                 "/attach <path>, /save, "
                 "/name <friendly name>, /close [<id>], "
@@ -3786,6 +3852,12 @@ class RadioTUI(App):
             self._handle_freq_command(arg)
         elif cmd == "/band":
             self._handle_band_command(arg)
+        elif cmd == "/inbox":
+            self._js8_show_inbox()
+        elif cmd == "/relay":
+            self._js8_relay(arg)
+        elif cmd == "/cmd":
+            self._js8_directed_cmd(arg)
         elif cmd in ("/name", "/rename"):
             self._set_friendly_name(arg)
         elif cmd in ("/close", "/delete"):
