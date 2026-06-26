@@ -440,6 +440,25 @@ def test_send_auto_connect_triggers_session(fake_pat):
     assert state.connects == ["telnet"]
 
 
+def test_outbox_count_reflects_queued_messages(fake_pat):
+    state, url = fake_pat
+
+    async def run():
+        t = _transport(url, connect="telnet")
+        await t.start()
+        empty = await t.outbox_count()
+        # Queue two messages (no auto-connect) so they stay in the outbox.
+        await t.send(UnifiedMessage.direct("N0CALL", "W1AW", "one"))
+        await t.send(UnifiedMessage.direct("N0CALL", "K2XYZ", "two"))
+        queued = await t.outbox_count()
+        await t.stop()
+        return empty, queued
+
+    empty, queued = asyncio.run(run())
+    assert empty == 0
+    assert queued == 2
+
+
 # -- inbound polling ----------------------------------------------------------
 
 def test_inbox_poll_emits_new_message(fake_pat):

@@ -364,12 +364,21 @@ def test_subject_md_empty_for_non_winlink_or_no_subject():
 def test_winlink_event_progress_formats_percent():
     ev = {"Progress": {"bytes_transferred": 50, "bytes_total": 200,
                        "subject": "Net Report", "sending": True}}
-    assert RadioTUI._format_winlink_event(ev) == "Winlink tx: 25% Net Report"
+    assert RadioTUI._format_winlink_event(ev) == (
+        "Winlink \u2191 send 25% of 200B: Net Report"
+    )
 
 
 def test_winlink_event_progress_done():
     ev = {"Progress": {"receiving": True, "subject": "Mail", "done": True}}
-    assert RadioTUI._format_winlink_event(ev) == "Winlink rx: done Mail"
+    assert RadioTUI._format_winlink_event(ev) == "Winlink \u2193 recv done: Mail"
+
+
+def test_winlink_event_progress_no_subject():
+    ev = {"Progress": {"sending": True, "done": True}}
+    assert RadioTUI._format_winlink_event(ev) == (
+        "Winlink \u2191 send done: (no subject)"
+    )
 
 
 def test_winlink_event_status_connected_and_dialing():
@@ -378,7 +387,7 @@ def test_winlink_event_status_connected_and_dialing():
     ) == "Winlink: dialing\u2026"
     assert RadioTUI._format_winlink_event(
         {"Status": {"connected": True, "remote_addr": "KW1U"}}
-    ) == "Winlink: connected KW1U"
+    ) == "Winlink: connected to KW1U"
     # An idle status update is suppressed.
     assert RadioTUI._format_winlink_event({"Status": {"connected": False}}) is None
 
@@ -386,10 +395,55 @@ def test_winlink_event_status_connected_and_dialing():
 def test_winlink_event_notification_and_unknown():
     assert RadioTUI._format_winlink_event(
         {"Notification": {"title": "Done", "body": "1 sent"}}
-    ) == "Winlink: Done \u2014 1 sent"
+    ) == "Winlink \U0001f4e8 Done \u2014 1 sent"
     # Bookkeeping events produce no line.
     assert RadioTUI._format_winlink_event({"Ping": True}) is None
     assert RadioTUI._format_winlink_event({"UpdateMailbox": True}) is None
+
+
+def test_winlink_event_logline_is_surfaced_dim():
+    # Pat's live log transcript is surfaced (dim) for verbose session feedback.
+    out = RadioTUI._format_winlink_event(
+        {"LogLine": "Connecting to telnet://cms.winlink.org ..."}
+    )
+    assert out is not None
+    assert "pat" in out
+    assert "Connecting to telnet" in out
+    # Blank log lines are suppressed.
+    assert RadioTUI._format_winlink_event({"LogLine": "   "}) is None
+
+
+def test_winlink_live_gate_hides_replayed_log_until_session_starts():
+    # Pat replays old LogLines to a new WS client before the session begins;
+    # they must be hidden until a live Status/Progress event marks the session.
+    state = {"live": False}
+    # Historical backlog arrives first -> suppressed.
+    assert RadioTUI._winlink_event_is_live(
+        {"LogLine": "2026/06/26 10:00:00 old session line"}, state
+    ) is False
+    # Pat's initial idle status doesn't make it live.
+    assert RadioTUI._winlink_event_is_live(
+        {"Status": {"connected": False, "dialing": False}}, state
+    ) is True  # non-LogLine events always pass
+    assert state["live"] is False
+    # The live session starts (dialing) -> flips live True.
+    assert RadioTUI._winlink_event_is_live(
+        {"Status": {"dialing": True}}, state
+    ) is True
+    assert state["live"] is True
+    # Now live LogLines are shown.
+    assert RadioTUI._winlink_event_is_live(
+        {"LogLine": "Connected to CMS"}, state
+    ) is True
+
+
+def test_winlink_live_gate_progress_also_triggers_live():
+    state = {"live": False}
+    assert RadioTUI._winlink_event_is_live({"LogLine": "old"}, state) is False
+    # A Progress push (live-only event) also marks the session live.
+    RadioTUI._winlink_event_is_live({"Progress": {"sending": True}}, state)
+    assert state["live"] is True
+    assert RadioTUI._winlink_event_is_live({"LogLine": "tx ..."}, state) is True
 
 
 # -- forms composer (picker + fill screens) ----------------------------------

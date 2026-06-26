@@ -704,6 +704,15 @@ class WinlinkTransport(Transport):
             return None
         return {str(e.get("MID", "")).strip() for e in data if e.get("MID")}
 
+    async def outbox_count(self) -> int | None:
+        """How many messages are queued in Pat's outbox (None if unknown).
+
+        Used by the UI to report how many messages a session will try to send,
+        and (by comparing before/after) how many actually went out.
+        """
+        mids = await self._outbox_mids()
+        return None if mids is None else len(mids)
+
     async def _reconcile_outbox(self) -> None:
         """Emit a delivery receipt for any tracked message that left the outbox.
 

@@ -3550,11 +3550,40 @@ class RadioTUI(App):
                     "it's idle during this RF session so it doesn't key over Winlink."
                 )
         self._log_system(f"Winlink: connecting via {target} \u2026")
+        # Report how many messages are queued to send, so the operator knows a
+        # send is expected (and we can summarise how many actually went out).
+        queued_before: int | None = None
+        if hasattr(t, "outbox_count"):
+            try:
+                queued_before = await t.outbox_count()
+            except Exception:  # noqa: BLE001
+                queued_before = None
+        if queued_before:
+            self._log_system(
+                f"Winlink: {queued_before} message(s) queued to send."
+            )
+        elif queued_before == 0:
+            self._log_system("Winlink: outbox empty — checking for new mail.")
         # Best-effort live progress from Pat's WebSocket while the session runs.
         stop = asyncio.Event()
         stream_task = None
+        # Track per-message transfers seen so we can summarise send/receive even
+        # if Pat's final counts are terse.
+        seen: dict[str, set[str]] = {"sent": set(), "recv": set()}
+        # Suppress Pat's replayed log backlog (it tails its log file to new WS
+        # clients) until the session is actually live.
+        log_state: dict[str, bool] = {"live": False}
         if hasattr(t, "stream_events"):
             def _on_event(ev: dict) -> None:
+                if not self._winlink_event_is_live(ev, log_state):
+                    return
+                prog = ev.get("Progress")
+                if isinstance(prog, dict) and prog.get("done"):
+                    mid = str(prog.get("mid") or "").strip()
+                    if prog.get("sending"):
+                        seen["sent"].add(mid or f"s{len(seen['sent'])}")
+                    elif prog.get("receiving"):
+                        seen["recv"].add(mid or f"r{len(seen['recv'])}")
                 line = self._format_winlink_event(ev)
                 if line:
                     self._log_system(line)
@@ -3581,9 +3610,30 @@ class RadioTUI(App):
             # Release the radio claim taken for this RF session.
             if session_rf and self.core is not None:
                 self.core.radio_interlock.release("winlink")
+        # Work out how many messages actually went out: the outbox delta is the
+        # authoritative "sent" count (forwarded messages leave the outbox); fall
+        # back to the per-message transfers we watched stream by.
+        queued_after: int | None = None
+        if hasattr(t, "outbox_count"):
+            try:
+                queued_after = await t.outbox_count()
+            except Exception:  # noqa: BLE001
+                queued_after = None
+        if queued_before is not None and queued_after is not None:
+            sent = max(0, queued_before - queued_after)
+        else:
+            sent = len(seen["sent"])
+        # connect_now's NumReceived is authoritative for received; cross-check
+        # with the transfers we saw.
+        got = max(int(received or 0), len(seen["recv"]))
         self._log_system(
-            f"Winlink session done \u2014 {received} message(s) received."
+            f"\u2713 Winlink session complete \u2014 sent {sent}, received {got}."
         )
+        if queued_after:
+            self._log_system(
+                f"[dim]Winlink: {queued_after} message(s) still queued "
+                "(not forwarded this session).[/dim]"
+            )
         self._refresh_active_pane()
 
     async def _winlink_password_prompt(self, prompt: dict) -> str | None:
@@ -3612,39 +3662,73 @@ class RadioTUI(App):
             return None
 
     @staticmethod
-    def _format_winlink_event(ev: dict) -> str | None:
-        """Turn one Pat ``/ws`` event into a concise progress line (or None).
+    def _winlink_event_is_live(ev: dict, state: dict) -> bool:
+        """Filter Pat's replayed log backlog from genuine live session events.
 
-        Only the events worth surfacing during a session are formatted;
-        idle status pings and bookkeeping events return ``None`` (suppressed).
+        When a WebSocket client connects, Pat *tails its log file* and replays
+        recent historical lines (``LogLine``) before the session begins — that's
+        old data, not this session. Real-time events (``Status`` dialing/connected
+        and ``Progress``) are pushed live, never replayed, so the first of those
+        marks the session as live (``state['live'] = True``). LogLines are shown
+        only once live; every non-LogLine event always passes. (Timestamps in the
+        log can't be trusted to filter — the Pat host's clock/timezone may differ
+        from ours.)
+        """
+        status = ev.get("Status")
+        if isinstance(status, dict) and (
+            status.get("dialing") or status.get("connected")
+        ):
+            state["live"] = True
+        if ev.get("Progress") is not None or ev.get("Notification") is not None:
+            state["live"] = True
+        if "LogLine" in ev:
+            return bool(state.get("live"))
+        return True
+
+    @staticmethod
+    def _format_winlink_event(ev: dict) -> str | None:
+        """Turn one Pat ``/ws`` event into a progress line (or None to suppress).
+
+        Surfaces the session in detail: per-message transfer progress (with an
+        up/down arrow for send vs receive), connection state, notifications, and
+        the live Pat log transcript (``LogLine``) so the operator sees exactly
+        what the session is doing. Keepalive pings and mailbox-changed events are
+        suppressed.
         """
         prog = ev.get("Progress")
         if isinstance(prog, dict):
-            subj = str(prog.get("subject") or "").strip()
-            verb = (
-                "rx" if prog.get("receiving")
-                else ("tx" if prog.get("sending") else "")
-            )
+            subj = str(prog.get("subject") or "").strip() or "(no subject)"
+            if prog.get("sending"):
+                arrow, verb = "\u2191", "send"
+            elif prog.get("receiving"):
+                arrow, verb = "\u2193", "recv"
+            else:
+                arrow, verb = "\u2022", ""
+            head = f"Winlink {arrow} {verb}".rstrip()
             if prog.get("done"):
-                return f"Winlink {verb}: done {subj}".rstrip()
+                return f"{head} done: {subj}"
             total = int(prog.get("bytes_total") or 0)
             xfer = int(prog.get("bytes_transferred") or 0)
-            amount = f"{(100 * xfer // total)}%" if total else f"{xfer}B"
-            return f"Winlink {verb}: {amount} {subj}".rstrip()
+            amount = f"{(100 * xfer // total)}% of {total}B" if total else f"{xfer}B"
+            return f"{head} {amount}: {subj}"
         status = ev.get("Status")
         if isinstance(status, dict):
             if status.get("dialing"):
                 return "Winlink: dialing\u2026"
             if status.get("connected"):
                 ra = str(status.get("remote_addr") or "").strip()
-                return f"Winlink: connected {ra}".rstrip()
+                return f"Winlink: connected{(' to ' + ra) if ra else ''}"
             return None
         note = ev.get("Notification")
         if isinstance(note, dict):
             text = " \u2014 ".join(
                 x for x in (note.get("title"), note.get("body")) if x
             )
-            return f"Winlink: {text}" if text else None
+            return f"Winlink \U0001f4e8 {text}" if text else None
+        # The live Pat log transcript — the verbose, Pat-terminal-style detail.
+        line = ev.get("LogLine")
+        if isinstance(line, str) and line.strip():
+            return f"[dim]pat\u2502 {line.strip()}[/dim]"
         return None
 
     @work(exclusive=True)
