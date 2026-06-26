@@ -160,7 +160,8 @@ def test_winlink_transport_helper_returns_instance(config_path):
             await pilot.pause()
             t = app._winlink_transport()
             assert t is not None and t.name == "winlink"
-            assert t.build_connect_url() == "telnet://"
+            # Telnet with no gateway uses Pat's 'telnet' alias (CMS, with target).
+            assert t.build_connect_url() == "telnet"
 
     asyncio.run(run())
 
@@ -389,6 +390,120 @@ def test_winlink_event_notification_and_unknown():
     # Bookkeeping events produce no line.
     assert RadioTUI._format_winlink_event({"Ping": True}) is None
     assert RadioTUI._format_winlink_event({"UpdateMailbox": True}) is None
+
+
+# -- forms composer (picker + fill screens) ----------------------------------
+
+_FORMS = [
+    {"name": "ICS213", "folder": "ICS", "path": "ICS/ICS213.txt"},
+    {"name": "Radiogram", "folder": "Welfare", "path": "Welfare/Rgram.txt"},
+    {"name": "Check-in", "folder": "Welfare", "path": "Welfare/Checkin.txt"},
+]
+
+
+def test_forms_filter_is_case_insensitive_substring():
+    from radio_app.ui.tui import WinlinkFormsScreen
+
+    f = WinlinkFormsScreen.filter_forms
+    assert len(f(_FORMS, "")) == 3                 # empty -> all
+    assert [x["name"] for x in f(_FORMS, "rgram")] == ["Radiogram"]   # by path
+    assert {x["name"] for x in f(_FORMS, "welfare")} == {
+        "Radiogram", "Check-in",
+    }                                              # by folder
+    assert f(_FORMS, "nope") == []
+
+
+def test_winlink_forms_button_present_in_bar(config_path):
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+            from textual.widgets import Button
+
+            assert app.query_one("#winlink-forms", Button) is not None
+
+    asyncio.run(run())
+
+
+def test_forms_picker_selection_dismisses_with_path(config_path):
+    from radio_app.ui.tui import WinlinkFormsScreen
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            picked = {}
+            app.push_screen(
+                WinlinkFormsScreen(_FORMS), lambda v: picked.update(v=v)
+            )
+            await pilot.pause()
+            screen = app.screen
+            # Filter narrows the list; selecting index 0 returns its path.
+            from textual.widgets import Input
+
+            screen.query_one("#wlf-filter", Input).value = "checkin"
+            await pilot.pause()
+            assert len(screen._visible) == 1
+            screen.on_list_view_selected(
+                type("E", (), {"list_view": type("L", (), {"index": 0})()})()
+            )
+            await pilot.pause()
+            assert picked["v"] == "Welfare/Checkin.txt"
+
+    asyncio.run(run())
+
+
+def test_compose_form_screen_builds_result(config_path):
+    from radio_app.ui.tui import WinlinkComposeFormScreen
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.push_screen(WinlinkComposeFormScreen("ICS/ICS213.txt", ["city"]))
+            await pilot.pause()
+            screen = app.screen
+            from textual.widgets import Input
+
+            screen.query_one("#wcf-f-city", Input).value = "Boston"
+            screen.query_one("#wcf-to", Input).value = "W1AW"
+            # Subject/Cc left blank -> None (form's computed values win).
+            result = screen._build_result()
+            assert result == {
+                "template": "ICS/ICS213.txt",
+                "responses": {"city": "Boston"},
+                "to": "W1AW",
+                "cc": None,
+                "subject": None,
+            }
+
+    asyncio.run(run())
+
+
+def test_winlink_open_forms_reports_when_none_installed(config_path):
+    """Pressing Forms with Pat unreachable surfaces a helpful system message."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+            logged: list[str] = []
+            app._log_system = lambda m: logged.append(m)  # type: ignore
+            app._winlink_open_forms()
+            # Let the worker run (list_forms fails fast against the dead port).
+            for _ in range(50):
+                await pilot.pause()
+                if any("form" in m.lower() for m in logged):
+                    break
+            assert any(
+                "No Winlink forms" in m or "catalog" in m.lower() for m in logged
+            )
+
+    asyncio.run(run())
+
 
 
 

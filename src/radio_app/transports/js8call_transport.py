@@ -58,6 +58,68 @@ JS8_DIRECTED_COMMANDS = frozenset(_JS8_COMMANDS)
 # Decibel value following an SNR token in a report, e.g. "... SNR -07" -> -7.
 _SNR_VALUE_RE = re.compile(r"SNR[\s:]*([+-]?\d{1,2})", re.IGNORECASE)
 
+# --- JS8 -> SMS (APRS-IS gateway) -------------------------------------------
+# JS8Call can relay APRS messages through its built-in ``@APRSIS`` gateway. The
+# free SMSGTE service (https://smsgte.org) turns an APRS message into a phone
+# text: address the message to the callsign ``SMSGTE`` with a body of
+# ``@<phone> <text>``. JS8Call's on-air syntax to inject a raw APRS message is:
+#
+#     @APRSIS CMD :<ADDRESSEE>:<aprs message body>
+#
+# where ``<ADDRESSEE>`` is the recipient callsign left-justified and padded to
+# exactly 9 characters (APRS message format). So an SMS to 12025550133 reading
+# "on my way" becomes:
+#
+#     @APRSIS CMD :SMSGTE   :@12025550133 on my way
+JS8_APRS_GATEWAY = "@APRSIS"
+SMS_GATEWAY_CALLSIGN = "SMSGTE"
+# Keep the whole frame within JS8Call's practical directed-message length so the
+# gateway address + phone + text don't get silently truncated on the air.
+_SMS_MAX_TEXT = 60
+_PHONE_RE = re.compile(r"[^\d+]")
+
+
+def _aprs_addressee(callsign: str) -> str:
+    """APRS message addressee field: callsign upper-cased, padded to 9 chars."""
+    return f"{callsign.strip().upper():<9}"[:9]
+
+
+def normalize_phone(phone: str) -> str:
+    """Reduce a phone number to digits (keeping a single leading ``+``).
+
+    Accepts human formats like ``(202) 555-0133`` or ``+1 202-555-0133`` and
+    returns ``2025550133`` / ``+12025550133``. Raises ``ValueError`` when no
+    digits remain.
+    """
+    raw = (phone or "").strip()
+    plus = raw.startswith("+")
+    digits = _PHONE_RE.sub("", raw).lstrip("+")
+    if not digits:
+        raise ValueError("phone number has no digits")
+    return ("+" + digits) if plus else digits
+
+
+def format_js8_sms(
+    phone: str, text: str, *, gateway: str = SMS_GATEWAY_CALLSIGN
+) -> str:
+    """Build the JS8Call API ``value`` that relays ``text`` to ``phone`` as SMS.
+
+    Pure (no sockets) so it is unit-tested directly. The result is the exact
+    string handed to JS8Call's ``TX.SEND_MESSAGE`` to inject an APRS message to
+    the SMSGTE gateway. Raises ``ValueError`` on an empty phone or message.
+    """
+    number = normalize_phone(phone)
+    body = " ".join((text or "").split())  # collapse whitespace/newlines
+    if not body:
+        raise ValueError("SMS text is empty")
+    if len(body) > _SMS_MAX_TEXT:
+        log.warning(
+            "JS8 SMS text exceeds %d chars (%d); JS8Call/SMSGTE may truncate it.",
+            _SMS_MAX_TEXT,
+            len(body),
+        )
+    return f"{JS8_APRS_GATEWAY} CMD :{_aprs_addressee(gateway)}:@{number} {body}"
+
 
 def _extract_command(params: dict, text: str) -> tuple[str | None, dict]:
     """Detect a JS8Call directed command in an event and parse its value.
@@ -328,6 +390,7 @@ class JS8CallTransport(Transport):
             address_scheme="callsign",
             carries_operator_identity=True,  # must ID with callsign on the air
             prohibits_encryption=True,       # encryption prohibited on amateur HF
+            uses_shared_radio=True,          # drives the one HF radio (sound+CAT+PTT)
         )
 
     async def start(self) -> None:
@@ -553,6 +616,21 @@ class JS8CallTransport(Transport):
         return await self._send_api(
             {"type": "TX.SEND_MESSAGE", "value": f"{tgt} {cmd}"}
         )
+
+    async def send_sms(self, phone: str, text: str) -> bool:
+        """Relay ``text`` to a phone number as SMS via JS8Call's APRS gateway.
+
+        Injects an APRS message to the SMSGTE gateway (``@APRSIS CMD
+        :SMSGTE   :@<phone> <text>``) through ``TX.SEND_MESSAGE``. Requires
+        JS8Call's APRS gateway/reporting to be enabled. Returns True once handed
+        to JS8Call, False on a malformed number/empty text or write failure.
+        """
+        try:
+            value = format_js8_sms(phone, text)
+        except ValueError as exc:
+            log.warning("JS8Call SMS not sent: %s", exc)
+            return False
+        return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
 
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:

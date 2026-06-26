@@ -317,7 +317,10 @@ def test_rf_method_reports_no_internet():
 
 def test_connect_url_telnet_default():
     t = _transport("http://x", connect="telnet")
-    assert t.build_connect_url() == "telnet://"
+    # Telnet with no gateway uses Pat's 'telnet' alias (expands to the full CMS
+    # URL with a target callsign) — a bare 'telnet://' has no target and Pat
+    # rejects it with "Invalid or missing target callsign".
+    assert t.build_connect_url() == "telnet"
 
 
 def test_connect_url_rf_with_gateway():
@@ -329,6 +332,21 @@ def test_connect_url_raw_override_wins():
     t = _transport("http://x", connect="telnet", gateway="KW1U",
                    connect_url="ardop://N0XYZ?freq=7100")
     assert t.build_connect_url() == "ardop://N0XYZ?freq=7100"
+
+
+def test_connect_url_auto_telnet_uses_alias_not_bare_url():
+    # The auto-fallback path also uses the 'telnet' alias for the telnet method,
+    # so Pat doesn't reject it with "Invalid or missing target callsign".
+    t = _transport("http://x", connect="auto",
+                   connect_order=["telnet", "varahf"])
+    assert t._connect_url_for("telnet") == "telnet"
+    assert t._connect_url_for("varahf") == "varahf://"  # RF needs a gateway
+
+
+def test_connect_url_telnet_with_gateway_is_plain_url():
+    # An explicit telnet gateway (P2P) keeps the scheme://host form.
+    t = _transport("http://x", connect="telnet", gateway="host:8774")
+    assert t.build_connect_url() == "telnet://host:8774"
 
 
 def test_unknown_method_falls_back_to_telnet():
@@ -419,7 +437,7 @@ def test_send_auto_connect_triggers_session(fake_pat):
         await t.stop()
 
     asyncio.run(run())
-    assert state.connects == ["telnet://"]
+    assert state.connects == ["telnet"]
 
 
 # -- inbound polling ----------------------------------------------------------
@@ -604,7 +622,7 @@ def test_auto_falls_back_to_second_method(fake_pat):
 
     received = asyncio.run(run())
     assert received == 0
-    assert state.connects == ["telnet://", "varahf://"]  # tried in order
+    assert state.connects == ["telnet", "varahf://"]  # tried in order
 
 
 def test_auto_skips_unreachable_rf_then_uses_telnet(fake_pat):
@@ -619,7 +637,7 @@ def test_auto_skips_unreachable_rf_then_uses_telnet(fake_pat):
         await t.stop()
 
     asyncio.run(run())
-    assert state.connects == ["telnet://"]  # varahf never dialed (probe failed)
+    assert state.connects == ["telnet"]  # varahf never dialed (probe failed)
 
 
 def test_auto_raises_when_all_paths_fail(fake_pat):
@@ -638,6 +656,26 @@ def test_auto_raises_when_all_paths_fail(fake_pat):
             await t.stop()
 
     assert asyncio.run(run()) == "raised"
+
+
+def test_auto_failure_surfaces_pat_error_detail(fake_pat):
+    """The raised error includes Pat's HTTP status so the cause is diagnosable."""
+    state, url = fake_pat
+    state.fail_schemes = ["telnet"]
+
+    async def run():
+        t = _transport(url, connect="auto", connect_order=["telnet"])
+        await t.start()
+        try:
+            await t.connect_now()
+        finally:
+            await t.stop()
+
+    with pytest.raises(RuntimeError) as excinfo:
+        asyncio.run(run())
+    msg = str(excinfo.value)
+    assert "attempted: telnet" in msg
+    assert "HTTP 500" in msg  # Pat's real response, not just an opaque message
 
 
 def test_auto_capabilities_not_internet_only(fake_pat):
@@ -763,6 +801,158 @@ def test_compose_form_returns_none_when_not_running(fake_pat):
     built = asyncio.run(_transport(url).compose_form("ICS/ICS213.txt"))
     assert built is None
     assert state.outbox == []
+
+
+# -- CLI form entry points (compose-form / form preview) ---------------------
+
+def _wl_cli_cfg(tmp_path, url):
+    p = tmp_path / "config.toml"
+    p.write_text(
+        "[transports.winlink]\n"
+        "enabled = true\n"
+        f'pat_url = "{url}"\n'
+        'callsign = "N0CALL"\n'
+        'connect = "telnet"\n'
+        "[logging]\n"
+        'file = ""\n'
+    )
+    return str(p)
+
+
+def test_cli_form_preview_lists_fields(fake_pat, tmp_path, capsys):
+    from radio_app.cli import main
+
+    state, url = fake_pat
+    cfg = _wl_cli_cfg(tmp_path, url)
+    rc = main(["--config", cfg, "winlink", "form", "ICS/ICS213.txt"])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "Preview" in out          # template text echoed for review
+    assert "City" in out             # field detected from "<var City>"
+
+
+def test_cli_compose_form_queues_and_previews(fake_pat, tmp_path, capsys):
+    from radio_app.cli import main
+
+    state, url = fake_pat
+    cfg = _wl_cli_cfg(tmp_path, url)
+    rc = main([
+        "--config", cfg, "winlink", "compose-form", "ICS/ICS213.txt",
+        "--field", "city=Boston", "--to", "W1AW",
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "To      : W1AW" in out          # override surfaced
+    assert "ICS213 report" in out           # computed subject
+    assert "City: Boston" in out            # response fed through
+    assert "outbox" in out                  # review/queue guidance
+    # Queued in Pat's outbox WITH the form XML attachment (cookie correlation).
+    assert len(state.outbox) == 1
+    assert state.outbox[0]["Files"][0]["Name"] == "RMS_Express_Form_ICS213.xml"
+
+
+def test_cli_compose_form_responses_file(fake_pat, tmp_path, capsys):
+    from radio_app.cli import main
+
+    state, url = fake_pat
+    cfg = _wl_cli_cfg(tmp_path, url)
+    rfile = tmp_path / "responses.json"
+    rfile.write_text(json.dumps({"city": "Boston"}))
+    rc = main([
+        "--config", cfg, "winlink", "compose-form", "ICS/ICS213.txt",
+        "--responses", str(rfile),
+    ])
+    out = capsys.readouterr().out
+    assert rc == 0
+    assert "City: Boston" in out
+    assert len(state.outbox) == 1
+
+
+def test_cli_compose_form_requires_template(fake_pat, tmp_path, capsys):
+    from radio_app.cli import main
+
+    state, url = fake_pat
+    cfg = _wl_cli_cfg(tmp_path, url)
+    rc = main(["--config", cfg, "winlink", "compose-form"])
+    assert rc == 2
+    assert "template path" in capsys.readouterr().err
+    assert state.outbox == []
+
+
+def test_cli_compose_form_bad_field_errors(fake_pat, tmp_path, capsys):
+    from radio_app.cli import main
+
+    state, url = fake_pat
+    cfg = _wl_cli_cfg(tmp_path, url)
+    rc = main([
+        "--config", cfg, "winlink", "compose-form", "ICS/ICS213.txt",
+        "--field", "noequals",
+    ])
+    assert rc == 2
+    assert "KEY=VALUE" in capsys.readouterr().err
+    assert state.outbox == []
+
+
+def test_tui_forms_flow_queues_to_outbox(fake_pat, tmp_path):
+    """Full TUI flow: pick a form, fill it, and confirm it lands in Pat's outbox."""
+    pytest.importorskip("textual")
+    from textual.widgets import Input
+
+    from radio_app.transports.base import TRANSPORT_REGISTRY
+    from radio_app.ui.tui import (
+        RadioTUI,
+        WinlinkComposeFormScreen,
+        WinlinkFormsScreen,
+    )
+
+    state, url = fake_pat
+    TRANSPORT_REGISTRY.pop("mercury", None)
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[general]\ndisplay_name = 'T'\n[logging]\nfile = ''\n"
+        "[transports.winlink]\nenabled = true\n"
+        f'pat_url = "{url}"\ncallsign = "N0CALL"\nconnect = "telnet"\n'
+    )
+
+    async def _wait(pilot, pred, tries=150):
+        for _ in range(tries):
+            await pilot.pause()
+            if pred():
+                return True
+        return False
+
+    async def run():
+        app = RadioTUI(str(cfg))
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            # Wait for the transport to come up (compose_form needs it running).
+            assert await _wait(
+                pilot, lambda: getattr(app._winlink_transport(), "running", False)
+            )
+            app._winlink_open_forms()
+            # 1) Forms picker appears -> choose ICS213.
+            assert await _wait(
+                pilot, lambda: isinstance(app.screen, WinlinkFormsScreen)
+            )
+            app.screen.dismiss("ICS/ICS213.txt")
+            # 2) Compose screen appears -> fill the detected "City" field + To.
+            assert await _wait(
+                pilot, lambda: isinstance(app.screen, WinlinkComposeFormScreen)
+            )
+            app.screen.query_one("#wcf-f-City", Input).value = "Boston"
+            app.screen.query_one("#wcf-to", Input).value = "W1AW"
+            app.screen.dismiss(app.screen._build_result())
+            # 3) Worker calls compose_form -> queued to Pat's outbox with the XML.
+            assert await _wait(pilot, lambda: bool(state.outbox))
+            assert len(state.outbox) == 1
+            assert state.outbox[0]["Files"][0]["Name"] == (
+                "RMS_Express_Form_ICS213.xml"
+            )
+            assert state.posted[-1]["to"] == "W1AW"
+
+    asyncio.run(run())
+
 
 
 

@@ -67,6 +67,20 @@ from ..transports.js8call_transport import (
 from .about import ABOUT_MD
 
 
+def _cache_age(when: datetime | None) -> str:
+    """Coarse human age (``3m``/``5h``/``2d``) for a cached NomadNet page."""
+    if when is None:
+        return "?"
+    secs = max(0.0, (datetime.now(UTC) - when).total_seconds())
+    if secs < 90:
+        return f"{secs:.0f}s"
+    if secs < 5400:
+        return f"{secs / 60:.0f}m"
+    if secs < 172800:
+        return f"{secs / 3600:.0f}h"
+    return f"{secs / 86400:.0f}d"
+
+
 def _parse_freq_to_hz(text: str) -> int | None:
     """Parse a user-typed frequency into Hz.
 
@@ -190,6 +204,60 @@ class ConfirmEncryptScreen(ModalScreen[bool]):
 
 
 
+class PasswordPromptScreen(ModalScreen[str | None]):
+    """Masked, per-session password prompt (e.g. Winlink secure login).
+
+    The value is returned to the caller via ``dismiss`` and is never written to
+    disk or config — it lives only for the duration of the session that asked
+    for it. Submitting an empty field (or Cancel/Esc) declines the prompt.
+    """
+
+    CSS = """
+    PasswordPromptScreen { align: center middle; }
+    #pw-box {
+        width: 64; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #pw-msg { height: auto; }
+    #pw-hint { height: auto; color: $text-muted; }
+    #pw-input { height: 3; }
+    #pw-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message or "Enter password"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pw-box"):
+            yield Static(f"[b]{self._message}[/b]", id="pw-msg")
+            yield Static(
+                "[dim]Used for this session only — never saved to disk.[/dim]",
+                id="pw-hint",
+            )
+            yield Input(password=True, id="pw-input")
+            with Horizontal(id="pw-buttons"):
+                yield Button("Cancel", id="pw-cancel")
+                yield Button("Send", id="pw-ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#pw-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value or None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "pw-ok":
+            self.dismiss(self.query_one("#pw-input", Input).value or None)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+
 class BrowseScreen(ModalScreen[None]):
     """Read-only NomadNet page viewer with link navigation + history."""
 
@@ -201,13 +269,16 @@ class BrowseScreen(ModalScreen[None]):
     }
     #browse-addr { height: 1; color: $accent; }
     #browse-body { height: 1fr; border: solid $panel; padding: 0 1; }
-    #browse-status { height: 1; color: $text-muted; }
+    #browse-actions { height: 1; }
+    #browse-status { width: 1fr; height: 1; color: $text-muted; }
+    #browse-getlive { height: 1; min-width: 12; border: none; margin: 0 0 0 1; }
     #browse-input { height: 3; }
     """
     BINDINGS = [
         ("escape", "close", "Close"),
         ("ctrl+b", "back", "Back"),
         ("ctrl+r", "reload", "Reload"),
+        ("ctrl+l", "get_live", "Get live"),
     ]
 
     def __init__(
@@ -216,22 +287,28 @@ class BrowseScreen(ModalScreen[None]):
         dest: str,
         path: str = "/page/index.mu",
         fields: dict | None = None,
+        prefer_cache: bool = False,
     ) -> None:
         super().__init__()
         self._browser = browser
         self._current = (dest, path, fields or {})
         self._history: list[tuple[str, str, dict]] = []
         self._links: list = []
+        # When the stack is offline, serve cached snapshots directly instead of
+        # waiting on a live fetch that is doomed to time out.
+        self._prefer_cache = prefer_cache
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-box"):
             yield Static("", id="browse-addr")
             with VerticalScroll(id="browse-body"):
                 yield Static("", id="browse-content", markup=True)
-            yield Static("", id="browse-status")
+            with Horizontal(id="browse-actions"):
+                yield Static("", id="browse-status")
+                yield Button("\u21bb Get live", id="browse-getlive")
             yield Input(
                 placeholder="link # to follow · <hash>:/page/x.mu · "
-                "Ctrl+B back · Ctrl+R reload · Esc close",
+                "Ctrl+L live · Ctrl+B back · Ctrl+R reload · Esc close",
                 id="browse-input",
             )
 
@@ -241,17 +318,40 @@ class BrowseScreen(ModalScreen[None]):
 
     @work
     async def _load(
-        self, dest: str, path: str, fields: dict, push: bool = True
+        self, dest: str, path: str, fields: dict, push: bool = True,
+        force_live: bool = False,
     ) -> None:
         addr = self.query_one("#browse-addr", Static)
         status = self.query_one("#browse-status", Static)
         content = self.query_one("#browse-content", Static)
-        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
-        status.update("loading...")
-        res = await self._browser.fetch(dest, path, field_data=fields or None)
+        loc = f"[b]{(dest or '?')[:16]}[/]:{path}"
+        addr.update(f"[dim]\u2026 loading[/] {loc}")
+        # Default browsing is cache-first: a page we've already seen is served
+        # straight from the local cache (instant, zero traffic on the air), and
+        # only an uncached page hits the network. The "Get live" button (Ctrl+L)
+        # forces a fresh fetch when the operator actually wants the latest.
+        # Offline mode (``_prefer_cache``) stays cache-only; dynamic pages
+        # (field_data) can never be cached, so they always go live.
+        prefer = self._prefer_cache and not force_live
+        cache_first = not force_live and not prefer and not fields
+        if force_live:
+            status.update("loading (live)...")
+        elif prefer:
+            status.update("loading (cached)...")
+        elif cache_first:
+            status.update("loading (cache-first)...")
+        else:
+            status.update("loading...")
+        res = await self._browser.fetch(
+            dest, path, field_data=fields or None,
+            prefer_cache=prefer, cache_first=cache_first,
+        )
+        getlive = self.query_one("#browse-getlive", Button)
         if not res.ok:
+            addr.update(f"[b white on red] OFFLINE [/] {loc}")
             content.update(f"[red]Error:[/red] {res.error}")
-            status.update("failed")
+            status.update("[red]failed[/] — no live link and no cached copy")
+            getlive.display = False
             return
         # Canonicalise to the *resolved* full destination hash. The caller may
         # have passed a short prefix (node lists show truncated hashes; the
@@ -261,7 +361,17 @@ class BrowseScreen(ModalScreen[None]):
         # silently land on a *different* node that shares the prefix. Pinning to
         # the full hash keeps in-node links on the same node.
         dest = res.dest or dest
-        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
+        loc = f"[b]{(dest or '?')[:16]}[/]:{path}"
+        age = getattr(res, "fetched_at", None) if res.from_cache else None
+        if res.from_cache:
+            badge = (
+                f"[b black on yellow] CACHED {_cache_age(age)} [/]"
+                if age
+                else "[b black on yellow] CACHED [/]"
+            )
+        else:
+            badge = "[b black on green] LIVE [/]"
+        addr.update(f"{badge} {loc}")
         page = render_micron(res.content, base_dest=dest)
         content.update(page.markup or "[dim](empty page)[/dim]")
         self._links = page.links
@@ -271,7 +381,22 @@ class BrowseScreen(ModalScreen[None]):
         self.query_one("#browse-body", VerticalScroll).scroll_home(animate=False)
         nlinks = len(self._links)
         hint = " · type a number to follow" if nlinks else ""
-        status.update(f"ok · {nlinks} link(s){hint}")
+        if res.from_cache:
+            # Offer a one-press upgrade to the live page (only worthwhile online).
+            getlive.display = self._browser.available
+            stale = f" — fetched {_cache_age(age)} ago, may be stale" if age else ""
+            live_hint = " · Ctrl+L for live" if self._browser.available else ""
+            status.update(
+                f"[yellow]\u25cf cached[/]{stale} · {nlinks} link(s){hint}{live_hint}"
+            )
+        else:
+            getlive.display = False
+            status.update(f"[green]\u25cf live[/] · {nlinks} link(s){hint}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "browse-getlive":
+            event.stop()
+            self.action_get_live()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -286,6 +411,8 @@ class BrowseScreen(ModalScreen[None]):
             self.action_back()
         elif low in ("r", "reload"):
             self.action_reload()
+        elif low in ("l", "live"):
+            self.action_get_live()
         elif low in ("q", "quit", "close"):
             self.dismiss(None)
         else:
@@ -313,6 +440,188 @@ class BrowseScreen(ModalScreen[None]):
 
     def action_reload(self) -> None:
         self._load(*self._current, push=False)
+
+    def action_get_live(self) -> None:
+        """Force a live fetch of the current page, bypassing the cache."""
+        self._load(*self._current, push=False, force_live=True)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class WinlinkFormsScreen(ModalScreen["str | None"]):
+    """Picker for an installed Winlink form template.
+
+    Lists the flattened form catalog (folder/name) and returns the selected
+    template ``path`` (or ``None`` if cancelled). A small filter box narrows long
+    catalogs by substring.
+    """
+
+    CSS = """
+    WinlinkFormsScreen { align: center middle; }
+    #wlf-box {
+        width: 80; height: 80%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wlf-title { height: 1; }
+    #wlf-filter { height: 3; margin-bottom: 1; }
+    #wlf-list { height: 1fr; border: solid $panel; }
+    #wlf-hint { height: 1; color: $text-muted; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(self, forms: list[dict]) -> None:
+        super().__init__()
+        self._forms = forms
+        self._visible: list[dict] = list(forms)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="wlf-box"):
+            yield Static(
+                f"[b]Winlink forms[/b] ({len(self._forms)} installed)",
+                id="wlf-title",
+            )
+            yield Input(placeholder="filter (type to narrow)…", id="wlf-filter")
+            yield ListView(id="wlf-list")
+            yield Static(
+                "Enter/tap a form to fill it · Esc to cancel", id="wlf-hint"
+            )
+
+    def on_mount(self) -> None:
+        self._rebuild()
+        self.query_one("#wlf-filter", Input).focus()
+
+    def _rebuild(self) -> None:
+        lst = self.query_one("#wlf-list", ListView)
+        lst.clear()
+        for f in self._visible:
+            folder = f.get("folder") or ""
+            name = f.get("name") or f.get("path") or "?"
+            label = f"{folder}/{name}" if folder else name
+            lst.append(ListItem(Label(label)))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._visible = self.filter_forms(self._forms, event.value)
+        self._rebuild()
+
+    @staticmethod
+    def filter_forms(forms: list[dict], term: str) -> list[dict]:
+        """Forms whose name/folder/path contains ``term`` (case-insensitive)."""
+        term = term.strip().lower()
+        if not term:
+            return list(forms)
+        return [
+            f
+            for f in forms
+            if term in (f.get("name") or "").lower()
+            or term in (f.get("folder") or "").lower()
+            or term in (f.get("path") or "").lower()
+        ]
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in the filter selects the only/first remaining match.
+        if self._visible:
+            self.dismiss(self._visible[0]["path"])
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._visible):
+            self.dismiss(self._visible[idx]["path"])
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class WinlinkComposeFormScreen(ModalScreen["dict | None"]):
+    """Fill in a Winlink form: per-field inputs + To/Cc/Subject overrides.
+
+    Returns ``{"template", "responses", "to", "cc", "subject"}`` on submit (empty
+    overrides are sent as ``None`` so the form's computed values win), or ``None``
+    if cancelled. The actual build/queue (``compose_form``) is done by the app so
+    this screen stays a pure data collector.
+    """
+
+    CSS = """
+    WinlinkComposeFormScreen { align: center middle; }
+    #wcf-box {
+        width: 84; height: 90%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wcf-title { height: auto; margin-bottom: 1; }
+    #wcf-fields { height: 1fr; }
+    #wcf-fields Input { margin-bottom: 1; }
+    #wcf-fields Static { color: $text-muted; }
+    #wcf-error { height: auto; color: $error; }
+    #wcf-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(self, template_path: str, field_names: list[str]) -> None:
+        super().__init__()
+        self._template = template_path
+        self._fields = field_names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="wcf-box"):
+            yield Static(
+                f"[b]Compose form[/b]\n[dim]{self._template}[/dim]", id="wcf-title"
+            )
+            with VerticalScroll(id="wcf-fields"):
+                yield Static("[b]Message[/b] (override the form's defaults)")
+                yield Input(placeholder="To (address) — blank uses form default",
+                            id="wcf-to")
+                yield Input(placeholder="Cc — optional", id="wcf-cc")
+                yield Input(placeholder="Subject — blank uses form default",
+                            id="wcf-subject")
+                if self._fields:
+                    yield Static("[b]Fields[/b]")
+                    for name in self._fields:
+                        yield Input(placeholder=name, id=f"wcf-f-{name}")
+                else:
+                    yield Static(
+                        "(No prompt fields detected — submit to build with the "
+                        "form's defaults, or add fields the form asks for.)"
+                    )
+            yield Static("", id="wcf-error")
+            with Horizontal(id="wcf-buttons"):
+                yield Button("Cancel", id="wcf-cancel")
+                yield Button("Queue to outbox", id="wcf-submit", variant="primary")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#wcf-to", Input).focus()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "wcf-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "wcf-submit":
+            return
+        self.dismiss(self._build_result())
+
+    def _build_result(self) -> dict:
+        """Collect field responses + To/Cc/Subject overrides into a result dict.
+
+        Empty fields are dropped (so the form's defaults stand); empty overrides
+        become ``None`` so :meth:`compose_form` uses the form's computed values.
+        """
+        responses: dict[str, str] = {}
+        for name in self._fields:
+            val = self.query_one(f"#wcf-f-{name}", Input).value.strip()
+            if val:
+                responses[name] = val
+        to = self.query_one("#wcf-to", Input).value.strip()
+        cc = self.query_one("#wcf-cc", Input).value.strip()
+        subject = self.query_one("#wcf-subject", Input).value.strip()
+        return {
+            "template": self._template,
+            "responses": responses,
+            "to": to or None,
+            "cc": cc or None,
+            "subject": subject or None,
+        }
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -410,7 +719,8 @@ class RadioTUI(App):
     #nomadnet-view { height: 1fr; }
     #nomad-help { height: 1; color: $text-muted; padding: 0 1; }
     #nomad-bar { height: 1; padding: 0 1; }
-    #nomad-spacer { width: 1fr; }
+    #nomad-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #nomad-spacer { width: 1fr; height: 1; }
     #nomad-nodes { height: 1fr; }
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
@@ -438,6 +748,8 @@ class RadioTUI(App):
         ("f4", "toggle_fav_only", "Fav-only"),
         ("f5", "cycle_utility", "Watch/Health/Fav"),
         ("f", "toggle_nomad_favorite", "Save node"),
+        ("s", "sync_nomad", "Sync favs"),
+        ("g", "cycle_watch_group", "Group filter"),
         ("i", "identity", "My address"),
         ("ctrl+n", "announce", "Announce"),
         ("ctrl+p", "find_path", "Find path"),
@@ -477,6 +789,12 @@ class RadioTUI(App):
         # Close-chat only applies when a conversation is open in a chat mode.
         if action == "close_chat":
             return self.view == "active" and self.current_target is not None
+        # Sync favorite NomadNet pages: only on the NomadNet surface.
+        if action == "sync_nomad":
+            return self.view == "nomadnet"
+        # Cycle the Watch stream group filter: only on the Watch surface.
+        if action == "cycle_watch_group":
+            return self.view == "monitor"
         return True
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -496,6 +814,10 @@ class RadioTUI(App):
         # rebuilt when the favorites-only filter is toggled.
         self._monitor_msgs: list[UnifiedMessage] = []
         self._monitor_fav_only = False
+        # Watch stream group filter: when set to a group name, the feed is
+        # restricted to that group's cross-mode traffic. Mutually exclusive with
+        # the favorites-only filter (selecting one clears the other).
+        self._monitor_group_filter: str | None = None
         # Per-mode favorites-only filter: when on, the active mode's thread list
         # is restricted to conversations with favorite peers (F4 in chat modes).
         self._active_fav_only = False
@@ -582,11 +904,17 @@ class RadioTUI(App):
                             _band, id=f"js8-band-{_band}", classes="modebtn"
                         )
                     yield Button("\u21bb", id="js8-freq-refresh", classes="modebtn")
+                    yield Button(
+                        "\u2709 SMS", id="js8-sms", classes="modebtn"
+                    )
                 with Horizontal(id="winlink-bar"):
                     yield Static("Winlink", id="winlink-bar-label")
                     yield Static("", id="winlink-spacer")
                     yield Button(
                         "\u270e Subject", id="winlink-subject", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4cb Forms", id="winlink-forms", classes="modebtn"
                     )
                     yield Button(
                         "\U0001f4e1 Connect", id="winlink-connect", classes="modebtn"
@@ -619,6 +947,7 @@ class RadioTUI(App):
                         id="monitor-help",
                     )
                     yield Static("", id="watch-spacer")
+                    yield Button("\u25cb Group", id="watch-group", classes="modebtn")
                     yield Button("⏸ Pause", id="watch-pause", classes="modebtn")
                     yield Button("\u21c5 By mode", id="watch-sort", classes="modebtn")
                     yield Button("✖ Clear", id="watch-clear", classes="modebtn")
@@ -626,11 +955,15 @@ class RadioTUI(App):
             with Vertical(id="nomadnet-view"):
                 yield Static(
                     "NomadNet pages (read-only) — Enter/tap a node to browse, "
-                    "or type an address below. [f] save/unsave · [F4] favorites.",
+                    "or type an address below. [f] save/unsave · [s] sync favs · "
+                    "[F4] favorites.",
                     id="nomad-help",
                 )
                 with Horizontal(id="nomad-bar"):
                     yield Static("", id="nomad-spacer")
+                    yield Button(
+                        "\u21bb Sync favs", id="nomad-sync", classes="modebtn"
+                    )
                     yield Button(
                         "\u2605 Save/Unsave", id="nomad-fav", classes="modebtn"
                     )
@@ -677,7 +1010,7 @@ class RadioTUI(App):
 
         log_path = configure_logging(cfg, stderr=False)
         self.core = CoreApp(cfg)
-        await self.core.start()
+        # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
         self.title = f"Radio_App - {cfg.display_name}"
@@ -701,6 +1034,21 @@ class RadioTUI(App):
         self.set_interval(5.0, self._refresh_health)
         self.call_after_refresh(self._refresh_health)
         self.call_after_refresh(self._initial_flow)
+        # Start transports in the background so the UI is interactive immediately
+        # — a slow/unreachable transport (e.g. an offline JS8Call host whose TCP
+        # connect sits in a multi-second timeout) no longer delays first paint.
+        self._start_core()
+
+    @work
+    async def _start_core(self) -> None:
+        """Bring transports online without blocking the initial UI paint."""
+        if self.core is None:
+            return
+        await self.core.start()
+        # Reflect any transports that have now come up.
+        self._update_status()
+        self._update_modebar()
+        self.call_after_refresh(self._refresh_health)
 
     def watch_theme(self, theme: str) -> None:
         """Persist the theme/palette selection to the single config file."""
@@ -1368,11 +1716,65 @@ class RadioTUI(App):
 
     def _toggle_fav_only(self) -> None:
         self._monitor_fav_only = not self._monitor_fav_only
+        # Favorites and the group filter are mutually exclusive.
+        if self._monitor_fav_only:
+            self._monitor_group_filter = None
         self._rebuild_monitor()
         self._update_monitor_help()
+        self._update_watch_filter_buttons()
         state = "ON" if self._monitor_fav_only else "OFF"
         self._log_system(f"Monitor favorites-only filter: {state}")
         self._update_status()
+
+    def _cycle_watch_group(self) -> None:
+        """Cycle the Watch stream group filter: off -> group1 -> ... -> off.
+
+        Selecting a group clears the favorites filter (the two are mutually
+        exclusive). With no groups configured this is a no-op with a hint.
+        """
+        if self.core is None:
+            return
+        names = [g.name for g in self.core.groups.all()]
+        if not names:
+            self._log_system(
+                "No groups configured. Add one with "
+                "'radioapp group <name> add <transport:id>'."
+            )
+            return
+        current = self._monitor_group_filter
+        if current is None:
+            nxt: str | None = names[0]
+        else:
+            try:
+                idx = names.index(current)
+            except ValueError:
+                idx = -1
+            nxt = names[idx + 1] if idx + 1 < len(names) else None
+        self._monitor_group_filter = nxt
+        if nxt is not None:
+            self._monitor_fav_only = False
+        self._rebuild_monitor()
+        self._update_monitor_help()
+        self._update_watch_filter_buttons()
+        label = f"@{nxt}" if nxt else "OFF"
+        self._log_system(f"Monitor group filter: {label}")
+        self._update_status()
+
+    def action_cycle_watch_group(self) -> None:
+        """Cycle the Watch group filter (key 'g', Watch view only)."""
+        if self.view == "monitor":
+            self._cycle_watch_group()
+
+    def _update_watch_filter_buttons(self) -> None:
+        """Reflect the active group filter on the Watch bar's Group button."""
+        try:
+            btn = self.query_one("#watch-group", Button)
+        except Exception:  # noqa: BLE001 - button may not be mounted (tests)
+            return
+        if self._monitor_group_filter:
+            btn.label = f"\u25c9 @{self._monitor_group_filter}"
+        else:
+            btn.label = "\u25cb Group"
 
     def action_choose_mode(self) -> None:
         """Cycle to the next mode (no menu): each transport, then NomadNet."""
@@ -1424,10 +1826,14 @@ class RadioTUI(App):
             self._toggle_watch_pause()
         elif bid == "watch-sort":
             self._toggle_watch_sort()
+        elif bid == "watch-group":
+            self._cycle_watch_group()
         elif bid == "watch-clear":
             self._clear_watch()
         elif bid == "nomad-fav":
             self.action_toggle_nomad_favorite()
+        elif bid == "nomad-sync":
+            self.action_sync_nomad()
         elif bid == "mesh-fav":
             self._favorite_current_conversation()
         elif bid == "mesh-announce":
@@ -1438,10 +1844,14 @@ class RadioTUI(App):
             self._js8_switch_band(bid[len("js8-band-"):])
         elif bid == "js8-freq-refresh":
             self._js8_refresh_freq()
+        elif bid == "js8-sms":
+            self._js8_sms_prompt()
         elif bid.startswith("js8-query-"):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
             self._winlink_subject_prompt()
+        elif bid == "winlink-forms":
+            self._winlink_open_forms()
         elif bid == "winlink-connect":
             self._winlink_connect()
         elif bid == "winlink-gateways":
@@ -1456,6 +1866,7 @@ class RadioTUI(App):
         if self.core is None:
             return
         self.active_transport = name
+        self._update_radio_claim()
         self._show_active()
         self._apply_mode()
         self.query_one("#composer", Input).focus()
@@ -1497,6 +1908,7 @@ class RadioTUI(App):
         self._enable_composer(False)
         self._refresh_monitor_ticker()
         self._update_monitor_help()
+        self._update_watch_filter_buttons()
         self._update_modebar()
         self._update_status()
 
@@ -1531,6 +1943,150 @@ class RadioTUI(App):
         self._refresh_health()
         self._update_modebar()
         self._update_status()
+
+    def _transport_identity(self, t) -> str:
+        """Human description of the on-air identity a transport uses.
+
+        Callsign-carrying media (HF: js8call/winlink/mercury) identify with a
+        callsign — from the transport's own config if set, else the station
+        callsign. Anonymous media (Reticulum/MeshCore) expose a non-identifying
+        address via ``local_identity()``. Mirrors ``radioapp status``.
+        """
+        caps = t.capabilities()
+        if caps.carries_operator_identity:
+            own = ""
+            cfg = getattr(t, "config", None)
+            if isinstance(cfg, dict):
+                own = str(cfg.get("callsign", "") or "").strip()
+            callsign = own or (
+                self.core.station.callsign if self.core is not None else ""
+            )
+            if callsign:
+                return f"[dim]id:[/dim] callsign [b]{callsign}[/b]"
+            return "[dim]id:[/dim] callsign [yellow](unset — run setup)[/yellow]"
+        anon = None
+        getter = getattr(t, "local_identity", None)
+        if callable(getter):
+            try:
+                anon = getter()
+            except Exception:  # noqa: BLE001
+                anon = None
+        return f"[dim]id:[/dim] anonymous{f' ({anon})' if anon else ''}"
+
+    def _transport_endpoint(self, t) -> str | None:
+        """The control endpoint (host:port / URL) a transport dials, from config.
+
+        Shown on the Health board even when the transport is **down**, so the
+        operator can verify *where* the app is trying to connect (e.g. the
+        JS8Call TCP API host, or Pat's HTTP URL) without digging in the config.
+        Returns ``None`` for transports without a simple IP endpoint (Reticulum
+        rides rnsd's local RPC socket; MeshCore may be USB-serial).
+        """
+        cfg = getattr(t, "config", None)
+        if not isinstance(cfg, dict):
+            return None
+        if t.name == "js8call":
+            host = str(cfg.get("host", "127.0.0.1") or "127.0.0.1")
+            port = cfg.get("port", 2442)
+            return f"[dim]endpoint:[/dim] {host}:{port} [dim](JS8Call TCP API)[/dim]"
+        if t.name == "winlink":
+            url = str(cfg.get("pat_url", "http://127.0.0.1:8080") or "")
+            return f"[dim]endpoint:[/dim] {url} [dim](Pat HTTP API)[/dim]"
+        return None
+
+    # -- radio interlock (one HF radio, one transmitter) ----------------------
+
+    def _continuous_radio_modes(self) -> set[str]:
+        """Radio transports that hold the radio whenever their mode is active.
+
+        JS8Call/Mercury occupy the sound card + CAT continuously while in use, so
+        they claim the radio on mode entry. Winlink is excluded: it only keys the
+        radio during an RF *session*, so it claims per-session, not on mode entry.
+        """
+        out: set[str] = set()
+        if self.core is None:
+            return out
+        for t in self.core.transports:
+            try:
+                if t.capabilities().uses_shared_radio and t.name != "winlink":
+                    out.add(t.name)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _update_radio_claim(self) -> None:
+        """Sync the radio interlock token with the active mode (handoff on switch).
+
+        Entering a continuous radio mode (JS8Call/Mercury) claims the radio;
+        leaving it for a non-radio or Winlink mode releases that claim so a later
+        Winlink RF session can take the radio. Warns when more than one radio
+        transport is running and could key up over each other.
+        """
+        if self.core is None:
+            return
+        il = self.core.radio_interlock
+        name = self.active_transport or ""
+        continuous = self._continuous_radio_modes()
+        if name in continuous:
+            prev = il.transfer(name)
+            if prev and prev != name and prev in continuous:
+                self._log_system(f"\U0001f4fb radio: handed to {name} (was {prev}).")
+        else:
+            # Moving to Winlink / a non-radio mode frees a continuous holder.
+            holder = il.holder
+            if holder in continuous:
+                il.release(holder)
+        self._warn_radio_contention(name)
+
+    def _running_radio_contenders(self, exclude: str = "") -> list[str]:
+        """Running transports that share the one HF radio (minus ``exclude``)."""
+        if self.core is None:
+            return []
+        out: list[str] = []
+        for t in self.core.transports:
+            if t.name == exclude or not getattr(t, "running", False):
+                continue
+            try:
+                if t.capabilities().uses_shared_radio:
+                    out.append(t.name)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _warn_radio_contention(self, name: str) -> None:
+        """Warn when another running radio transport could fight ``name`` for the radio."""
+        if self.core is None or not self.core.radio_interlock.is_contender(name):
+            return
+        others = self._running_radio_contenders(exclude=name)
+        if others:
+            verb = "is" if len(others) == 1 else "are"
+            self._log_system(
+                f"\u26a0 radio: {', '.join(others)} {verb} also running and "
+                f"share the one radio with {name}. Only one can transmit at a "
+                "time — keep the others idle (or use Winlink telnet)."
+            )
+
+    def _render_radio_interlock(self, log: RichLog) -> None:
+        """Render the radio-interlock status (who owns the shared HF radio)."""
+        if self.core is None:
+            return
+        il = self.core.radio_interlock
+        contenders = [
+            t.name for t in self.core.transports
+            if t.capabilities().uses_shared_radio
+        ]
+        if len(contenders) < 2:
+            return  # nothing contends — no interlock to show
+        log.write("")
+        log.write("[b]Radio interlock[/b] (one HF radio — one transmitter)")
+        log.write(f"  owner: [b]{il.holder or '(free)'}[/b]")
+        log.write(f"  shares the radio: {', '.join(contenders)}")
+        running = self._running_radio_contenders()
+        if len(running) > 1:
+            log.write(
+                f"  [yellow]\u26a0 {', '.join(running)} are all running — keep all "
+                "but one idle so they don't key over each other.[/yellow]"
+            )
 
     def _render_health(self) -> None:
         """Render the reachability board from the latest probe results.
@@ -1570,6 +2126,15 @@ class RadioTUI(App):
                 else ""
             )
             log.write(f"  {dot} [b]{t.name}[/b]  {word}{vol}")
+            # Show the actual on-air identity this transport uses (callsign for
+            # HF media, an anonymous address for Reticulum/MeshCore) so it's
+            # obvious which callsign goes out — matching `radioapp status`.
+            log.write(f"       {self._transport_identity(t)}")
+            # Show the configured control endpoint (host:port / URL) even when
+            # the transport is down, so the operator can confirm *where* we dial.
+            endpoint = self._transport_endpoint(t)
+            if endpoint:
+                log.write(f"       {endpoint}")
             if (
                 t.name == "reticulum"
                 and status is ReachabilityStatus.OK
@@ -1598,7 +2163,115 @@ class RadioTUI(App):
                 self._render_device_telemetry(
                     log, self._device_telemetry.get(t.name)
                 )
+        self._render_radio_interlock(log)
+        self._render_system_health(log)
         log.write("[dim]Press F5 to re-check now.[/dim]")
+
+    def _render_system_health(self, log: RichLog) -> None:
+        """Render host system health: CPU, memory, temperature, power, disk + DB.
+
+        All metrics are best-effort (``core.syshealth`` degrades gracefully on
+        platforms/installs where a reading isn't available), so anything unknown
+        is simply omitted. Battery/power matters for field/portable operation;
+        the database line is the single "how big is my history getting?"
+        indicator, alongside free space on its filesystem.
+        """
+        from ..core.syshealth import collect, format_bytes, format_duration
+
+        if self.core is None:
+            return
+        db_path = self.core.config.database_path()
+        health = collect(str(db_path))
+        log.write("")
+        log.write("[b]System[/b] (host resources)")
+
+        cpu_bits: list[str] = []
+        if health.cpu_percent is not None:
+            cpu_bits.append(f"{health.cpu_percent:.0f}%")
+        if health.load_avg is not None:
+            la = health.load_avg
+            cpu_bits.append(
+                f"load {la[0]:.2f} {la[1]:.2f} {la[2]:.2f}"
+                + (f" / {health.cpu_count} cpu" if health.cpu_count else "")
+            )
+        if cpu_bits:
+            log.write(f"  cpu   : {'  '.join(cpu_bits)}")
+        if health.mem_total:
+            log.write(
+                f"  mem   : {format_bytes(health.mem_used)} / "
+                f"{format_bytes(health.mem_total)}"
+                + (
+                    f"  ({health.mem_percent:.0f}%)"
+                    if health.mem_percent is not None
+                    else ""
+                )
+            )
+        if health.temp_c is not None:
+            colour = (
+                "red" if health.temp_c >= 80
+                else "yellow" if health.temp_c >= 65
+                else "green"
+            )
+            log.write(f"  temp  : [{colour}]{health.temp_c:.0f}°C[/{colour}]")
+        if health.has_battery or health.power_plugged is not None:
+            self._render_power_line(log, health, format_duration)
+        if health.disk_free is not None:
+            colour = (
+                "red" if (health.disk_used_percent or 0) >= 95
+                else "yellow" if (health.disk_used_percent or 0) >= 85
+                else "green"
+            )
+            pct = (
+                f"  ({health.disk_used_percent:.0f}% used)"
+                if health.disk_used_percent is not None
+                else ""
+            )
+            log.write(
+                f"  disk  : [{colour}]{format_bytes(health.disk_free)} free[/{colour}]"
+                f" of {format_bytes(health.disk_total)}{pct}"
+            )
+
+        # Database size + history extent — the "is my history bloating?" signal.
+        try:
+            s = self.core.store.stats()
+            c = self.core.nomad_cache.stats()
+            retention = int(
+                self.core.config.general.get("history_retention_days", 0) or 0
+            )
+            keep = f"{retention}d retention" if retention > 0 else "kept forever"
+            log.write(
+                f"  data  : {format_bytes(s['size_bytes'])} db · "
+                f"{s['messages']} msgs / {s['threads']} threads · "
+                f"{c['pages']} cached pages · {keep}"
+            )
+        except Exception:  # noqa: BLE001 - never let stats break the board
+            pass
+
+    def _render_power_line(self, log: RichLog, health, format_duration) -> None:
+        """Render a battery/power line: charge %, AC/battery, time remaining.
+
+        On a desktop/SBC with no battery we still show the mains state (so an
+        operator running off a power supply knows AC is present); on a laptop or
+        battery-backed field rig we colour the charge by how low it is and add a
+        runtime estimate when discharging.
+        """
+        bits: list[str] = []
+        if health.battery_percent is not None:
+            pct = health.battery_percent
+            colour = (
+                "red" if pct < 15
+                else "yellow" if pct < 40
+                else "green"
+            )
+            bits.append(f"[{colour}]{pct:.0f}%[/{colour}]")
+        if health.power_plugged is True:
+            bits.append("\u26a1 on AC" if health.has_battery else "\u26a1 AC power")
+        elif health.power_plugged is False:
+            bits.append("on battery")
+            if health.battery_secs_left:
+                bits.append(f"~{format_duration(health.battery_secs_left)} left")
+        if bits:
+            log.write(f"  power : {'  '.join(bits)}")
 
     def _render_winlink_paths(self, log: RichLog) -> None:
         """Render Winlink connection-path availability under its status line.
@@ -1936,12 +2609,26 @@ class RadioTUI(App):
         self, dest: str, path: str = "/page/index.mu", fields: dict | None = None
     ) -> None:
         if self.core is None or not getattr(self.core, "browser", None):
-            self._log_system("NomadNet browser unavailable (Reticulum not running).")
+            self._log_system("NomadNet browser unavailable.")
             return
-        if not self.core.browser.available:
-            self._log_system("Reticulum is not running; cannot browse NomadNet.")
-            return
-        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields or {}))
+        # Even with Reticulum down we can still serve cached snapshots, so open
+        # the viewer in offline mode rather than refusing outright. Dynamic pages
+        # (with field_data) can't be cached, so those still need a live link.
+        offline = not self.core.browser.available
+        if offline:
+            if fields:
+                self._log_system(
+                    "Reticulum is down; dynamic pages need a live link."
+                )
+                return
+            self._log_system(
+                "Reticulum is down — showing cached page (if any)."
+            )
+        self.push_screen(
+            BrowseScreen(
+                self.core.browser, dest, path, fields or {}, prefer_cache=offline
+            )
+        )
 
     def action_toggle_nomad_favorite(self) -> None:
         """Bookmark / un-bookmark the highlighted NomadNet node (key 'f').
@@ -1978,6 +2665,38 @@ class RadioTUI(App):
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"could not save favorites: {exc}")
         self._refresh_nomad_nodes()
+
+    @work
+    async def action_sync_nomad(self) -> None:
+        """Cache every favorite NomadNet node's page for offline viewing ('s').
+
+        Fetches each ``kind == "node"`` favorite's index page live and stores it
+        in the offline cache, so the pages stay readable once Reticulum drops.
+        Runs as a worker so the UI stays responsive during the round-trips.
+        """
+        if self.core is None or self.view != "nomadnet":
+            return
+        browser = getattr(self.core, "browser", None)
+        if browser is None:
+            self._log_system("NomadNet browser unavailable.")
+            return
+        node_favs = [f for f in self.core.favorites.all() if f.kind == "node"]
+        if not node_favs:
+            self._log_system("No favorite nodes to sync (save one with 'f').")
+            return
+        if not browser.available:
+            self._log_system("Reticulum is not running; cannot sync favorites.")
+            return
+        self._log_system(f"\u21bb syncing {len(node_favs)} favorite node(s)...")
+        try:
+            res = await browser.sync_favorites(node_favs)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"sync failed: {exc}")
+            return
+        self._log_system(
+            f"\u2713 sync done: {res.ok} cached, {res.failed} failed, "
+            f"{res.skipped} skipped"
+        )
 
     # -- Watch pause / clear --------------------------------------------------
     def _toggle_watch_pause(self) -> None:
@@ -2612,6 +3331,76 @@ class RadioTUI(App):
         composer.cursor_position = len(composer.value)
         composer.focus()
 
+    @work
+    async def _winlink_open_forms(self) -> None:
+        """End-to-end Winlink form flow: pick → fill → build → queue to outbox.
+
+        Drives three steps without blocking the UI: a forms picker, a generated
+        field form, then ``compose_form`` (which queues to Pat's outbox). Nothing
+        is transmitted — the operator presses Connect to send, which is the
+        natural review gate (mirrors the ``winlink compose-form`` CLI).
+        """
+        from ..transports.winlink_transport import detect_form_fields
+
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "list_forms"):
+            self._log_system("Winlink is not enabled.")
+            return
+        self._log_system("Winlink: loading form catalog \u2026")
+        try:
+            forms = await t.list_forms()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form catalog failed: {exc}")
+            return
+        if not forms:
+            self._log_system(
+                "No Winlink forms installed. Run 'radioapp winlink forms-update' "
+                "to download them."
+            )
+            return
+        template = await self.push_screen_wait(WinlinkFormsScreen(forms))
+        if not template:
+            return
+        try:
+            text = await t.get_form_template(template)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink template fetch failed: {exc}")
+            return
+        fields = detect_form_fields(text or "")
+        result = await self.push_screen_wait(
+            WinlinkComposeFormScreen(template, fields)
+        )
+        if not result:
+            return
+        if not getattr(t, "running", False):
+            self._log_system("Winlink transport is not running (is Pat reachable?).")
+            return
+        self._log_system(f"Winlink: building form {template} \u2026")
+        try:
+            built = await t.compose_form(
+                result["template"],
+                result["responses"],
+                to=result["to"],
+                cc=result["cc"],
+                subject=result["subject"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form build failed: {exc}")
+            return
+        if built is None:
+            self._log_system(
+                "Winlink form build failed (check the template and that Pat is "
+                "reachable)."
+            )
+            return
+        self._log_system(
+            "Winlink form queued to Pat's outbox \u2014 "
+            f"To: {built.get('to') or '(none)'} \u00b7 "
+            f"Subj: {built.get('subject') or '(none)'}. "
+            "Nothing sent yet; press Connect to transmit."
+        )
+        self._refresh_active_pane()
+
     def _set_winlink_subject(self, text: str) -> None:
         """Set (or clear) the pending subject for the next Winlink message."""
         self._winlink_subject = text.strip()
@@ -2740,6 +3529,26 @@ class RadioTUI(App):
             t.connect_summary() if hasattr(t, "connect_summary")
             else t.build_connect_url()
         )
+        # Radio interlock: a Winlink RF session keys the shared radio. Refuse to
+        # start one while JS8Call/Mercury holds the radio, and warn if another
+        # radio app is still running (it would key over this session).
+        session_rf = bool(t.capabilities().uses_shared_radio)
+        if session_rf and self.core is not None:
+            il = self.core.radio_interlock
+            dec = il.acquire("winlink")
+            if not dec.granted:
+                self._log_system(
+                    f"\u26d4 radio busy: {dec.blocked_by} is using the radio. "
+                    f"Switch away from {dec.blocked_by} (or stop its TX) before an "
+                    "RF Winlink session — or use a telnet path."
+                )
+                return
+            others = self._running_radio_contenders(exclude="winlink")
+            if others:
+                self._log_system(
+                    f"\u26a0 radio: {', '.join(others)} still running — make sure "
+                    "it's idle during this RF session so it doesn't key over Winlink."
+                )
         self._log_system(f"Winlink: connecting via {target} \u2026")
         # Best-effort live progress from Pat's WebSocket while the session runs.
         stop = asyncio.Event()
@@ -2752,7 +3561,10 @@ class RadioTUI(App):
 
             async def _pump() -> None:
                 try:
-                    await t.stream_events(_on_event, stop.is_set)
+                    await t.stream_events(
+                        _on_event, stop.is_set,
+                        on_prompt=self._winlink_password_prompt,
+                    )
                 except Exception:  # noqa: BLE001 - feedback is optional
                     pass
 
@@ -2766,10 +3578,38 @@ class RadioTUI(App):
             stop.set()
             if stream_task is not None:
                 stream_task.cancel()
+            # Release the radio claim taken for this RF session.
+            if session_rf and self.core is not None:
+                self.core.radio_interlock.release("winlink")
         self._log_system(
             f"Winlink session done \u2014 {received} message(s) received."
         )
         self._refresh_active_pane()
+
+    async def _winlink_password_prompt(self, prompt: dict) -> str | None:
+        """Answer Pat's mid-session secure-login password prompt (option A).
+
+        Pops a masked input and returns what the operator types, kept in memory
+        only for this session (never written to config/disk). Returns ``None`` on
+        cancel or if the operator doesn't respond before Pat's ~60s timeout, so
+        Pat falls back to its own handling. Mirrors Pat's prompt message so the
+        operator sees exactly which callsign/account is being authenticated.
+        """
+        message = str(prompt.get("message") or "Enter Winlink secure-login password")
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[str | None] = loop.create_future()
+
+        def _done(value: str | None) -> None:
+            if not future.done():
+                future.set_result(value)
+
+        self.push_screen(PasswordPromptScreen(message), _done)
+        try:
+            # Stay within Pat's 60s prompt window; decline if it elapses.
+            return await asyncio.wait_for(future, timeout=55)
+        except (TimeoutError, asyncio.TimeoutError):
+            self._log_system("Winlink: password prompt timed out.")
+            return None
 
     @staticmethod
     def _format_winlink_event(ev: dict) -> str | None:
@@ -2961,6 +3801,52 @@ class RadioTUI(App):
             )
         else:
             self._log_system("Could not store the relay message.")
+
+    def _js8_sms_prompt(self) -> None:
+        """SMS push-button: pre-fill the composer with ``/sms `` to type into.
+
+        Switches to JS8Call mode first if needed, since the APRS gateway send
+        only works there. The operator then types ``<phone> <message>``.
+        """
+        if self.active_transport != "js8call":
+            self._select_mode("js8call")
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        composer.value = "/sms "
+        composer.cursor_position = len(composer.value)
+        composer.focus()
+        self._log_system(
+            "SMS via APRS gateway \u2014 type: /sms <phone> <message>  "
+            "[dim](relayed by JS8Call \u2192 SMSGTE)[/dim]"
+        )
+
+    @work
+    async def _js8_send_sms(self, arg: str) -> None:
+        """``/sms <phone> <text>`` — text a phone via JS8Call's APRS gateway."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            self._log_system("usage: /sms <phone> <message text>")
+            return
+        phone, body = parts[0], parts[1]
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        if await t.send_sms(phone, body):
+            self._log_system(
+                f"\u2709 SMS to {phone} queued via APRS (SMSGTE) \u2014 "
+                "JS8Call will transmit it on the next cycle."
+            )
+        else:
+            self._log_system(
+                "Could not send the SMS. Check the number and that JS8Call's "
+                "APRS gateway is enabled."
+            )
 
     @work
     async def _js8_directed_cmd(self, arg: str) -> None:
@@ -3392,7 +4278,7 @@ class RadioTUI(App):
         if self._watch_sort_by_mode:
             self._rebuild_monitor()
             return
-        if self._monitor_fav_only and not self._msg_is_favorite(msg):
+        if not self._monitor_passes(msg):
             return
         self._render_monitor_row(msg)
 
@@ -3466,6 +4352,36 @@ class RadioTUI(App):
         self._monitor_entries.append((msg.thread_key, msg.transport))
         mlist.scroll_end(animate=False)
 
+    def _monitor_passes(self, msg: UnifiedMessage) -> bool:
+        """Whether a message survives the Watch stream's active filter.
+
+        The favorites-only and group filters are mutually exclusive; at most one
+        is active at a time (selecting one clears the other), so this is a simple
+        either/or. With no filter active every message passes.
+        """
+        if self._monitor_group_filter is not None:
+            return self._msg_in_group(msg, self._monitor_group_filter)
+        if self._monitor_fav_only:
+            return self._msg_is_favorite(msg)
+        return True
+
+    def _msg_in_group(self, msg: UnifiedMessage, name: str) -> bool:
+        """True if a message belongs to the named group (member or tag).
+
+        Uses the stamp the router already wrote (``msg.groups``) when present,
+        and otherwise resolves live against the registry so your own outbound
+        sends to the group show too (keeping both sides of a watched group).
+        """
+        if self.core is None:
+            return False
+        names = msg.groups
+        if not names:
+            try:
+                names = self.core.groups.groups_for_message(msg)
+            except Exception:  # noqa: BLE001 - filtering must never crash Watch
+                return False
+        return name in names
+
     def _msg_is_favorite(self, msg: UnifiedMessage) -> bool:
         if self.core is None:
             return False
@@ -3497,7 +4413,7 @@ class RadioTUI(App):
                 msgs, key=lambda m: (m.transport or "~", m.timestamp)
             )
         for msg in msgs:
-            if self._monitor_fav_only and not self._msg_is_favorite(msg):
+            if not self._monitor_passes(msg):
                 continue
             self._render_monitor_row(msg)
 
@@ -3518,23 +4434,28 @@ class RadioTUI(App):
         )
 
     def _update_monitor_help(self) -> None:
-        """Reflect the Monitor scope and favorites-filter state in the header.
+        """Reflect the Monitor scope and active filter in the header.
 
-        The transport scope ("all transports") and the favorites-only filter are
-        shown as two independent segments, so the filter state never overwrites
-        the scope label.
+        The transport scope ("all transports") and the active filter (favorites
+        or a group) are shown as two independent segments, so the filter state
+        never overwrites the scope label. Favorites and group are mutually
+        exclusive — at most one shows at a time.
         """
         try:
             help_line = self.query_one("#monitor-help", Static)
         except Exception:  # noqa: BLE001 - widget may not be mounted yet
             return
         scope = "Monitor - [b]all transports[/b] (read-only)"
-        if self._monitor_fav_only:
-            fav = "filter: [b yellow]\u2605 favorites only[/b yellow]"
+        if self._monitor_group_filter:
+            grp = self._monitor_group_filter
+            filt = f"filter: [b cyan]\u25c9 group @{grp}[/b cyan]"
+        elif self._monitor_fav_only:
+            filt = "filter: [b yellow]\u2605 favorites only[/b yellow]"
         else:
-            fav = "filter: [dim]off (all senders)[/dim]"
+            filt = "filter: [dim]off (all senders)[/dim]"
         help_line.update(
-            f"{scope}    {fav}    Enter opens an item \u00b7 [F4] toggle favorites"
+            f"{scope}    {filt}    "
+            "[F4] favorites \u00b7 [g] group"
         )
 
     def _refresh_monitor_ticker(self) -> None:
@@ -3698,10 +4619,8 @@ class RadioTUI(App):
         """Open the NomadNet page viewer: /browse <hash>[:/page/x.mu]."""
         if self.core is None:
             return
-        if not getattr(self.core, "browser", None) or not self.core.browser.available:
-            self._log_system(
-                "Reticulum is not running; the NomadNet browser is unavailable."
-            )
+        if not getattr(self.core, "browser", None):
+            self._log_system("NomadNet browser unavailable.")
             return
         if not arg:
             self._log_system("usage: /browse <hash>[:/page/x.mu]  (see /nodes)")
@@ -3710,7 +4629,19 @@ class RadioTUI(App):
         if not dest:
             self._log_system("usage: /browse <hash>[:/page/x.mu]")
             return
-        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields))
+        # Offline is fine for cached pages; only dynamic (field_data) pages need
+        # a live link.
+        offline = not self.core.browser.available
+        if offline and fields:
+            self._log_system(
+                "Reticulum is down; dynamic pages need a live link."
+            )
+            return
+        if offline:
+            self._log_system("Reticulum is down — showing cached page (if any).")
+        self.push_screen(
+            BrowseScreen(self.core.browser, dest, path, fields, prefer_cache=offline)
+        )
 
     def _handle_nodes_command(self) -> None:
         """List discovered NomadNet nodes in the message log."""
@@ -3757,6 +4688,7 @@ class RadioTUI(App):
         # Entering a conversation switches the active mode to its transport.
         if transport and transport != self.active_transport:
             self.active_transport = transport
+            self._update_radio_claim()
             self._update_modebar()
         self.current_target = thread_key
         self.view = "active"
@@ -3848,6 +4780,7 @@ class RadioTUI(App):
                 "/channel list|add <index> <#name> [secret], "
                 "/freq [<MHz|Hz>], /band [<name>], "
                 "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
+                "/sms <phone> <text>, "
                 "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
                 "/attach <path>, /save, "
                 "/name <friendly name>, /close [<id>], "
@@ -3902,6 +4835,8 @@ class RadioTUI(App):
             self._js8_show_inbox()
         elif cmd == "/relay":
             self._js8_relay(arg)
+        elif cmd == "/sms":
+            self._js8_send_sms(arg)
         elif cmd == "/cmd":
             self._js8_directed_cmd(arg)
         elif cmd in ("/name", "/rename"):
@@ -3942,6 +4877,20 @@ class RadioTUI(App):
         me = self.core.config.display_name
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None
+        # Radio interlock: a send on a continuous radio mode (JS8Call/Mercury)
+        # keys the shared HF radio, so refuse while another transport holds it.
+        # (Winlink sends only *queue* to Pat's outbox — the radio is keyed by the
+        # connect session, which is gated separately in _winlink_connect.)
+        il = self.core.radio_interlock
+        if self.active_transport in self._continuous_radio_modes():
+            dec = il.acquire(self.active_transport)
+            if not dec.granted:
+                self._log_system(
+                    f"\u26d4 radio busy: {dec.blocked_by} is using the radio. "
+                    f"Wait for it to finish (or stop it) before transmitting on "
+                    f"{self.active_transport}."
+                )
+                return
         if self.current_target.startswith("@"):
             if not (caps and caps.supports_groups):
                 self._log_system(
@@ -4129,7 +5078,12 @@ class RadioTUI(App):
             (self.view == "monitor" and self._monitor_fav_only)
             or (self.view in ("active", "nomadnet") and self._active_fav_only)
         )
-        filt = "    [fav-only]" if fav_on else ""
+        if self.view == "monitor" and self._monitor_group_filter:
+            filt = f"    [group:@{self._monitor_group_filter}]"
+        elif fav_on:
+            filt = "    [fav-only]"
+        else:
+            filt = ""
         counter = self._compose_counter_markup()
         self.query_one("#statusbar", Static).update(
             f" view: {self.view}    mode: {mode}{ident_part}    target: {target}    "

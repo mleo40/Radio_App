@@ -357,6 +357,17 @@ class Router:
         self._seen.add(msg.msg_id)
         msg.status = DeliveryStatus.RECEIVED
 
+        # Cross-mode grouping: stamp the message with any operator-declared
+        # group(s) it belongs to (by sender membership or tag) so the store and
+        # UI can aggregate one collective's traffic across every transport. This
+        # is read-side only — outbound fan-out is deliberately not done here.
+        try:
+            group_names = self._groups.groups_for_message(msg)
+            if group_names:
+                msg.metadata["groups"] = group_names
+        except Exception:  # noqa: BLE001 - grouping must never break delivery
+            log.exception("group stamping failed for %s", msg.msg_id)
+
         action = self._filters.decide(msg)
         # Persist everything except explicit DROPs, but ALWAYS notify the UI so
         # the Monitor can show a complete, all-transport feed. The UI honours the

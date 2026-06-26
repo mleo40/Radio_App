@@ -90,6 +90,12 @@ class TransportCapabilities:
     #: Whether transmitting encrypted/obscured payloads is prohibited on this
     #: medium (true for amateur HF). The compliance guard enforces this.
     prohibits_encryption: bool = False
+    #: Whether this transport drives the single physical HF radio (sound card +
+    #: CAT + PTT). Two such transports (e.g. JS8Call and Pat/Winlink over an RF
+    #: modem) cannot transmit at once — the radio interlock gates them so they
+    #: don't key up over each other. Internet-only paths (Winlink telnet) are
+    #: False since they never touch the radio.
+    uses_shared_radio: bool = False
 
 
 class Transport(abc.ABC):

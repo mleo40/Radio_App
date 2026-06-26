@@ -127,3 +127,54 @@ def test_stream_connects_and_reads_server_frames():
 
     got = asyncio.run(run())
     assert got == ['{"Status":{"dialing":true}}', '{"Progress":{"done":true}}']
+
+
+# -- outbound (client->server) frames: per-session prompt answers --------------
+
+def test_encode_text_frame_is_masked_and_roundtrips():
+    frame = winlink_ws.encode_text_frame("password123")
+    # Client frames MUST set the mask bit (second byte high bit).
+    assert frame[1] & 0x80
+    frames, rest = winlink_ws.decode_frames(frame)
+    assert rest == b""
+    assert frames[0][1] == b"password123"
+
+
+def test_stream_flushes_outgoing_queue_to_server():
+    """A string put on the outgoing queue is sent to the server as a frame."""
+    async def run():
+        received: list[bytes] = []
+
+        async def handle(reader, writer):
+            header = await reader.readuntil(b"\r\n\r\n")
+            key = ""
+            for line in header.split(b"\r\n"):
+                if line.lower().startswith(b"sec-websocket-key:"):
+                    key = line.split(b":", 1)[1].strip().decode()
+            writer.write(
+                b"HTTP/1.1 101 Switching Protocols\r\n"
+                b"Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                b"Sec-WebSocket-Accept: "
+                + winlink_ws.accept_key(key).encode() + b"\r\n\r\n"
+            )
+            await writer.drain()
+            # Read one client frame (the queued message) and decode it.
+            data = await asyncio.wait_for(reader.read(4096), 2)
+            frames, _ = winlink_ws.decode_frames(data)
+            received.extend(p for _, p in frames)
+            writer.close()
+
+        server = await asyncio.start_server(handle, "127.0.0.1", 0)
+        host, port = server.sockets[0].getsockname()
+        outgoing: asyncio.Queue[str] = asyncio.Queue()
+        outgoing.put_nowait('{"prompt_response":{"id":"p1","value":"sec"}}')
+        async with server:
+            await winlink_ws.stream(
+                host, port, "/ws", lambda _t: None, lambda: False,
+                outgoing=outgoing,
+            )
+        return received
+
+    received = asyncio.run(run())
+    assert received == [b'{"prompt_response":{"id":"p1","value":"sec"}}']
+

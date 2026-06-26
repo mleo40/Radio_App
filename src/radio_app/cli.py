@@ -11,7 +11,7 @@ import argparse
 import asyncio
 import shutil
 import sys
-from datetime import UTC
+from datetime import UTC, datetime
 from pathlib import Path
 
 from . import __version__
@@ -76,12 +76,67 @@ def _build_parser() -> argparse.ArgumentParser:
     p_read.add_argument("--limit", type=int, default=200)
     p_read.set_defaults(func=_cmd_read)
 
+    p_history = sub.add_parser(
+        "history", help="browse stored message history (offline, read-only)"
+    )
+    p_history.add_argument("--thread", help="thread key, e.g. @TTP or a callsign")
+    p_history.add_argument("--to", help="alias for --thread (a direct conversation)")
+    p_history.add_argument(
+        "--mode", help="only this transport (js8call, reticulum, meshcore, winlink)"
+    )
+    p_history.add_argument(
+        "--from", dest="sender", help="only messages from this sender (substring)"
+    )
+    p_history.add_argument("--group", help="only this group (with or without @)")
+    p_history.add_argument("--since", help="on/after this date (YYYY-MM-DD or ISO)")
+    p_history.add_argument("--until", help="on/before this date (YYYY-MM-DD or ISO)")
+    p_history.add_argument(
+        "--limit", type=int, default=200, help="max messages (most recent)"
+    )
+    p_history.add_argument(
+        "--format", choices=["text", "json"], default="text"
+    )
+    p_history.set_defaults(func=_cmd_history)
+
+    p_search = sub.add_parser(
+        "search", help="search stored message bodies (offline, read-only)"
+    )
+    p_search.add_argument("text", help="text to find in message bodies")
+    p_search.add_argument("--mode", help="only this transport")
+    p_search.add_argument(
+        "--from", dest="sender", help="only messages from this sender (substring)"
+    )
+    p_search.add_argument("--group", help="only this group (with or without @)")
+    p_search.add_argument("--since", help="on/after this date (YYYY-MM-DD or ISO)")
+    p_search.add_argument("--until", help="on/before this date (YYYY-MM-DD or ISO)")
+    p_search.add_argument("--limit", type=int, default=100)
+    p_search.add_argument(
+        "--format", choices=["text", "json"], default="text"
+    )
+    p_search.set_defaults(func=_cmd_search)
+
     p_listen = sub.add_parser("listen", help="stream incoming messages to stdout")
     p_listen.add_argument("--group", help="only show this group")
     p_listen.set_defaults(func=_cmd_listen)
 
     p_groups = sub.add_parser("groups", help="list configured groups")
     p_groups.set_defaults(func=_cmd_groups)
+
+    p_group = sub.add_parser(
+        "group", help="manage a group's cross-mode membership (incoming)"
+    )
+    p_group.add_argument("name", help="group name, e.g. ttp")
+    p_group.add_argument(
+        "action",
+        choices=["show", "add", "remove", "tag", "untag", "delete"],
+        help="show | add/remove a member | tag/untag | delete the group",
+    )
+    p_group.add_argument(
+        "value",
+        nargs="?",
+        help="member spec 'transport:identifier' (add/remove) or a tag (tag/untag)",
+    )
+    p_group.set_defaults(func=_cmd_group)
 
     p_sub = sub.add_parser("sub", help="manage group subscriptions")
     p_sub.add_argument("action", choices=["add", "remove", "list"])
@@ -106,6 +161,42 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_setup.set_defaults(func=_cmd_setup)
 
+    p_db = sub.add_parser(
+        "db", help="database maintenance (stats / vacuum / prune)"
+    )
+    p_db.add_argument(
+        "action",
+        choices=["stats", "vacuum", "prune", "cache-prune", "cache-clear"],
+        help="stats: sizes & counts; vacuum: reclaim space; prune: delete "
+        "messages older than --days; cache-prune/cache-clear: trim the "
+        "NomadNet page cache",
+    )
+    p_db.add_argument(
+        "--days",
+        type=int,
+        default=0,
+        help="age threshold in days for prune / cache-prune",
+    )
+    p_db.set_defaults(func=_cmd_db)
+
+    p_backup = sub.add_parser(
+        "backup", help="back up config + database to a .tar.gz archive"
+    )
+    p_backup.add_argument(
+        "--out", help="output directory (default: the config file's directory)"
+    )
+    p_backup.set_defaults(func=_cmd_backup)
+
+    p_restore = sub.add_parser(
+        "restore", help="restore config + database from a backup archive"
+    )
+    p_restore.add_argument("archive", help="path to a backup .tar.gz")
+    p_restore.add_argument(
+        "--yes", action="store_true", help="skip the confirmation prompt"
+    )
+    p_restore.set_defaults(func=_cmd_restore)
+
+
 
     p_ret = sub.add_parser("reticulum", help="Reticulum / RNode utilities")
     p_ret.add_argument(
@@ -116,35 +207,60 @@ def _build_parser() -> argparse.ArgumentParser:
     p_wl = sub.add_parser("winlink", help="Winlink / Pat utilities")
     p_wl.add_argument(
         "action",
-        choices=["status", "connect", "gateways", "forms", "forms-update"],
+        choices=[
+            "status", "connect", "gateways", "forms", "forms-update",
+            "form", "compose-form",
+        ],
         nargs="?",
         default="status",
         help="status (default): check Pat; connect: run a session; "
         "gateways: list nearby RMS gateways; forms: list installed Winlink "
-        "forms; forms-update: download the latest standard forms",
+        "forms; forms-update: download the latest standard forms; "
+        "form <template>: preview a form template + its fields; "
+        "compose-form <template>: fill in a form and queue it to the outbox",
     )
     p_wl.add_argument(
-        "gateway", nargs="?", help="optional RMS gateway callsign for 'connect'"
+        "target",
+        nargs="?",
+        help="RMS gateway callsign (connect) or form template path "
+        "(form / compose-form, e.g. 'ICS/ICS213.txt')",
     )
+    p_wl.add_argument(
+        "--field",
+        action="append",
+        metavar="KEY=VALUE",
+        help="form response for compose-form (repeatable, e.g. --field city=Boston)",
+    )
+    p_wl.add_argument(
+        "--responses",
+        metavar="FILE",
+        help="JSON file of {field: value} responses for compose-form",
+    )
+    p_wl.add_argument("--to", help="override the form's To address")
+    p_wl.add_argument("--cc", help="override the form's Cc address")
+    p_wl.add_argument("--subject", help="override the form's Subject")
     p_wl.set_defaults(func=_cmd_winlink)
 
     p_js8 = sub.add_parser(
-        "js8", help="JS8Call utilities (inbox / directed commands / relay)"
+        "js8", help="JS8Call utilities (inbox / directed commands / relay / sms)"
     )
     p_js8.add_argument(
         "action",
-        choices=["inbox", "cmd", "relay"],
+        choices=["inbox", "cmd", "relay", "sms"],
         help="inbox: list JS8Call's stored messages; cmd: send a directed "
         "command (e.g. SNR?) to a station; relay: leave a store-and-forward "
-        "message for a station",
+        "message for a station; sms: text a phone via the APRS SMSGTE gateway",
     )
     p_js8.add_argument(
-        "target", nargs="?", help="callsign or @GROUP for 'cmd'/'relay'"
+        "target",
+        nargs="?",
+        help="callsign or @GROUP for 'cmd'/'relay'; phone number for 'sms'",
     )
     p_js8.add_argument(
         "rest",
         nargs="*",
-        help="command token for 'cmd' (e.g. SNR?), or message text for 'relay'",
+        help="command token for 'cmd' (e.g. SNR?), or message text for "
+        "'relay'/'sms'",
     )
     p_js8.set_defaults(func=_cmd_js8)
 
@@ -153,14 +269,25 @@ def _build_parser() -> argparse.ArgumentParser:
         help="manage favorite peers (callsigns / RNS hex hashes) for alerts",
     )
     p_fav.add_argument(
-        "action", choices=["add", "remove", "list", "watch", "import-groups"]
+        "action", choices=["add", "remove", "list", "set", "watch", "import-groups"]
     )
     p_fav.add_argument(
         "identity",
         nargs="?",
-        help="callsign or RNS destination hash (required for add/remove)",
+        help="callsign or RNS destination hash (required for add/remove/set)",
     )
     p_fav.add_argument("--label", default="", help="optional friendly label")
+    p_fav.add_argument("--name", default=None, help="contact's name")
+    p_fav.add_argument(
+        "--grid", "--gridsquare", dest="grid", default=None,
+        help="Maidenhead grid square, e.g. FN31pr",
+    )
+    p_fav.add_argument("--power", default=None, help="typical TX power, e.g. 5W")
+    p_fav.add_argument("--notes", default=None, help="free-form notes")
+    p_fav.add_argument(
+        "--meta", action="append", default=[], metavar="KEY=VALUE",
+        help="set an arbitrary metadata field (repeatable); empty value clears it",
+    )
     p_fav.set_defaults(func=_cmd_favorites)
 
     p_browse = sub.add_parser(
@@ -175,6 +302,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_browse.add_argument(
         "--timeout", type=float, default=20.0, help="seconds to wait for the page"
+    )
+    p_browse.add_argument(
+        "--offline",
+        action="store_true",
+        help="serve the cached copy without touching the network",
+    )
+    p_browse.add_argument(
+        "--live",
+        action="store_true",
+        help="force a fresh fetch over the air (default is cache-first)",
     )
     p_browse.set_defaults(func=_cmd_browse)
 
@@ -193,6 +330,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--wait", type=float, default=0.0, help="seconds to listen for announces first"
     )
     p_peers.set_defaults(func=_cmd_peers)
+
+    p_nomad = sub.add_parser(
+        "nomad", help="NomadNet maintenance (offline page cache)"
+    )
+    p_nomad.add_argument(
+        "action", choices=["sync"], help="sync: cache favorite nodes' pages now"
+    )
+    p_nomad.add_argument(
+        "--follow-links",
+        action="store_true",
+        help="also cache same-node /page/*.mu links (one level deep)",
+    )
+    p_nomad.add_argument(
+        "--timeout", type=float, default=20.0, help="seconds to wait per page"
+    )
+    p_nomad.set_defaults(func=_cmd_nomad)
 
 
     return parser
@@ -283,6 +436,116 @@ def _cmd_read(args: argparse.Namespace) -> int:
     return _run(_with_app(args.config, run))
 
 
+def _parse_when(value: str, *, end: bool) -> datetime:
+    """Parse a --since/--until value to an aware-UTC datetime.
+
+    Accepts a full ISO-8601 timestamp or a bare ``YYYY-MM-DD`` date; a date-only
+    value expands to the start of the day for ``--since`` and the end of the day
+    for ``--until`` (so the whole day is inclusive). Naive values are treated as
+    UTC. Raises ``ValueError`` on anything unparseable.
+    """
+    from datetime import time
+
+    raw = value.strip()
+    date_only = "T" not in raw and " " not in raw and len(raw) <= 10
+    dt = datetime.fromisoformat(raw)
+    if date_only:
+        dt = datetime.combine(dt.date(), time.max if end else time.min)
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=UTC)
+    return dt
+
+
+def _render_messages(msgs, fmt: str, *, show_thread: bool = False) -> None:
+    """Print a list of UnifiedMessages as text lines or a JSON array."""
+    import json
+
+    if fmt == "json":
+        print(json.dumps([m.to_dict() for m in msgs], indent=2))
+        return
+    if not msgs:
+        print("(no matching messages)")
+        return
+    for m in msgs:
+        ts = m.timestamp.strftime("%Y-%m-%d %H:%M")
+        via = f"[{m.transport or '?'}]"
+        tgt = f"@{m.group}" if m.group else (m.recipient or "")
+        arrow = f" -> {tgt}" if tgt else ""
+        where = f" {{{m.thread_key}}}" if show_thread else ""
+        groups = m.groups
+        gtag = f" ({', '.join('@' + g for g in groups)})" if groups else ""
+        print(f"{ts} {via} {m.sender}{arrow}{where}{gtag}: {m.content}")
+
+
+def _history_window(args) -> tuple[datetime | None, datetime | None] | None:
+    """Resolve --since/--until args to datetimes; None on a parse error."""
+    try:
+        since = _parse_when(args.since, end=False) if args.since else None
+        until = _parse_when(args.until, end=True) if args.until else None
+    except ValueError:
+        print(
+            "error: --since/--until must be YYYY-MM-DD or ISO 8601",
+            file=sys.stderr,
+        )
+        return None
+    return since, until
+
+
+def _cmd_history(args: argparse.Namespace) -> int:
+    """Browse stored history with optional filters (offline, no transports)."""
+    from .core.store import MessageStore
+
+    window = _history_window(args)
+    if window is None:
+        return 2
+    since, until = window
+    thread = args.thread or args.to
+    store = MessageStore(Config.load(args.config).database_path())
+    try:
+        msgs = store.query(
+            thread=thread,
+            transport=args.mode,
+            sender=args.sender,
+            group=args.group,
+            since=since,
+            until=until,
+            limit=args.limit,
+            newest_first=False,  # read like a conversation (oldest-first)
+        )
+        # Without a specific thread, annotate each line with its thread so a
+        # cross-mode history stays legible.
+        _render_messages(msgs, args.format, show_thread=not thread)
+    finally:
+        store.close()
+    return 0
+
+
+def _cmd_search(args: argparse.Namespace) -> int:
+    """Search stored message bodies with optional filters (offline)."""
+    from .core.store import MessageStore
+
+    window = _history_window(args)
+    if window is None:
+        return 2
+    since, until = window
+    store = MessageStore(Config.load(args.config).database_path())
+    try:
+        msgs = store.query(
+            text=args.text,
+            transport=args.mode,
+            sender=args.sender,
+            group=args.group,
+            since=since,
+            until=until,
+            limit=args.limit,
+            newest_first=True,  # most relevant = most recent first
+        )
+        _render_messages(msgs, args.format, show_thread=True)
+    finally:
+        store.close()
+    return 0
+
+
 def _cmd_listen(args: argparse.Namespace) -> int:
     async def run(app: App) -> int:
         print("Listening for messages (Ctrl-C to stop)...")
@@ -319,10 +582,93 @@ def _cmd_groups(args: argparse.Namespace) -> int:
     from .core.groups import GroupRegistry
 
     reg = GroupRegistry.from_config(cfg)
-    for g in reg.all():
+    groups = reg.all()
+    if not groups:
+        print("(no groups configured — add one with 'radioapp group <name> add ...')")
+        return 0
+    for g in groups:
         subscribed = "*" if reg.is_subscribed(g.name) else " "
         where = ", ".join(g.transports) or "-"
-        print(f"[{subscribed}] {g.tag:<12} {g.display_name:<20} via {where}")
+        extra = []
+        if g.members:
+            extra.append(f"{len(g.members)} member(s)")
+        if g.tags:
+            extra.append(f"tags: {', '.join('@' + t for t in g.tags)}")
+        suffix = f"  [{'; '.join(extra)}]" if extra else ""
+        print(
+            f"[{subscribed}] {g.tag:<12} {g.display_name:<20} via {where}{suffix}"
+        )
+    return 0
+
+
+def _print_group(reg, name: str) -> int:
+    g = reg.get(name)
+    if g is None:
+        print(f"no such group @{name.lstrip('@')}", file=sys.stderr)
+        return 1
+    print(f"@{g.name}  ({g.display_name})")
+    print(f"  outbound transports: {', '.join(g.transports) or '-'}")
+    print("  members (incoming):")
+    if g.members:
+        for m in g.members:
+            who = m.transport or "any"
+            print(f"    - {m.identifier}   [{who}]")
+    else:
+        print("    (none)")
+    print(
+        "  tags (incoming): "
+        + (", ".join("@" + t for t in g.tags) if g.tags else "(none)")
+    )
+    return 0
+
+
+def _cmd_group(args: argparse.Namespace) -> int:
+    """Manage a group's cross-mode incoming membership (members + tags)."""
+    cfg = Config.load(args.config)
+    from .core.groups import GroupRegistry
+
+    reg = GroupRegistry.from_config(cfg)
+    name = args.name.lstrip("@")
+    action = args.action
+
+    if action == "show":
+        return _print_group(reg, name)
+    if action == "delete":
+        if reg.remove_group(name):
+            reg.save(cfg)
+            print(f"removed group @{name}")
+            return 0
+        print(f"no such group @{name}", file=sys.stderr)
+        return 1
+
+    if not args.value:
+        need = "a member spec 'transport:identifier'" if action in (
+            "add",
+            "remove",
+        ) else "a tag"
+        print(f"error: {action} needs {need}", file=sys.stderr)
+        return 2
+
+    if action == "add":
+        m = reg.add_member(name, args.value)
+        reg.save(cfg)
+        print(f"@{name}: added member {m.spec}")
+    elif action == "remove":
+        if not reg.remove_member(name, args.value):
+            print(f"@{name}: '{args.value}' is not a member", file=sys.stderr)
+            return 1
+        reg.save(cfg)
+        print(f"@{name}: removed member {args.value}")
+    elif action == "tag":
+        t = reg.add_tag(name, args.value)
+        reg.save(cfg)
+        print(f"@{name}: now claims tag @{t}")
+    elif action == "untag":
+        if not reg.remove_tag(name, args.value):
+            print(f"@{name}: no such tag '{args.value}'", file=sys.stderr)
+            return 1
+        reg.save(cfg)
+        print(f"@{name}: removed tag")
     return 0
 
 
@@ -359,11 +705,48 @@ def _cmd_status(args: argparse.Namespace) -> int:
         print(f"encrypt-on-HF: {enc}")
         print(f"database     : {app.config.database_path()}")
         print("transports   :")
+        from .transports.base import ReachabilityStatus
+
         for t in app.transports:
+            # `running` is just "the adapter loaded"; it does NOT mean the
+            # backing service (Pat, the JS8Call API, rnsd, ...) is actually
+            # reachable. Probe the control endpoint too so this agrees with the
+            # Health panel instead of always reporting UP.
             state = "UP" if t.running else "down"
+            try:
+                reach = await t.check_reachable()
+            except Exception:  # noqa: BLE001 - any failure means "down"
+                reach = ReachabilityStatus.DOWN
+            reach_txt = {
+                ReachabilityStatus.OK: "reachable",
+                ReachabilityStatus.DOWN: "UNREACHABLE",
+                ReachabilityStatus.NOT_APPLICABLE: "n/a",
+            }.get(reach, str(reach.value))
             caps = t.capabilities()
-            ident_kind = "anon" if not caps.carries_operator_identity else "callsign"
-            print(f"  - {t.name:<12} {state:<5} id={ident_kind}")
+            # Show the *actual* identity this transport uses, not just its kind.
+            # Callsign-carrying media (HF: js8call/winlink/mercury) identify with
+            # a callsign — from the transport's own config if set, else the
+            # station callsign. Anonymous media (Reticulum/MeshCore) expose a
+            # non-identifying address via local_identity().
+            if caps.carries_operator_identity:
+                cfg = getattr(t, "config", None)
+                own = ""
+                if isinstance(cfg, dict):
+                    own = str(cfg.get("callsign", "") or "").strip()
+                callsign = own or app.station.callsign
+                ident = f"callsign={callsign}" if callsign else "callsign=(unset)"
+            else:
+                anon = None
+                getter = getattr(t, "local_identity", None)
+                if callable(getter):
+                    try:
+                        anon = getter()
+                    except Exception:  # noqa: BLE001
+                        anon = None
+                ident = f"anon={anon}" if anon else "anon"
+            print(
+                f"  - {t.name:<12} {state:<5} {reach_txt:<11} {ident}"
+            )
         return 0
 
     return _run(_with_app(args.config, run))
@@ -415,6 +798,119 @@ def _cmd_tui(args: argparse.Namespace) -> int:
     from .ui import run_tui
 
     run_tui(args.config)
+    return 0
+
+
+def _cmd_db(args: argparse.Namespace) -> int:
+    """Database maintenance: stats, vacuum, and pruning (history + page cache)."""
+    from .core.nomad_cache import NomadPageCache
+    from .core.store import MessageStore
+    from .core.syshealth import format_bytes
+
+    cfg = Config.load(args.config)
+    db_path = cfg.database_path()
+    store = MessageStore(db_path)
+    cache = NomadPageCache(db_path)
+    try:
+        if args.action == "stats":
+            _print_db_stats(cfg, store, cache)
+            return 0
+        if args.action == "vacuum":
+            freed = store.vacuum()
+            print(f"VACUUM complete; reclaimed {format_bytes(freed)}.")
+            return 0
+        if args.action in ("prune", "cache-prune"):
+            days = args.days or int(
+                cfg.general.get("history_retention_days", 0) or 0
+            )
+            if days <= 0:
+                print(
+                    "error: specify --days N (no retention configured)",
+                    file=sys.stderr,
+                )
+                return 2
+            if args.action == "prune":
+                n = store.purge_older_than(days)
+                print(f"pruned {n} message(s) older than {days} day(s).")
+                if n:
+                    print("  tip: run 'radioapp db vacuum' to reclaim disk space.")
+            else:
+                n = cache.prune(days)
+                print(f"pruned {n} cached page(s) older than {days} day(s).")
+            return 0
+        if args.action == "cache-clear":
+            n = cache.clear()
+            print(f"cleared {n} cached NomadNet page(s).")
+            return 0
+    finally:
+        store.close()
+        cache.close()
+    return 1
+
+
+def _print_db_stats(cfg: Config, store, cache) -> None:
+    from .core.syshealth import collect, format_bytes
+
+    db_path = cfg.database_path()
+    s = store.stats()
+    c = cache.stats()
+    sys_h = collect(str(db_path))
+    print(f"database : {db_path}")
+    print(f"  size       : {format_bytes(s['size_bytes'])}")
+    span = f"   ({s['oldest'][:10]} … {s['newest'][:10]})" if s["oldest"] else ""
+    print(f"  messages   : {s['messages']} in {s['threads']} thread(s){span}")
+    print(
+        f"  page cache : {c['pages']} page(s), "
+        f"{format_bytes(c['content_bytes'])} of content"
+    )
+    retention = int(cfg.general.get("history_retention_days", 0) or 0)
+    print(
+        "  retention  : "
+        + (f"{retention} days" if retention > 0 else "keep forever (no pruning)")
+    )
+    if sys_h.disk_free is not None:
+        print(
+            f"  disk free  : {format_bytes(sys_h.disk_free)} "
+            f"of {format_bytes(sys_h.disk_total)}"
+        )
+
+
+def _cmd_backup(args: argparse.Namespace) -> int:
+    """Back up the config file + database (page cache included) to a .tar.gz."""
+    from .core.backup import create_backup
+    from .core.syshealth import format_bytes
+
+    cfg = Config.load(args.config)
+    res = create_backup(cfg.path, cfg.database_path(), args.out)
+    print(f"backup written: {res.path}  ({format_bytes(res.size_bytes)})")
+    print(
+        f"  config: {'yes' if res.config_included else 'no'}   "
+        f"database: {'yes' if res.db_included else 'no'}"
+    )
+    return 0
+
+
+def _cmd_restore(args: argparse.Namespace) -> int:
+    """Restore the config + database from a backup archive (with confirmation)."""
+    from .core.backup import read_manifest, restore_backup
+
+    cfg = Config.load(args.config)
+    manifest = read_manifest(args.archive)
+    if manifest:
+        print(
+            f"archive created: {manifest.get('created', '?')}  "
+            f"(config={manifest.get('config')}, database={manifest.get('database')})"
+        )
+    if not args.yes:
+        print(f"This will OVERWRITE:\n  {cfg.path}\n  {cfg.database_path()}")
+        if not _ask_bool("Proceed with restore?", False):
+            print("aborted.")
+            return 1
+    res = restore_backup(args.archive, cfg.path, cfg.database_path())
+    print(f"restored — config: {res.config_restored}, database: {res.db_restored}")
+    for sc in res.safety_copies:
+        print(f"  safety copy of previous file: {sc}")
+    print("Restart Radio_App to load the restored data.")
     return 0
 
 
@@ -472,6 +968,21 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     # -- general -------------------------------------------------------------
     print("General")
     display_name = _ask("Display name", cfg.display_name)
+    # History retention: messages and cached pages accumulate in the SQLite DB
+    # over time. 0 keeps everything forever (simplest, but the file grows without
+    # bound); a positive number auto-prunes anything older on each startup.
+    print(
+        "\n  Message history is kept in a local database that grows over time.\n"
+        "  Set how many days to keep (0 = keep everything forever; you can\n"
+        "  always prune later with 'radioapp db prune')."
+    )
+    retention_default = str(int(cfg.general.get("history_retention_days", 0) or 0))
+    retention_raw = _ask("History retention in days", retention_default)
+    try:
+        retention_days = max(0, int(retention_raw))
+    except ValueError:
+        print("  (not a number; keeping everything — 0 days)")
+        retention_days = 0
 
     # -- Reticulum -----------------------------------------------------------
     print("\nReticulum (encrypted internet / LoRa / serial via rnsd)")
@@ -604,6 +1115,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
     # -- write it all to the single config file ------------------------------
     cfg.set("general", "display_name", display_name)
+    cfg.set("general", "history_retention_days", retention_days)
     cfg.set("station", "callsign", station.callsign)
     cfg.set("station", "grid_square", station.grid_square)
     cfg.set("compliance", "allow_encrypted_on_hf", allow_enc)
@@ -853,15 +1365,56 @@ def _cmd_winlink(args: argparse.Namespace) -> int:
                 print(f"Already up to date (version {version}).")
             return 0
 
+        if args.action == "form":
+            if not hasattr(t, "get_form_template"):
+                print("This transport build cannot read forms.")
+                return 1
+            if not args.target:
+                print(
+                    "error: give a template path, e.g. "
+                    "radioapp winlink form ICS/ICS213.txt "
+                    "(see 'radioapp winlink forms')",
+                    file=sys.stderr,
+                )
+                return 2
+            try:
+                text = await t.get_form_template(args.target)
+            except Exception as exc:  # noqa: BLE001
+                print(f"Template fetch failed: {exc}")
+                return 1
+            if not text.strip():
+                print(
+                    f"No template text for '{args.target}'. Check the path "
+                    "from 'radioapp winlink forms' (and that Pat is reachable)."
+                )
+                return 1
+            print(f"Template: {args.target}\n")
+            print(text.rstrip())
+            fields = _winlink_form_fields(text)
+            if fields:
+                print("\nDetected fields (use --field NAME=VALUE):")
+                for name in fields:
+                    print(f"  {name}")
+            else:
+                print(
+                    "\n(No prompt fields auto-detected — this form may have no "
+                    "inputs, or use a layout we can't introspect. You can still "
+                    "pass --field NAME=VALUE for any prompt the template asks for.)"
+                )
+            return 0
+
+        if args.action == "compose-form":
+            return await _winlink_compose_form(t, args)
+
         # connect
         if not hasattr(t, "connect_now"):
             print("This transport build cannot start a session.")
             return 1
         url = None
-        if args.gateway:
+        if args.target:
             method = getattr(t, "_method", None)
             scheme = method.scheme if method is not None else "telnet"
-            url = f"{scheme}://{args.gateway}"
+            url = f"{scheme}://{args.target}"
         target = url or (
             t.connect_summary() if hasattr(t, "connect_summary") else "default"
         )
@@ -875,6 +1428,92 @@ def _cmd_winlink(args: argparse.Namespace) -> int:
         return 0
 
     return _run(_with_app(args.config, run))
+
+
+def _winlink_form_fields(template_text: str) -> list[str]:
+    """Discover a form's prompt field names (delegates to the transport helper)."""
+    from .transports.winlink_transport import detect_form_fields
+
+    return detect_form_fields(template_text)
+
+
+def _parse_field_args(field_args, responses_file) -> tuple[dict[str, str], str | None]:
+    """Merge ``--responses FILE`` + repeated ``--field K=V`` into one dict.
+
+    Returns ``(responses, error)``; ``error`` is a message (and the caller should
+    exit non-zero) when a ``--field`` lacks ``=`` or the JSON file is unreadable.
+    ``--field`` values win over the file on key collisions.
+    """
+    import json
+
+    responses: dict[str, str] = {}
+    if responses_file:
+        try:
+            with open(responses_file, encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, ValueError) as exc:
+            return {}, f"could not read --responses file: {exc}"
+        if not isinstance(data, dict):
+            return {}, "--responses file must be a JSON object of field: value"
+        responses.update({str(k): str(v) for k, v in data.items()})
+    for raw in field_args or []:
+        key, sep, value = raw.partition("=")
+        if not sep or not key.strip():
+            return {}, f"--field must be KEY=VALUE (got '{raw}')"
+        responses[key.strip()] = value
+    return responses, None
+
+
+async def _winlink_compose_form(t, args) -> int:
+    """Build a Winlink form from --field/--responses and queue it to the outbox."""
+    if not hasattr(t, "compose_form"):
+        print("This transport build cannot compose forms.")
+        return 1
+    if not args.target:
+        print(
+            "error: give a template path, e.g. "
+            "radioapp winlink compose-form ICS/ICS213.txt --field city=Boston "
+            "(see 'radioapp winlink forms' / 'radioapp winlink form <path>')",
+            file=sys.stderr,
+        )
+        return 2
+    responses, err = _parse_field_args(args.field, args.responses)
+    if err:
+        print(f"error: {err}", file=sys.stderr)
+        return 2
+    if not getattr(t, "running", False):
+        print("Winlink transport is not running (is Pat reachable?).")
+        return 1
+    try:
+        built = await t.compose_form(
+            args.target,
+            responses,
+            to=args.to,
+            cc=args.cc,
+            subject=args.subject,
+        )
+    except Exception as exc:  # noqa: BLE001
+        print(f"Form build failed: {exc}")
+        return 1
+    if built is None:
+        print(
+            "Form build failed. Check the template path and that Pat is "
+            "reachable; 'radioapp winlink forms' lists installed templates."
+        )
+        return 1
+    print("Form queued to Pat's outbox for review:\n")
+    print(f"  To      : {built.get('to') or '(none)'}")
+    if built.get("cc"):
+        print(f"  Cc      : {built['cc']}")
+    print(f"  Subject : {built.get('subject') or '(none)'}")
+    print("  Body    :")
+    for line in (built.get("body") or "").splitlines() or ["(empty)"]:
+        print(f"    {line}")
+    print(
+        "\nNothing has been transmitted yet — it sits in Pat's outbox. "
+        "Run 'radioapp winlink connect' to send it (or delete it from Pat)."
+    )
+    return 0
 
 
 def _cmd_js8(args: argparse.Namespace) -> int:
@@ -927,6 +1566,24 @@ def _cmd_js8(args: argparse.Namespace) -> int:
                 )
                 return 1
             print(f"Sent directed command: {args.target.upper()} {command.upper()}")
+            return 0
+
+        if args.action == "sms":
+            if not args.target or not args.rest:
+                print("usage: radioapp js8 sms <phone> <message text>")
+                return 1
+            phone, text = args.target, " ".join(args.rest)
+            ok = await t.send_sms(phone, text)
+            if not ok:
+                print(
+                    "Could not send the SMS. Check the phone number and that "
+                    "JS8Call's APRS gateway is enabled."
+                )
+                return 1
+            print(
+                f"Sent SMS to {phone} via APRS (SMSGTE) — JS8Call will transmit "
+                "it on the next cycle."
+            )
             return 0
 
         # relay
@@ -1036,17 +1693,62 @@ def _cmd_favorites(args: argparse.Namespace) -> int:
         for f in items:
             label = f"  ({f.label})" if f.label else ""
             print(f"  {f.id}{label}   last seen: {_ago(f.last_seen)}")
+            for key, value in f.meta.items():
+                print(f"      {key}: {value}")
         return 0
 
     if not args.identity:
-        print("error: identity is required for add/remove", file=sys.stderr)
+        print("error: identity is required for add/remove/set", file=sys.stderr)
         return 2
 
+    # Collect contact metadata from the convenience flags and any --meta KEY=VALUE
+    # pairs. A flag left unset (None) is ignored; an explicit empty string clears.
+    meta: dict[str, str] = {}
+    for flag, key in (
+        (args.name, "name"),
+        (args.grid, "gridsquare"),
+        (args.power, "power"),
+        (args.notes, "notes"),
+    ):
+        if flag is not None:
+            meta[key] = flag
+    for pair in args.meta:
+        if "=" not in pair:
+            print(f"error: --meta expects KEY=VALUE, got {pair!r}", file=sys.stderr)
+            return 2
+        key, value = pair.split("=", 1)
+        key = key.strip()
+        if key:
+            meta[key] = value.strip()
+
     if args.action == "add":
-        fav = favs.add(args.identity, args.label)
+        fav = favs.add(args.identity, args.label, meta=meta or None)
         favs.save(cfg)
         label = f"  ({fav.label})" if fav.label else ""
         print(f"added favorite: {fav.id}{label}")
+        for key, value in fav.meta.items():
+            print(f"  {key}: {value}")
+        return 0
+
+    if args.action == "set":
+        if not meta and not args.label:
+            print(
+                "error: 'set' needs at least one of "
+                "--name/--grid/--power/--notes/--meta/--label",
+                file=sys.stderr,
+            )
+            return 2
+        if args.label:
+            favs.set_label(args.identity, args.label)
+        fav = favs.set_meta(args.identity, meta) if meta else favs.match(args.identity)
+        favs.save(cfg)
+        if fav is None:
+            print("not found")
+            return 1
+        label = f"  ({fav.label})" if fav.label else ""
+        print(f"updated favorite: {fav.id}{label}")
+        for key, value in fav.meta.items():
+            print(f"  {key}: {value}")
         return 0
 
     if args.action == "remove":
@@ -1071,11 +1773,29 @@ def _cmd_browse(args: argparse.Namespace) -> int:
 
     async def run(app: App) -> int:
         res = await app.browser.fetch(
-            dest, path, field_data=fields or None, timeout=args.timeout
+            dest,
+            path,
+            field_data=fields or None,
+            timeout=args.timeout,
+            prefer_cache=args.offline,
+            cache_first=not args.live and not args.offline,
         )
         if not res.ok:
             print(f"error: {res.error}", file=sys.stderr)
             return 1
+        if res.from_cache:
+            from datetime import datetime
+
+            secs = max(0.0, (datetime.now(UTC) - res.fetched_at).total_seconds())
+            if secs < 90:
+                age = f"{secs:.0f}s ago"
+            elif secs < 5400:
+                age = f"{secs / 60:.0f}m ago"
+            elif secs < 172800:
+                age = f"{secs / 3600:.0f}h ago"
+            else:
+                age = f"{secs / 86400:.0f}d ago"
+            print(f"(cached copy — fetched {age}; may be stale)", file=sys.stderr)
         if args.raw:
             print(res.content)
             return 0
@@ -1111,6 +1831,40 @@ def _cmd_nodes(args: argparse.Namespace) -> int:
             name = n["name"] or "(unnamed)"
             print(f"  {n['dest']}  {name}")
         return 0
+
+    return _run(_with_app(args.config, run))
+
+
+def _cmd_nomad(args: argparse.Namespace) -> int:
+    """NomadNet maintenance commands (currently: cache sync)."""
+
+    async def run(app: App) -> int:
+        node_favs = [f for f in app.favorites.all() if f.kind == "node"]
+        if not node_favs:
+            print(
+                "(no NomadNet node favorites yet — save one with the TUI's "
+                "'Save node' action or 'radioapp favorites add <hash>')"
+            )
+            return 0
+        if not app.browser.available:
+            print(
+                "Reticulum transport is not running; cannot refresh pages "
+                "(start rnsd, then retry).",
+                file=sys.stderr,
+            )
+            return 1
+        print(f"Syncing {len(node_favs)} favorite node(s)...")
+        res = await app.browser.sync_favorites(
+            node_favs,
+            timeout=args.timeout,
+            follow_links=args.follow_links,
+        )
+        for label, status in res.pages:
+            print(f"  {status:>12}  {label}")
+        print(
+            f"done: {res.ok} cached, {res.failed} failed, {res.skipped} skipped"
+        )
+        return 0 if res.failed == 0 else 1
 
     return _run(_with_app(args.config, run))
 

@@ -199,7 +199,24 @@ class WinlinkTransport(Transport):
     def _connect_url_for(self, method_name: str) -> str:
         method = CONNECT_METHODS.get(method_name, CONNECT_METHODS[_DEFAULT_METHOD])
         gateway = self._gateway_for(method_name)
-        return f"{method.scheme}://{gateway}" if gateway else f"{method.scheme}://"
+        return self._pat_connect_string(method.scheme, gateway)
+
+    @staticmethod
+    def _pat_connect_string(scheme: str, gateway: str) -> str:
+        """Build the string handed to Pat's ``/api/connect?url=`` for a path.
+
+        For **telnet with no gateway** this returns Pat's built-in connect
+        *alias* ``"telnet"`` (not the bare URL ``telnet://``). Pat expands the
+        alias to the full CMS URL **including the target callsign**
+        (``telnet://{mycall}:CMSTelnet@cms.winlink.org:8772/wl2k``); a bare
+        ``telnet://`` has no target and Pat rejects it with "Invalid or missing
+        target callsign". RF schemes keep ``<scheme>://<gateway>`` — they
+        genuinely need an RMS gateway callsign as the target.
+        """
+        gateway = (gateway or "").strip()
+        if scheme == "telnet" and not gateway:
+            return "telnet"
+        return f"{scheme}://{gateway}" if gateway else f"{scheme}://"
 
     @property
     def _poll_interval(self) -> float:
@@ -221,18 +238,19 @@ class WinlinkTransport(Transport):
         return bool(self.config.get("auto_connect", False))
 
     def build_connect_url(self) -> str:
-        """Compose the Pat ``connect`` URL from config.
+        """Compose the Pat ``connect`` string from config.
 
-        A raw ``connect_url`` in config wins (full escape hatch). Otherwise the
-        URL is ``<scheme>://<gateway>`` using the configured method; for telnet
-        with no gateway, Pat's bare ``telnet://`` default CMS host is used.
+        A raw ``connect_url`` in config wins (full escape hatch). Otherwise it is
+        ``<scheme>://<gateway>`` using the configured method; for **telnet with
+        no gateway** it is Pat's built-in ``telnet`` alias (which expands to the
+        full CMS URL with a target callsign) — a bare ``telnet://`` is rejected
+        by Pat as "Invalid or missing target callsign".
         """
         raw = str(self.config.get("connect_url", "")).strip()
         if raw:
             return raw
         gateway = str(self.config.get("gateway", "")).strip()
-        scheme = self._method.scheme
-        return f"{scheme}://{gateway}" if gateway else f"{scheme}://"
+        return self._pat_connect_string(self._method.scheme, gateway)
 
     # -- capabilities ---------------------------------------------------------
 
@@ -243,8 +261,12 @@ class WinlinkTransport(Transport):
         if self.is_auto:
             methods = [CONNECT_METHODS[n] for n in self._connect_order()]
             needs_internet = bool(methods) and all(m.needs_internet for m in methods)
+            # Uses the shared radio if ANY configured path drives an RF modem
+            # (telnet-only never touches the radio; an RF fallback can).
+            uses_radio = any(m.needs_modem for m in methods)
         else:
             needs_internet = self._method.needs_internet
+            uses_radio = self._method.needs_modem
         return TransportCapabilities(
             max_message_size=120_000,        # email-class: bodies + attachments
             supports_broadcast=False,        # point-to-mailbox, not on-air bcast
@@ -258,6 +280,7 @@ class WinlinkTransport(Transport):
             address_scheme="email",          # callsign-based Winlink address
             carries_operator_identity=True,  # amateur: identify with callsign
             prohibits_encryption=True,        # amateur HF rules apply on RF
+            uses_shared_radio=uses_radio,     # only when an RF modem path is used
         )
 
     def local_identity(self) -> str | None:
@@ -601,6 +624,7 @@ class WinlinkTransport(Transport):
     async def _connect_auto(self) -> int:
         """Try each method in order; first reachable + connecting one wins."""
         tried: list[str] = []
+        errors: list[str] = []
         for name in self._connect_order():
             method = CONNECT_METHODS[name]
             port = self._probe_port_for(method)
@@ -619,18 +643,43 @@ class WinlinkTransport(Transport):
                 return received
             except Exception as exc:  # noqa: BLE001 - try the next method
                 log.info("Winlink auto: %s failed (%s).", name, exc)
+                errors.append(f"{name}: {exc}")
+        # Surface Pat's actual error(s) so the failure is diagnosable (bad
+        # password, no internet, CMS refused, modem down) instead of opaque.
+        detail = "; ".join(errors) if errors else "none reachable"
         raise RuntimeError(
-            "no Winlink path succeeded "
-            f"(attempted: {', '.join(tried) or 'none reachable'})"
+            f"no Winlink path succeeded (attempted: "
+            f"{', '.join(tried) or 'none reachable'}) — {detail}"
         )
 
     async def _attempt_connect(self, url: str) -> int:
-        """Dial one connect URL via Pat; raise on session failure (HTTP 5xx)."""
+        """Dial one connect URL via Pat; raise on session failure (HTTP 5xx).
+
+        On an HTTP error, Pat's response body usually explains *why* the session
+        failed (e.g. "no command response from CMS", a secure-login problem, or a
+        connection refusal); we include it in the raised error so the operator
+        sees the real cause rather than a bare status code.
+        """
         log.info("Winlink connecting: %s", url)
         query = urllib.parse.urlencode({"url": url})
-        body = await asyncio.to_thread(
-            self._http_get, f"/api/connect?{query}", _HTTP_TIMEOUT_S
-        )
+        try:
+            body = await asyncio.to_thread(
+                self._http_get, f"/api/connect?{query}", _HTTP_TIMEOUT_S
+            )
+        except urllib.error.HTTPError as exc:
+            detail = ""
+            try:
+                detail = exc.read().decode("utf-8", "replace").strip()
+            except Exception:  # noqa: BLE001
+                detail = ""
+            raise RuntimeError(
+                f"Pat rejected the {url!r} session "
+                f"(HTTP {exc.code}{': ' + detail if detail else ''})"
+            ) from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(
+                f"could not reach Pat at {self._pat_url} ({exc.reason})"
+            ) from exc
         received = 0
         try:
             received = int(json.loads(body).get("NumReceived", 0))
@@ -775,31 +824,79 @@ class WinlinkTransport(Transport):
         self,
         on_event: Callable[[dict], None],
         should_stop: Callable[[], bool],
+        *,
+        on_prompt: Callable[[dict], asyncio.Future | object] | None = None,
     ) -> None:
         """Stream Pat's live ``/ws`` events as decoded dicts to ``on_event``.
 
         Best-effort live session feedback (Status/Progress/Notification). Parses
         the host/port from ``pat_url`` and opens a minimal WebSocket; any failure
         is swallowed so the UI never breaks if Pat has no WebSocket.
+
+        ``on_prompt`` (optional) is an async callable invoked when Pat asks for a
+        **secure-login password** mid-session (it only does this when no password
+        is set in Pat's own config). It receives the prompt dict and returns the
+        password string (or ``None`` to decline); the answer is sent back over
+        the same WebSocket as a ``prompt_response``. This is what enables
+        per-session credentials without storing the password anywhere.
         """
         from . import winlink_ws
 
         parts = urllib.parse.urlsplit(self._pat_url)
         host = parts.hostname or "127.0.0.1"
         port = parts.port or (443 if parts.scheme == "https" else 80)
+        outgoing: asyncio.Queue[str] = asyncio.Queue()
+        tasks: set[asyncio.Task] = set()
 
         def _on_text(text: str) -> None:
             try:
                 event = json.loads(text)
             except (ValueError, json.JSONDecodeError):
                 return
-            if isinstance(event, dict):
-                on_event(event)
+            if not isinstance(event, dict):
+                return
+            prompt = event.get("Prompt")
+            if (
+                on_prompt is not None
+                and isinstance(prompt, dict)
+                and str(prompt.get("kind")) == "password"
+            ):
+                # Answer asynchronously so the WS read loop is never blocked
+                # while the operator types; the response is queued for sending.
+                task = asyncio.create_task(
+                    self._answer_password_prompt(prompt, on_prompt, outgoing)
+                )
+                tasks.add(task)
+                task.add_done_callback(tasks.discard)
+                return
+            on_event(event)
 
         try:
-            await winlink_ws.stream(host, port, "/ws", _on_text, should_stop)
+            await winlink_ws.stream(
+                host, port, "/ws", _on_text, should_stop, outgoing=outgoing
+            )
         except Exception as exc:  # noqa: BLE001 - feedback is optional
             log.debug("Winlink event stream ended: %s", exc)
+
+    async def _answer_password_prompt(
+        self,
+        prompt: dict,
+        on_prompt: Callable[[dict], object],
+        outgoing: asyncio.Queue[str],
+    ) -> None:
+        """Resolve a password via ``on_prompt`` and queue Pat's prompt_response."""
+        try:
+            value = await on_prompt(prompt)  # type: ignore[misc]
+        except Exception as exc:  # noqa: BLE001
+            log.debug("Winlink password prompt handler failed: %s", exc)
+            value = None
+        if not value:
+            return
+        outgoing.put_nowait(
+            json.dumps(
+                {"prompt_response": {"id": prompt.get("id", ""), "value": value}}
+            )
+        )
 
     async def list_gateways(
         self, mode: str | None = None, prefix: str | None = None
@@ -1003,6 +1100,33 @@ class WinlinkTransport(Transport):
         if len(first) > 60:
             first = first[:57] + "..."
         return first or "(no subject)"
+
+
+def detect_form_fields(template_text: str) -> list[str]:
+    """Best-effort discovery of a form's prompt field names from its text.
+
+    Winlink/Pat templates expose inputs in a few shapes; we scan for the common
+    ones so the CLI/TUI can suggest fields to fill. Returns a de-duplicated,
+    order-preserving list. Unknown layouts simply yield ``[]`` — the user can
+    still supply any field the form asks for.
+    """
+    import re
+
+    names: list[str] = []
+    seen: set[str] = set()
+    patterns = (
+        r"<(?:var|ask)\s+([A-Za-z0-9_]+)",            # <Var City> / <Ask Name>
+        r'name\s*=\s*["\']([A-Za-z0-9_]+)["\']',       # HTML input name="city"
+        r"\{([A-Za-z0-9_]+)\}",                         # {City} placeholders
+    )
+    for pat in patterns:
+        for m in re.finditer(pat, template_text, flags=re.IGNORECASE):
+            name = m.group(1)
+            low = name.lower()
+            if low not in seen:
+                seen.add(low)
+                names.append(name)
+    return names
 
 
 def _flatten_form_folder(node: object, prefix: str, out: list[dict]) -> None:

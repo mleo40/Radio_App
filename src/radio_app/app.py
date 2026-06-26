@@ -7,6 +7,7 @@ which keeps the user interface a thin layer over a transport-agnostic core.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .config import Config
@@ -14,7 +15,9 @@ from .core.compliance import ComplianceGuard
 from .core.favorites import Favorites
 from .core.filters import FilterEngine
 from .core.groups import GroupRegistry
+from .core.nomad_cache import NomadPageCache
 from .core.nomadnet import NomadnetBrowser
+from .core.radio_interlock import RadioInterlock
 from .core.router import Router
 from .core.selector import SelectionMode
 from .core.station import Station
@@ -38,13 +41,20 @@ class App:
         )
         self.favorites = Favorites.from_config(config)
         self.transports = load_transports(config.enabled_transports())
+        # Radio interlock: the transports that drive the one physical HF radio
+        # (JS8Call, Pat/Winlink over an RF modem, Mercury) must not key up over
+        # each other. This single-owner token gates our transmit actions; the UI
+        # claims/releases it as the operator switches modes / runs sessions.
+        self.radio_interlock = RadioInterlock(self._radio_contenders())
         # HF transports route inbound traffic by our callsign (a message "TO" us
         # is DIRECT). Push the operator identity from [station] into any transport
         # that accepts it, so users don't have to duplicate it per transport block.
         self._apply_station_identity()
-        # Read-only NomadNet page browser over the Reticulum transport (if any).
+        # Read-only NomadNet page browser over the Reticulum transport (if any),
+        # with an offline page cache backed by the same database file.
         ret = next((t for t in self.transports if t.name == "reticulum"), None)
-        self.browser = NomadnetBrowser(ret)
+        self.nomad_cache = NomadPageCache(config.database_path())
+        self.browser = NomadnetBrowser(ret, cache=self.nomad_cache)
         self.router = Router(
             transports=self.transports,
             store=self.store,
@@ -59,6 +69,22 @@ class App:
     @classmethod
     def from_config_path(cls, path: str | None = None) -> App:
         return cls(Config.load(path))
+
+    def _radio_contenders(self) -> list[str]:
+        """Names of transports that drive the one physical HF radio.
+
+        These are gated by the radio interlock so they don't transmit over each
+        other. Winlink reports this dynamically: it only contends when an RF
+        modem path is configured (telnet-only never touches the radio).
+        """
+        names: list[str] = []
+        for t in self.transports:
+            try:
+                if t.capabilities().uses_shared_radio:
+                    names.append(t.name)
+            except Exception:  # noqa: BLE001 - a bad capability never blocks startup
+                continue
+        return names
 
     def _default_mode(self) -> SelectionMode:
         try:
@@ -83,11 +109,17 @@ class App:
     # -- lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
-        for transport in self.transports:
+        # Start every transport concurrently so a slow/unreachable one (e.g. a
+        # JS8Call host that's off the network, where the TCP connect sits in a
+        # multi-second SYN timeout) doesn't serialise startup behind itself.
+        async def _start_one(transport) -> None:
             try:
                 await transport.start()
             except Exception:  # noqa: BLE001
                 log.exception("failed to start transport %s", transport.name)
+
+        if self.transports:
+            await asyncio.gather(*(_start_one(t) for t in self.transports))
         # Apply retention policy on startup.
         days = int(self.config.general.get("history_retention_days", 0) or 0)
         if days > 0:
@@ -109,6 +141,7 @@ class App:
             except Exception:  # noqa: BLE001
                 log.exception("failed to stop transport %s", transport.name)
         self.store.close()
+        self.nomad_cache.close()
         self._started = False
 
     @property

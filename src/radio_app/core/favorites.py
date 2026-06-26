@@ -21,12 +21,16 @@ is it a fresh come-online event?" — which keeps that logic unit-testable.
 from __future__ import annotations
 
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 
 from ..config import Config
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")
+
+#: Reserved keys that have their own column in the persisted entry and therefore
+#: must never be stored inside the free-form ``meta`` map.
+_RESERVED_META_KEYS = frozenset({"id", "label", "last_seen", "kind", "meta"})
 
 # A favorite silent for at least this long is treated as a fresh "back online"
 # event the next time it is heard.
@@ -51,6 +55,31 @@ def _parse_ts(raw: object) -> datetime | None:
     return ts
 
 
+def _parse_meta(entry: dict) -> dict[str, str]:
+    """Extract the free-form metadata map from a persisted favorite entry.
+
+    Accepts metadata nested under a ``meta`` table (the canonical form) and is
+    tolerant of legacy flat keys: any unknown top-level key is folded into the
+    metadata map so hand-edited configs keep working. Values are coerced to
+    strings for predictable display and TOML round-tripping.
+    """
+    meta: dict[str, str] = {}
+    raw = entry.get("meta")
+    if isinstance(raw, dict):
+        for key, value in raw.items():
+            key = str(key).strip()
+            if key and value not in (None, ""):
+                meta[key] = str(value)
+    # Tolerate metadata stored as flat top-level keys (hand-edited configs).
+    for key, value in entry.items():
+        key = str(key).strip()
+        if key in _RESERVED_META_KEYS or key in meta:
+            continue
+        if value not in (None, ""):
+            meta[key] = str(value)
+    return meta
+
+
 @dataclass
 class Favorite:
     id: str                       # callsign/label OR full/long hex hash
@@ -61,10 +90,15 @@ class Favorite:
     #: Persisted so a node saved while offline still opens the page browser
     #: rather than being mistaken for a peer.
     kind: str = ""
+    #: Free-form, operator-supplied metadata about the contact — e.g.
+    #: ``{"name": "Bob", "gridsquare": "FN31pr", "power": "5W",
+    #: "notes": "QRP CW"}``. Keys are arbitrary so callers can store whatever
+    #: they like; values are kept as strings for clean TOML round-tripping.
+    meta: dict[str, str] = field(default_factory=dict)
 
     @property
     def display(self) -> str:
-        return self.label or self.id
+        return self.meta.get("name") or self.label or self.id
 
 
 @dataclass
@@ -103,6 +137,7 @@ class Favorites:
                     label=str(entry.get("label", "") or ""),
                     last_seen=_parse_ts(entry.get("last_seen")),
                     kind=str(entry.get("kind", "") or ""),
+                    meta=_parse_meta(entry),
                 )
             )
         return cls(items)
@@ -119,6 +154,7 @@ class Favorites:
                     if f.last_seen is not None
                     else {}
                 ),
+                **({"meta": dict(f.meta)} if f.meta else {}),
             }
             for f in self._items
         ]
@@ -188,13 +224,18 @@ class Favorites:
 
     # -- mutations ------------------------------------------------------------
 
-    def add(self, identity: str, label: str = "", kind: str = "") -> Favorite:
+    def add(self, identity: str, label: str = "", kind: str = "",
+            meta: dict[str, str] | None = None) -> Favorite:
         """Add or update a favorite; returns the live instance.
 
         ``kind`` ("node" | "peer" | "callsign" | "") records how the favorite
         should be opened/grouped and is persisted, so e.g. a NomadNet server
         saved while offline still opens the page browser instead of being
         treated as a messageable peer.
+
+        ``meta`` is a free-form map of contact details (name, gridsquare,
+        power, notes, ...). When updating an existing favorite the supplied
+        keys are merged in; pass an empty string as a value to delete a key.
         """
         ident = identity.strip()
         if not ident:
@@ -207,8 +248,12 @@ class Favorites:
             if kind and existing.kind != kind:
                 existing.kind = kind
                 self._dirty = True
+            if meta:
+                self._merge_meta(existing, meta)
             return existing
         fav = Favorite(id=ident, label=label.strip(), kind=kind.strip())
+        if meta:
+            self._merge_meta(fav, meta)
         self._items.append(fav)
         self._dirty = True
         return fav
@@ -238,4 +283,34 @@ class Favorites:
             fav.label = label
             self._dirty = True
         return fav
+
+    def set_meta(self, identity: str, meta: dict[str, str]) -> Favorite | None:
+        """Set/merge free-form metadata (name, gridsquare, power, notes, ...).
+
+        Creates the entry if it doesn't exist yet (so you can annotate a
+        contact you haven't otherwise saved). A key whose value is an empty
+        string is removed. Returns the live :class:`Favorite`, or ``None`` if
+        there was nothing to do (no existing entry and no non-empty values).
+        """
+        fav = self.match(identity)
+        if fav is None:
+            if not any(v.strip() for v in meta.values()):
+                return None
+            fav = self.add(identity)
+        self._merge_meta(fav, meta)
+        return fav
+
+    def _merge_meta(self, fav: Favorite, meta: dict[str, str]) -> None:
+        """Apply a metadata patch in-place, deleting keys with empty values."""
+        for key, value in meta.items():
+            key = str(key).strip()
+            if key in _RESERVED_META_KEYS or not key:
+                continue
+            value = str(value).strip()
+            if not value:
+                if fav.meta.pop(key, None) is not None:
+                    self._dirty = True
+            elif fav.meta.get(key) != value:
+                fav.meta[key] = value
+                self._dirty = True
 

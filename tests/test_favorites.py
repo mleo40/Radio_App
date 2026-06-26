@@ -194,4 +194,87 @@ def test_save_and_reload_preserves_last_seen():
     assert fav.last_seen == t0
 
 
+# -- contact metadata (name / gridsquare / power / notes / custom) -----------
+
+
+def test_add_with_meta_stored_and_displayed():
+    favs = Favorites()
+    fav = favs.add(
+        "KD2ABC",
+        meta={"name": "Bob", "gridsquare": "FN31pr", "power": "5W"},
+    )
+    assert fav.meta["gridsquare"] == "FN31pr"
+    assert fav.meta["power"] == "5W"
+    # A name takes precedence over label/id in display.
+    assert fav.display == "Bob"
+
+
+def test_set_meta_merges_and_marks_dirty():
+    favs = Favorites()
+    favs.add("KD2ABC")
+    favs._dirty = False
+    fav = favs.set_meta("kd2abc", {"gridsquare": "FN31"})
+    assert fav is not None
+    assert fav.meta == {"gridsquare": "FN31"}
+    assert favs.dirty is True
+    # Merging keeps existing keys and adds new ones.
+    favs.set_meta("KD2ABC", {"power": "10W"})
+    assert favs.match("KD2ABC").meta == {"gridsquare": "FN31", "power": "10W"}
+
+
+def test_set_meta_empty_value_deletes_key():
+    favs = Favorites()
+    favs.add("KD2ABC", meta={"gridsquare": "FN31", "power": "5W"})
+    favs.set_meta("KD2ABC", {"power": ""})
+    assert favs.match("KD2ABC").meta == {"gridsquare": "FN31"}
+
+
+def test_set_meta_creates_entry_for_new_id():
+    favs = Favorites()
+    fav = favs.set_meta("W1AW", {"name": "Hiram"})
+    assert fav is not None
+    assert favs.match("W1AW").meta["name"] == "Hiram"
+
+
+def test_set_meta_all_empty_for_missing_is_noop():
+    favs = Favorites()
+    assert favs.set_meta("W1AW", {"name": ""}) is None
+    assert favs.all() == []
+
+
+def test_meta_ignores_reserved_keys():
+    favs = Favorites()
+    fav = favs.add("KD2ABC", meta={"id": "spoof", "name": "Bob"})
+    assert "id" not in fav.meta
+    assert fav.id == "KD2ABC"
+    assert fav.meta["name"] == "Bob"
+
+
+def test_save_and_reload_preserves_meta():
+    cfg = _FakeConfig()
+    favs = Favorites()
+    favs.add("KD2ABC", "Bob", meta={"gridsquare": "FN31pr", "power": "5W"})
+    favs.save(cfg)
+
+    reloaded = Favorites.from_config(cfg)
+    fav = reloaded.match("KD2ABC")
+    assert fav is not None
+    assert fav.meta == {"gridsquare": "FN31pr", "power": "5W"}
+
+
+def test_from_config_tolerates_flat_legacy_meta_keys():
+    # Hand-edited config with metadata as flat top-level keys.
+    cfg = _FakeConfig()
+    cfg.data = {
+        "favorites": [
+            {"id": "KD2ABC", "label": "Bob", "gridsquare": "FN31", "power": "5W"}
+        ]
+    }
+    favs = Favorites.from_config(cfg)
+    fav = favs.match("KD2ABC")
+    assert fav is not None
+    assert fav.meta == {"gridsquare": "FN31", "power": "5W"}
+
+
+
 

@@ -119,6 +119,16 @@ class UnifiedMessage:
         """Approximate wire size of the body in bytes."""
         return len(self.content.encode("utf-8"))
 
+    @property
+    def groups(self) -> list[str]:
+        """Operator-declared groups this message was aggregated into.
+
+        Stamped by the router from the :class:`GroupRegistry` (by sender
+        membership or tag). Empty unless cross-mode grouping matched.
+        """
+        g = self.metadata.get("groups")
+        return list(g) if isinstance(g, list) else []
+
     def to_dict(self) -> dict:
         return {
             "msg_id": self.msg_id,

@@ -116,6 +116,28 @@ def test_favorites_view_add_classify_and_remove(config_path):
     asyncio.run(run())
 
 
+def test_nomad_bar_buttons_visible_on_home(config_path):
+    """The NomadNet home screen shows its action-bar buttons immediately.
+
+    Regression: the buttons were clipped (no #nomad-bar Button height rule) and
+    only appeared after opening a server forced a relayout.
+    """
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_nomadnet()
+            await pilot.pause()
+            sync = app.query_one("#nomad-sync", Button)
+            fav = app.query_one("#nomad-fav", Button)
+            for btn in (sync, fav):
+                assert btn.display is True
+                assert btn.region.width > 0
+                assert btn.region.height > 0
+
+    asyncio.run(run())
+
+
 def test_view_switching(config_path):
     async def run():
         app = RadioTUI(config_path)
@@ -979,6 +1001,66 @@ def test_meshcore_channels_listed_in_panel(config_path):
     asyncio.run(run())
 
 
+def test_health_board_shows_system_section(config_path):
+    """The Health board includes a host System section + database size line."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_health()
+            await pilot.pause()
+            log = app.query_one("#health-log")
+            written = []
+            orig = log.write
+            log.write = lambda *a, **k: written.append(a[0] if a else "")
+            try:
+                app._render_health()
+            finally:
+                log.write = orig
+            joined = "\n".join(str(w) for w in written)
+            assert "System" in joined          # host resources header
+            assert "disk" in joined            # free disk space line
+            assert "data" in joined            # database size / counts line
+
+    asyncio.run(run())
+
+
+def test_health_board_shows_power_line(config_path, monkeypatch):
+    """The Health board shows a battery/power line when a battery is present."""
+    from radio_app.core import syshealth
+
+    def fake_collect(disk_path=None):
+        return syshealth.SystemHealth(
+            disk_total=100, disk_free=50, disk_used_percent=50.0,
+            battery_percent=42.0, power_plugged=False,
+            battery_secs_left=3 * 3600 + 12 * 60, has_battery=True,
+        )
+
+    monkeypatch.setattr(syshealth, "collect", fake_collect)
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_health()
+            await pilot.pause()
+            log = app.query_one("#health-log")
+            written = []
+            orig = log.write
+            log.write = lambda *a, **k: written.append(a[0] if a else "")
+            try:
+                app._render_health()
+            finally:
+                log.write = orig
+            joined = "\n".join(str(w) for w in written)
+            assert "power" in joined            # battery/power line present
+            assert "42%" in joined              # charge percentage
+            assert "on battery" in joined       # discharging state
+            assert "3h12m" in joined            # runtime estimate
+
+    asyncio.run(run())
+
+
 def test_health_renders_with_no_rns_interface_stats(config_path):
     """Health view must render even when Reticulum can't be queried (no rnsd).
 
@@ -1708,6 +1790,88 @@ def test_outbound_and_anonymous_senders_are_not_clickable(config_path):
 
     asyncio.run(run())
 
+
+def test_watch_group_filter_cycles_and_filters(groups_config_path):
+    """The Watch [g] filter cycles off -> each group -> off and filters rows."""
+    from radio_app.core.message import DeliveryStatus
+
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            # @TTP net, @TTPNE net, and an unrelated direct message.
+            msgs = [
+                UnifiedMessage.to_group(
+                    "W1AW", "TTP", "ttp net", transport="js8call"
+                ),
+                UnifiedMessage.to_group(
+                    "K2ABC", "TTPNE", "ne net", transport="js8call"
+                ),
+                UnifiedMessage(
+                    sender="N0CALL", content="hi", transport="js8call",
+                    recipient="me",
+                ),
+            ]
+            for m in msgs:
+                m.status = DeliveryStatus.RECEIVED
+                app._append_monitor(m)
+            await pilot.pause()
+            assert len(app._monitor_entries) == 3  # no filter: all shown
+
+            app._cycle_watch_group()                # -> first group (TTP)
+            await pilot.pause()
+            assert app._monitor_group_filter == "TTP"
+            assert app._monitor_entries == [("@TTP", "js8call")]
+
+            app._cycle_watch_group()                # -> TTPNE
+            assert app._monitor_group_filter == "TTPNE"
+            assert app._monitor_entries == [("@TTPNE", "js8call")]
+
+            app._cycle_watch_group()                # -> off again
+            assert app._monitor_group_filter is None
+            assert len(app._monitor_entries) == 3
+
+    asyncio.run(run())
+
+
+def test_watch_group_and_fav_filters_mutually_exclusive(groups_config_path):
+    """Selecting a group clears favorites-only and vice-versa."""
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            # Favorites on, then pick a group -> favorites clears.
+            app._toggle_fav_only()
+            assert app._monitor_fav_only is True
+            app._cycle_watch_group()
+            assert app._monitor_group_filter == "TTP"
+            assert app._monitor_fav_only is False
+            # Favorites on again -> the group filter clears.
+            app._toggle_fav_only()
+            assert app._monitor_fav_only is True
+            assert app._monitor_group_filter is None
+
+    asyncio.run(run())
+
+
+def test_cycle_watch_group_action_only_on_watch(groups_config_path):
+    """The [g] group-filter action is enabled only on the Watch surface."""
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            assert app.check_action("cycle_watch_group", ()) is True
+            app._select_mode("js8call")
+            await pilot.pause()
+            assert app.check_action("cycle_watch_group", ()) is False
+
+    asyncio.run(run())
 
 
 

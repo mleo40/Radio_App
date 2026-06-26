@@ -47,6 +47,32 @@ def build_handshake(host: str, port: int, path: str, key: str) -> bytes:
     ).encode()
 
 
+def encode_text_frame(text: str) -> bytes:
+    """Encode ``text`` as a masked client text frame (RFC 6455).
+
+    Client→server frames MUST be masked, so we generate a 4-byte mask and XOR
+    the payload. Used to answer Pat's interactive prompts (e.g. a per-session
+    secure-login password) over the same WebSocket we read events from.
+    """
+    payload = text.encode("utf-8")
+    header = bytearray()
+    header.append(0x80 | _OP_TEXT)  # FIN + text opcode
+    length = len(payload)
+    mask_bit = 0x80
+    if length < 126:
+        header.append(mask_bit | length)
+    elif length < 65536:
+        header.append(mask_bit | 126)
+        header += length.to_bytes(2, "big")
+    else:
+        header.append(mask_bit | 127)
+        header += length.to_bytes(8, "big")
+    mask = os.urandom(4)
+    header += mask
+    masked = bytes(b ^ mask[i % 4] for i, b in enumerate(payload))
+    return bytes(header) + masked
+
+
 def decode_frames(buf: bytes) -> tuple[list[tuple[int, bytes]], bytes]:
     """Decode as many complete frames as ``buf`` contains.
 
@@ -103,12 +129,17 @@ async def stream(
     should_stop: Callable[[], bool],
     *,
     connect_timeout: float = 5.0,
+    outgoing: asyncio.Queue[str] | None = None,
 ) -> None:
     """Open ``ws://host:port/path`` and call ``on_text`` for each text frame.
 
     Polls ``should_stop`` between reads so the caller can cancel cleanly when a
     session ends. Returns when the socket closes, ``should_stop`` is True, or on
     any connection error (logged by the caller, never raised through the UI).
+
+    When an ``outgoing`` queue is given, any strings placed on it are sent to the
+    server as masked text frames between reads — used to answer Pat's prompts
+    (e.g. a per-session secure-login password).
     """
     reader, writer = await asyncio.wait_for(
         asyncio.open_connection(host, port), connect_timeout
@@ -125,6 +156,15 @@ async def stream(
             raise ConnectionError(f"WebSocket upgrade failed: {status_line!r}")
         buf = b""
         while not should_stop():
+            # Flush any queued outbound messages (e.g. a prompt_response) first.
+            if outgoing is not None:
+                while not outgoing.empty():
+                    try:
+                        msg = outgoing.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    writer.write(encode_text_frame(msg))
+                    await writer.drain()
             try:
                 chunk = await asyncio.wait_for(reader.read(4096), 0.5)
             except TimeoutError:

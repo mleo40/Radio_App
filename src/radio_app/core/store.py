@@ -177,6 +177,65 @@ class MessageStore:
         )
         return [self._row_to_message(r) for r in cur.fetchall()]
 
+    def query(
+        self,
+        *,
+        thread: str | None = None,
+        transport: str | None = None,
+        sender: str | None = None,
+        group: str | None = None,
+        text: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+        limit: int = 200,
+        newest_first: bool = True,
+    ) -> list[UnifiedMessage]:
+        """Flexible read-only history/search query. All filters are ANDed.
+
+        ``sender`` and ``text`` match case-insensitive substrings; ``thread``,
+        ``transport`` and ``group`` match exactly (``group`` tolerates a leading
+        ``@``). ``since``/``until`` bound the message timestamp (inclusive) — the
+        stored ISO-8601 UTC strings sort chronologically, so plain comparison is
+        correct.
+
+        ``limit`` always bounds the *most recent* matches (newest N); pass
+        ``newest_first=False`` to return those N oldest-first for a
+        conversation-style read.
+        """
+        clauses: list[str] = []
+        params: list[object] = []
+        if thread:
+            clauses.append("thread_key = ?")
+            params.append(thread)
+        if transport:
+            clauses.append("transport = ?")
+            params.append(transport)
+        if sender:
+            clauses.append("LOWER(sender) LIKE LOWER(?)")
+            params.append(f"%{sender}%")
+        if group:
+            clauses.append("group_name = ?")
+            params.append(group.lstrip("@"))
+        if text:
+            clauses.append("content LIKE ?")
+            params.append(f"%{text}%")
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("timestamp <= ?")
+            params.append(until.isoformat())
+        where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
+        params.append(max(1, limit))
+        rows = self._conn.execute(
+            f"SELECT * FROM messages{where} ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+        msgs = [self._row_to_message(r) for r in rows]
+        if not newest_first:
+            msgs.reverse()
+        return msgs
+
     def delete_thread(self, thread_key: str) -> int:
         """Delete every message in a conversation. Returns rows removed.
 
@@ -207,6 +266,50 @@ class MessageStore:
         )
         self._conn.commit()
         return len(to_delete)
+
+    # -- maintenance ----------------------------------------------------------
+
+    def stats(self) -> dict:
+        """Summarise the message store for ``db stats`` / the Health board.
+
+        Returns message + thread counts, the oldest/newest timestamps, and the
+        on-disk size of the database file (which holds every table, including the
+        NomadNet page cache).
+        """
+        row = self._conn.execute(
+            """
+            SELECT COUNT(*) AS n, MIN(timestamp) AS oldest, MAX(timestamp) AS newest
+            FROM messages
+            """
+        ).fetchone()
+        threads = self._conn.execute(
+            "SELECT COUNT(DISTINCT thread_key) AS t FROM messages"
+        ).fetchone()
+        return {
+            "messages": row["n"] or 0,
+            "threads": threads["t"] or 0,
+            "oldest": row["oldest"],
+            "newest": row["newest"],
+            "size_bytes": self.path.stat().st_size if self.path.exists() else 0,
+        }
+
+    def vacuum(self) -> int:
+        """Rebuild the database to reclaim free pages. Returns bytes freed.
+
+        SQLite never shrinks the file on its own after deletes, so without a
+        periodic VACUUM the database only grows. VACUUM cannot run inside a
+        transaction, so we drop to autocommit for the duration.
+        """
+        before = self.path.stat().st_size if self.path.exists() else 0
+        prev_isolation = self._conn.isolation_level
+        try:
+            self._conn.isolation_level = None  # autocommit so VACUUM is allowed
+            self._conn.execute("VACUUM")
+        finally:
+            self._conn.isolation_level = prev_isolation
+        after = self.path.stat().st_size if self.path.exists() else 0
+        return max(0, before - after)
+
 
     # -- helpers --------------------------------------------------------------
 

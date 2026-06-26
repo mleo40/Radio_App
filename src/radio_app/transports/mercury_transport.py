@@ -40,6 +40,7 @@ class MercuryTransport(Transport):
             address_scheme="node_id",
             carries_operator_identity=True,  # amateur HF: identify with callsign
             prohibits_encryption=True,       # encryption prohibited on amateur HF
+            uses_shared_radio=True,          # drives the one HF radio (sound+CAT+PTT)
         )
 
     async def start(self) -> None:

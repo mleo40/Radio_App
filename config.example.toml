@@ -5,6 +5,11 @@ favorites = [
 [general]
 display_name = "Anonymous"
 default_mode = "auto"
+# How many days of message history (and cached NomadNet pages) to keep. The
+# database grows over time, so on small devices set a positive number to
+# auto-prune anything older on startup. 0 = keep everything forever. You can
+# also prune on demand with 'radioapp db prune --days N' and reclaim space with
+# 'radioapp db vacuum'; 'radioapp db stats' shows the current size.
 history_retention_days = 0
 
 [station]
@@ -94,6 +99,24 @@ display_name = "TTP Net"
 transports = [
     "js8call",
     "reticulum",
+]
+# Cross-mode membership (INCOMING aggregation only — outbound fan-out is not
+# done yet). Membership is entirely operator-declared; the app never guesses
+# that two identities are "the same person". Manage these with the CLI:
+#   radioapp group TTP add js8call:KE0XYZ
+#   radioapp group TTP add reticulum:ff00112233...
+#   radioapp group TTP tag ttp        # a JS8 @group or Winlink subject tag
+#   radioapp group TTP show
+# A member is "transport:identifier" (a bare "identifier" matches any
+# transport); hex hashes are prefix-tolerant, callsigns case-insensitive.
+members = [
+    "js8call:KE0XYZ",
+    "reticulum:ff00112233445566778899aabbccddeeff",
+]
+# Native group names / labels that also map a message into this group
+# regardless of who sent it (e.g. a JS8 @TTP group or a Winlink "ttp" tag).
+tags = [
+    "ttp",
 ]
 
 [groups.TTPNE]

@@ -12,10 +12,12 @@ crashing the app.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import json
 import logging
 import os
+import signal
 from datetime import UTC, datetime
 
 from ..core.message import AddressType, UnifiedMessage
@@ -51,6 +53,26 @@ _BROADCAST_GROUP = "broadcast"
 # Group messages are single RNS packets; cap the encoded body near the packet
 # MDU so we reject (rather than silently truncate) oversize group sends.
 _GROUP_PAYLOAD_MAX = 383
+
+
+@contextlib.contextmanager
+def _suppress_signal_registration():
+    """Neutralise ``signal.signal`` while RNS initialises.
+
+    ``RNS.Reticulum.__init__`` calls ``signal.signal()`` to install its own
+    SIGINT/SIGTERM handlers. That raises "signal only works in main thread of
+    the main interpreter" whenever we build RNS off the main thread — which we
+    do, since the blocking connect runs via ``asyncio.to_thread`` — and even on
+    the main thread we don't want RNS hijacking the host application's signal
+    handling. Swapping in a no-op for the duration of construction sidesteps
+    both problems; RNS itself never relies on those handlers being installed.
+    """
+    original = signal.signal
+    signal.signal = lambda *args, **kwargs: None  # type: ignore[assignment]
+    try:
+        yield
+    finally:
+        signal.signal = original  # type: ignore[assignment]
 
 
 def group_shared_key(name: str) -> bytes:
@@ -237,6 +259,94 @@ class ReticulumTransport(Transport):
                 log.info("Reticulum: attached to rnsd after retry; transport up.")
                 break
 
+    def _release_squatted_listener(self) -> None:
+        """Close any shared-instance listener RNS left bound on a failed attempt.
+
+        When our process starts *before* rnsd, ``RNS.Reticulum.__init__`` (with
+        ``require_shared_instance=True``) binds the local shared-instance socket
+        as a side effect of probing, decides it should abort, and calls
+        ``interface.detach()`` — but ``Interface.detach`` is a no-op for the
+        ``LocalServerInterface``, so the bound listening socket is **leaked** into
+        our process. We then squat on the shared-instance socket for the whole
+        retry interval, and when rnsd finally starts it connects to *us* instead
+        of binding ("connected to another shared local instance, this is probably
+        NOT what you want!"). Closing the leaked listener here means we only ever
+        hold the socket for the microseconds inside one attempt, never across the
+        retry interval, so rnsd can bind normally once it appears.
+        """
+        if not _HAVE_RNS:
+            return
+        try:
+            RNS.Transport.detach_interfaces()
+        except Exception:  # noqa: BLE001 - best-effort cleanup, never fatal
+            pass
+
+    def _reset_rns_singleton(self, force: bool = False) -> None:
+        """Clear RNS's leaked process-global ``Reticulum`` singleton + listeners.
+
+        ``RNS.Reticulum.__init__`` assigns the singleton (``Reticulum.__instance``)
+        *before* it tries to attach to the shared instance, then raises
+        ``SystemError`` when ``require_shared_instance=True`` and rnsd isn't up.
+        RNS never clears that reference (not even in ``exit_handler``), so a second
+        ``RNS.Reticulum(...)`` raises ``OSError("Attempt to reinitialise...")`` —
+        which would permanently wedge our reconnect loop after the first failed
+        probe. We clear it ourselves so the next retry can build a fresh instance,
+        and release any shared-instance listener socket RNS leaked along the way.
+
+        ``force`` clears the singleton even when it *is* a live, fully-attached
+        instance — used by :meth:`stop` to deliberately detach so a later
+        :meth:`start` can reattach (the default keeps the safety guard for the
+        retry path, where the instance is never live).
+        """
+        if not _HAVE_RNS:
+            return
+        # First close any leaked shared-instance listener so we don't squat on
+        # the socket that rnsd needs to bind.
+        self._release_squatted_listener()
+        ret_cls = getattr(RNS, "Reticulum", None)
+        if ret_cls is None:
+            return
+        # Only clear the singleton if it isn't a live, fully-attached instance
+        # (it never is on a failed attempt, but guard anyway) — unless forced.
+        try:
+            current = getattr(ret_cls, "_Reticulum__instance", None)
+            if current is not None and (
+                force
+                or not getattr(current, "is_connected_to_shared_instance", False)
+            ):
+                ret_cls._Reticulum__instance = None
+        except Exception:  # noqa: BLE001
+            pass
+        # Re-arm the exit-handler guards so a future genuine shutdown still runs.
+        for flag in (
+            "_Reticulum__exit_handler_ran",
+            "_Reticulum__interface_detach_ran",
+        ):
+            try:
+                setattr(ret_cls, flag, False)
+            except Exception:  # noqa: BLE001
+                pass
+
+        # Only clear the singleton if it isn't a live, fully-attached instance
+        # (it never is on a failed attempt, but guard anyway).
+        try:
+            current = getattr(ret_cls, "_Reticulum__instance", None)
+            if current is not None and not getattr(
+                current, "is_connected_to_shared_instance", False
+            ):
+                ret_cls._Reticulum__instance = None
+        except Exception:  # noqa: BLE001
+            pass
+        # Re-arm the exit-handler guards so a future genuine shutdown still runs.
+        for flag in (
+            "_Reticulum__exit_handler_ran",
+            "_Reticulum__interface_detach_ran",
+        ):
+            try:
+                setattr(ret_cls, flag, False)
+            except Exception:  # noqa: BLE001
+                pass
+
     def _attempt_connect(self) -> bool:
         """Attach to an external rnsd shared instance. Never starts our own.
 
@@ -248,18 +358,23 @@ class ReticulumTransport(Transport):
         # instance: it attaches to a running rnsd or raises. We NEVER want this
         # process to own the hardware / become the shared instance itself.
         try:
-            self._reticulum = RNS.Reticulum(
-                configdir=self._configdir,
-                require_shared_instance=True,
-            )
+            with _suppress_signal_registration():
+                self._reticulum = RNS.Reticulum(
+                    configdir=self._configdir,
+                    require_shared_instance=True,
+                )
         except SystemError as exc:
-            # rnsd isn't running (or not sharing this config dir) yet.
+            # rnsd isn't running (or not sharing this config dir) yet. RNS has
+            # already stashed a half-built singleton; clear it so the next retry
+            # can construct a fresh one instead of hitting "already running".
             log.debug("Reticulum: shared instance not available yet: %s", exc)
             self._reticulum = None
+            self._reset_rns_singleton()
             return False
         except Exception as exc:  # noqa: BLE001 - never crash the whole app
             log.warning("Reticulum connect attempt failed: %s", exc)
             self._reticulum = None
+            self._reset_rns_singleton()
             return False
 
         # Belt-and-suspenders: if somehow we didn't attach to a shared instance,
@@ -271,19 +386,22 @@ class ReticulumTransport(Transport):
             log.debug(
                 "Reticulum: not attached to a shared instance; will keep trying."
             )
-            try:
-                if hasattr(RNS, "exit"):
-                    RNS.exit()
-            except Exception:  # noqa: BLE001
-                pass
+            # Tear down the unwanted standalone instance safely. Do NOT call
+            # RNS.exit() (os._exit(0) would kill the whole app); clearing the
+            # singleton + detaching interfaces fully releases it.
             self._reticulum = None
+            self._reset_rns_singleton(force=True)
             return False
         log.info("Reticulum: connected to shared instance (rnsd).")
 
         # One-time setup (identity, LXMF, handlers, group joins) the first time we
         # successfully attach. Guarded so a reconnect never double-registers.
+        # LXMF.LXMRouter also installs its own signal handlers during init, which
+        # fails off the main thread (we're in asyncio.to_thread here), so this
+        # runs under the same signal-suppression guard as the RNS construction.
         if not self._connect_setup_done:
-            self._setup_after_connect()
+            with _suppress_signal_registration():
+                self._setup_after_connect()
             self._connect_setup_done = True
 
         self._running = True
@@ -366,11 +484,16 @@ class ReticulumTransport(Transport):
                 self._lxmf.exit_handler()
         except Exception:  # noqa: BLE001
             pass
-        if _HAVE_RNS and hasattr(RNS, "exit"):
-            try:
-                RNS.exit()
-            except Exception:  # noqa: BLE001
-                pass
+        # Detach our client side from the shared rnsd instance. We deliberately do
+        # NOT call RNS.exit(): it ends in os._exit(0), which would hard-kill the
+        # whole process — skipping every other transport's stop() and any final
+        # flush — and is uncatchable (os._exit doesn't raise). RNS's own worker
+        # threads are daemonised, so the interpreter still exits cleanly without
+        # it. Releasing our interface + clearing RNS's process-global singleton
+        # also lets a later start() reattach instead of hitting "already running".
+        if _HAVE_RNS:
+            self._reset_rns_singleton(force=True)
+        self._reticulum = None
 
     # -- sending --------------------------------------------------------------
     async def send(self, msg: UnifiedMessage) -> bool:

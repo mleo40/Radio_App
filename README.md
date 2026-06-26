@@ -288,8 +288,32 @@ Notes:
   raw Pat connect string (e.g. `ardop://N0XYZ?freq=7100`).
 - **Credentials:** your Winlink account password lives **inside Pat** (its own
   secure-login config) and is presented to the CMS by Pat — Radio_App never sees
-  or stores it. If a future version sets it on your behalf it will push to Pat's
-  config API and keep any local secret in the OS keyring rather than the TOML.
+  or stores it. Alternatively, leave Pat's `secure_login_password` **empty** and
+  Radio_App will prompt you for it **per session** (a masked field in the TUI):
+  the password is sent to Pat over its WebSocket for that one session only and is
+  never written to disk or config.
+
+### Sharing one radio: the interlock
+
+JS8Call and Pat/Winlink **over an RF modem** (VARA/ARDOP/Mercury) both drive the
+*same* physical HF station — one sound card, one CAT port, one PTT line — so they
+must not transmit at once. Radio_App gates this with a **radio interlock**: only
+one radio-using mode "holds" the radio at a time.
+
+- Switching into JS8Call (or Mercury) **claims** the radio for that mode; leaving
+  it frees the radio. Starting a **Winlink RF session** claims it for the session
+  and releases it when the session ends.
+- The app **refuses to key the radio** on one mode while another holds it (e.g. a
+  JS8Call transmit is blocked during a Winlink RF session, and an RF Winlink
+  session is blocked while JS8Call holds the radio), telling you who to switch
+  away from or stop.
+- When more than one radio transport is **running**, the Health board (and a
+  one-line warning) flags it, since the external apps still physically contend —
+  keep all but one idle, or use a **Winlink telnet** path (which never touches the
+  radio and so is never gated).
+
+The interlock only applies to transports that report `uses_shared_radio`; internet
+(Reticulum, MeshCore, Winlink-over-telnet) modes are never gated.
 
 ## Configuration
 

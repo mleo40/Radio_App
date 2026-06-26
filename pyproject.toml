@@ -37,6 +37,12 @@ meshcore = [
 # NomadNet page viewing is built-in (read-only micron renderer over Reticulum);
 # it needs no extra packages beyond the 'reticulum' extra. No 'nomadnet'
 # dependency is required to read pages.
+# Richer host system-health metrics on the Health board (CPU%, memory,
+# temperature) across platforms. Optional: without it, free disk space + load
+# average (and Linux /proc, /sys readings) still work from the standard library.
+health = [
+    "psutil>=5.9",
+]
 # Developer tooling.
 dev = [
     "pytest>=8.0",
@@ -45,7 +51,7 @@ dev = [
 ]
 # Everything.
 all = [
-    "radio-app[reticulum,tui,meshcore]",
+    "radio-app[reticulum,tui,meshcore,health]",
 ]
 
 [project.scripts]
