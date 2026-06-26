@@ -28,6 +28,7 @@ Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
 from __future__ import annotations
 
 import asyncio
+import os
 from collections import deque
 from datetime import UTC, datetime, timedelta
 
@@ -324,6 +325,11 @@ class BrowseScreen(ModalScreen[None]):
 class RadioTUI(App):
     """The Textual application."""
 
+    # Transports whose per-message size cap is advisory rather than a hard
+    # protocol limit. JS8Call has no documented character cap — it auto-frames
+    # long text into successive transmissions — so we warn instead of blocking.
+    _SOFT_LIMIT_TRANSPORTS = frozenset({"js8call"})
+
     CSS = """
     #modebar { height: 3; background: $boost; padding: 0 1; }
     #modebar Button {
@@ -463,6 +469,9 @@ class RadioTUI(App):
         # is restricted to conversations with favorite peers (F4 in chat modes).
         self._active_fav_only = False
         self._encrypt_approved = False
+        # Documented per-message size cap (bytes) for the active mode's
+        # transport; drives the composer guard + live counter. 0 = no limit.
+        self._compose_limit: int = 0
         self._theme_ready = False
         # Per-transport announce telemetry. Announces are intentionally NOT
         # rendered as Monitor rows (too noisy), but we keep a rolling count and
@@ -508,6 +517,9 @@ class RadioTUI(App):
         # Pending subject line for the next Winlink message (set via the Subject
         # button or /subject). Cleared after a Winlink send consumes it.
         self._winlink_subject: str = ""
+        # Pending outbound attachment file paths for the next Winlink message
+        # (set via /attach). Cleared after a send consumes them.
+        self._winlink_attach: list[str] = []
         # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
         # endpoint up/down), shown under its line on the Health board.
         self._winlink_paths: list[dict] = []
@@ -1528,6 +1540,14 @@ class RadioTUI(App):
             # down even while Pat (telnet) is reachable.
             if t.name == "winlink":
                 self._render_winlink_paths(log)
+            # JS8Call: show the rig operating state (dial/band/offset/speed and
+            # the selected callsign) that JS8Call learns from the radio via CAT.
+            if (
+                t.name == "js8call"
+                and status is ReachabilityStatus.OK
+                and hasattr(t, "radio_status_snapshot")
+            ):
+                self._render_js8_status(log, t.radio_status_snapshot())
             # MeshCore (and any transport exposing device_telemetry) shows its
             # device health: battery + radio parameters.
             if (
@@ -1561,6 +1581,37 @@ class RadioTUI(App):
             label = p.get("label", p.get("name", "?"))
             detail = p.get("detail", "")
             log.write(f"      {dot} {label}  {word}  [dim]{detail}[/dim]")
+
+    def _render_js8_status(self, log: RichLog, snap: dict | None) -> None:
+        """Render the JS8Call rig operating state under its status line.
+
+        Shows dial frequency / band / audio offset / submode speed and the
+        selected callsign, all of which JS8Call learns from the radio via CAT.
+        When there is no dial frequency JS8Call has no CAT/rig control, so we say
+        so rather than implying the rig state is known.
+        """
+        if not snap or not snap.get("cat"):
+            log.write(
+                "      [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
+            )
+            return
+        bits: list[str] = []
+        dial = snap.get("dial")
+        if dial:
+            mhz = dial / 1_000_000
+            band = snap.get("band")
+            bits.append(f"{mhz:.6f} MHz" + (f" ({band})" if band else ""))
+        offset = snap.get("offset")
+        if offset:
+            bits.append(f"offset {int(offset)} Hz")
+        speed = snap.get("speed")
+        if speed:
+            bits.append(f"speed {speed}")
+        sel = snap.get("selected")
+        if sel:
+            bits.append(f"selected {sel}")
+        if bits:
+            log.write(f"      [dim]{'  ·  '.join(bits)}[/dim]")
 
     def _render_device_telemetry(self, log: RichLog, tel: dict | None) -> None:
         """Render a MeshCore companion's device telemetry under its status line.
@@ -2315,11 +2366,71 @@ class RadioTUI(App):
             None,
         )
 
+    def _refresh_compose_limit(self) -> None:
+        """Cache the active mode's documented per-message size cap (bytes)."""
+        t = self._active_transport_obj()
+        self._compose_limit = (
+            t.capabilities().max_message_size if t is not None else 0
+        )
+
+    def _check_compose_limit(self, text: str) -> bool:
+        """Whether ``text`` may be sent on the active transport.
+
+        Measures the UTF-8 *byte* length (one accented/emoji char can be several
+        bytes, which is what the on-air framing counts). Hard-blocks anything
+        over a transport's documented cap; for soft-limit transports (JS8Call,
+        which has no published cap and auto-frames) it only warns and allows it.
+        """
+        limit = self._compose_limit
+        if not limit:
+            return True
+        size = len(text.encode("utf-8"))
+        if size <= limit:
+            return True
+        over = size - limit
+        if self.active_transport in self._SOFT_LIMIT_TRANSPORTS:
+            self._log_system(
+                f"{size} bytes — JS8Call will send this as several "
+                "transmissions (it has no hard length limit)."
+            )
+            return True
+        self._log_system(
+            f"Too long for {self.active_transport}: {over} byte(s) over the "
+            f"{limit}-byte limit. Trim the message and resend."
+        )
+        return False
+
+    def _compose_counter_markup(self) -> str:
+        """A live ``124/134`` size counter for the active mode's composer.
+
+        Empty unless an operating mode with a size cap is active and the composer
+        holds a non-command message. Turns red past a hard cap, yellow past a
+        soft (advisory) one.
+        """
+        limit = self._compose_limit
+        if not limit or self.view != "active":
+            return ""
+        try:
+            val = self.query_one("#composer", Input).value
+        except Exception:  # noqa: BLE001
+            return ""
+        if not val or val.lstrip().startswith("/"):
+            return ""  # commands are not size-limited
+        size = len(val.encode("utf-8"))
+        if size <= limit:
+            return f"    [dim]{size}/{limit}[/dim]"
+        color = (
+            "yellow" if self.active_transport in self._SOFT_LIMIT_TRANSPORTS
+            else "red"
+        )
+        return f"    [{color}]{size}/{limit}[/{color}]"
+
     def _apply_mode(self) -> None:
         # Switching mode resets the open conversation (sending is mode-bound).
         # Channel-based transports (MeshCore) default to their primary channel
         # (the public channel 0) so the panel is ready to send straight away.
         self.current_target = self._default_channel_target()
+        self._refresh_compose_limit()
         self.query_one("#messages", RichLog).clear()
         self._refresh_threads()
         self._update_active_banner()
@@ -2446,6 +2557,8 @@ class RadioTUI(App):
             if len(subj) > 24:
                 subj = subj[:21] + "..."
             parts.append(f"[dim]subj:[/dim]\u201c{subj}\u201d")
+        if self._winlink_attach:
+            parts.append(f"[dim]\U0001f4ce[/dim]{len(self._winlink_attach)}")
         label.update("  ".join(parts))
 
     def _winlink_subject_prompt(self) -> None:
@@ -2482,6 +2595,94 @@ class RadioTUI(App):
         else:
             self._log_system("Winlink gateway cleared (telnet uses default CMS).")
 
+    def _add_winlink_attachment(self, arg: str) -> None:
+        """Queue (or list/clear) attachment file paths for the next message.
+
+        ``/attach <path>`` queues a file; ``/attach`` lists the queue;
+        ``/attach clear`` empties it. Paths are validated up front so the
+        operator finds out immediately if a file is missing.
+        """
+        arg = arg.strip()
+        if not arg:
+            if self._winlink_attach:
+                names = ", ".join(os.path.basename(p) for p in self._winlink_attach)
+                self._log_system(f"Winlink attachments queued: {names}")
+            else:
+                self._log_system(
+                    "No attachments queued. Use /attach <path> to add one."
+                )
+            return
+        if arg.lower() == "clear":
+            self._winlink_attach = []
+            self._update_winlink_bar()
+            self._log_system("Winlink attachments cleared.")
+            return
+        path = os.path.expanduser(arg)
+        if not os.path.isfile(path):
+            self._log_system(f"Attachment not found: {arg}")
+            return
+        self._winlink_attach.append(path)
+        self._update_winlink_bar()
+        self._log_system(
+            f"Attachment queued: {os.path.basename(path)} "
+            f"({len(self._winlink_attach)} total). Send to deliver."
+        )
+
+    def _winlink_download_dir(self) -> str:
+        """Where saved inbound attachments go (config override or a default)."""
+        t = self._winlink_transport()
+        if t is not None:
+            configured = str(t.config.get("download_dir", "")).strip()
+            if configured:
+                return os.path.expanduser(configured)
+        return os.path.join(
+            os.path.expanduser("~"), ".local", "share", "radio_app", "winlink"
+        )
+
+    @work(exclusive=True)
+    async def _winlink_save_attachments(self) -> None:
+        """Download attachments of the latest received mail in the open thread."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "save_attachments"):
+            self._log_system("Winlink is not enabled.")
+            return
+        if self.core is None or not self.current_target:
+            self._log_system("Open a Winlink conversation first.")
+            return
+        # Find the most recent received message (in this thread) that both has a
+        # Pat MID and lists attachments.
+        mid = None
+        names: list[str] = []
+        for msg in reversed(self.core.store.read_thread(self.current_target)):
+            if msg.transport != "winlink":
+                continue
+            m = msg.metadata.get("mid")
+            atts = msg.metadata.get("attachments") or []
+            if m and atts:
+                mid, names = str(m), [str(a) for a in atts]
+                break
+        if not mid:
+            self._log_system("No received attachments in this conversation.")
+            return
+        dest = self._winlink_download_dir()
+        self._log_system(f"Saving {len(names)} attachment(s) to {dest} \u2026")
+        try:
+            saved = await t.save_attachments(mid, dest)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Attachment download failed: {exc}")
+            return
+        if saved:
+            self._log_system("Saved: " + ", ".join(saved))
+        else:
+            self._log_system("No attachments were saved.")
+
+    def action_pick_gateway(self, call: str = "") -> None:
+        """Pick an RMS gateway (clicked in the /gateways list) and connect."""
+        if not call:
+            return
+        self._set_winlink_gateway(call)
+        self._winlink_connect(call)
+
     @work(exclusive=True)
     async def _winlink_connect(self, gateway: str | None = None) -> None:
         """Trigger a Pat session to deliver the outbox and receive new mail."""
@@ -2499,15 +2700,71 @@ class RadioTUI(App):
             else t.build_connect_url()
         )
         self._log_system(f"Winlink: connecting via {target} \u2026")
+        # Best-effort live progress from Pat's WebSocket while the session runs.
+        stop = asyncio.Event()
+        stream_task = None
+        if hasattr(t, "stream_events"):
+            def _on_event(ev: dict) -> None:
+                line = self._format_winlink_event(ev)
+                if line:
+                    self._log_system(line)
+
+            async def _pump() -> None:
+                try:
+                    await t.stream_events(_on_event, stop.is_set)
+                except Exception:  # noqa: BLE001 - feedback is optional
+                    pass
+
+            stream_task = asyncio.create_task(_pump())
         try:
             received = await t.connect_now(url)
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"Winlink connect failed: {exc}")
             return
+        finally:
+            stop.set()
+            if stream_task is not None:
+                stream_task.cancel()
         self._log_system(
             f"Winlink session done \u2014 {received} message(s) received."
         )
         self._refresh_active_pane()
+
+    @staticmethod
+    def _format_winlink_event(ev: dict) -> str | None:
+        """Turn one Pat ``/ws`` event into a concise progress line (or None).
+
+        Only the events worth surfacing during a session are formatted;
+        idle status pings and bookkeeping events return ``None`` (suppressed).
+        """
+        prog = ev.get("Progress")
+        if isinstance(prog, dict):
+            subj = str(prog.get("subject") or "").strip()
+            verb = (
+                "rx" if prog.get("receiving")
+                else ("tx" if prog.get("sending") else "")
+            )
+            if prog.get("done"):
+                return f"Winlink {verb}: done {subj}".rstrip()
+            total = int(prog.get("bytes_total") or 0)
+            xfer = int(prog.get("bytes_transferred") or 0)
+            amount = f"{(100 * xfer // total)}%" if total else f"{xfer}B"
+            return f"Winlink {verb}: {amount} {subj}".rstrip()
+        status = ev.get("Status")
+        if isinstance(status, dict):
+            if status.get("dialing"):
+                return "Winlink: dialing\u2026"
+            if status.get("connected"):
+                ra = str(status.get("remote_addr") or "").strip()
+                return f"Winlink: connected {ra}".rstrip()
+            return None
+        note = ev.get("Notification")
+        if isinstance(note, dict):
+            text = " \u2014 ".join(
+                x for x in (note.get("title"), note.get("body")) if x
+            )
+            return f"Winlink: {text}" if text else None
+        return None
 
     @work(exclusive=True)
     async def _winlink_list_gateways(self) -> None:
@@ -2528,14 +2785,22 @@ class RadioTUI(App):
             )
             return
         self._log_system(f"Nearby RMS gateways ({len(gateways)} shown):")
+        log = self.query_one("#messages", RichLog)
         for gw in gateways[:15]:
-            call = gw.get("callsign") or gw.get("Callsign") or "?"
+            call = str(gw.get("callsign") or gw.get("Callsign") or "?")
             mode = gw.get("mode") or gw.get("Mode") or ""
             dist = gw.get("distance") or gw.get("Distance") or ""
             extra = " ".join(str(x) for x in (mode, dist) if x)
-            self._log_system(f"  {call}  [dim]{extra}[/dim]")
+            # Make each callsign clickable: clicking picks it as the gateway and
+            # starts a session. Strip quotes so it can't break the action arg.
+            safe = call.replace("'", "").replace("\\", "")
+            log.write(
+                f"  [b][@click=app.pick_gateway('{safe}')]{call}[/][/b]  "
+                f"[dim]{extra}[/dim]"
+            )
         self._log_system(
-            "Use [b]/gateway <CALL>[/b] then [b]Connect[/b] (or /connect <CALL>)."
+            "Click a callsign above, or use [b]/gateway <CALL>[/b] then "
+            "[b]Connect[/b]."
         )
 
     def _js8_transport(self) -> Transport | None:
@@ -2720,6 +2985,14 @@ class RadioTUI(App):
                     await t.request_dial_freq()
                 except Exception:  # noqa: BLE001 - never crash the probe timer
                     pass
+                # Also pull the fuller operating snapshot (speed + selected
+                # callsign) for the Health board; the reply arrives async as a
+                # STATION.STATUS event.
+                if hasattr(t, "radio_status"):
+                    try:
+                        await t.radio_status()
+                    except Exception:  # noqa: BLE001 - never crash the probe timer
+                        pass
             # Winlink: probe each connection path's endpoint (telnet via Pat,
             # varahf/Mercury @8300, ardop @8515) so the Health board can show
             # which modems are up — even when they're expected to be down.
@@ -3030,6 +3303,39 @@ class RadioTUI(App):
     def _mode_color(self, transport: str) -> str:
         return self._MODE_COLORS.get(transport, "white")
 
+    @staticmethod
+    def _subject_md(msg: UnifiedMessage) -> str:
+        """A bold ``Subject \u2014 `` prefix for Winlink mail.
+
+        Winlink is email: the subject carries half the meaning, so prepend it to
+        the body when rendering. Returns ``""`` for transports that have no
+        subject. Brackets/backslashes are escaped so an arbitrary email subject
+        can't break the surrounding Rich markup.
+        """
+        if msg.transport != "winlink":
+            return ""
+        subj = str(msg.metadata.get("subject") or "").strip()
+        if not subj:
+            return ""
+        safe = subj.replace("\\", "\\\\").replace("[", "\\[")
+        return f"[b]{safe}[/b] \u2014 "
+
+    @staticmethod
+    def _attachments_md(msg: UnifiedMessage) -> str:
+        """A dim ``\U0001f4ce name1, name2`` suffix listing message attachments.
+
+        Returns ``""`` when there are none. Names are escaped so they can't
+        break the surrounding Rich markup.
+        """
+        names = msg.metadata.get("attachments") or []
+        names = [str(n).strip() for n in names if str(n).strip()]
+        if not names:
+            return ""
+        safe = ", ".join(
+            n.replace("\\", "\\\\").replace("[", "\\[") for n in names
+        )
+        return f" [dim]\U0001f4ce {safe}[/dim]"
+
     def _render_monitor_row(self, msg: UnifiedMessage) -> None:
         mlist = self.query_one("#monitor", ListView)
         ts = msg.timestamp.strftime("%H:%M:%S")
@@ -3046,7 +3352,10 @@ class RadioTUI(App):
         name = msg.transport or "?"
         color = self._mode_color(name)
         mode_tag = f"[{color}]{name:<9}[/{color}]"
-        line = f"{ts} {mode_tag} {sec} {star}{who} -> {tgt}: {msg.content}"
+        line = (
+            f"{ts} {mode_tag} {sec} {star}{who} -> {tgt}: "
+            f"{self._subject_md(msg)}{msg.content}{self._attachments_md(msg)}"
+        )
         mlist.append(ListItem(Label(line)))
         self._monitor_entries.append((msg.thread_key, msg.transport))
         mlist.scroll_end(animate=False)
@@ -3393,7 +3702,25 @@ class RadioTUI(App):
         if text.startswith("/"):
             await self._handle_command(text)
             return
+        # Enforce the active protocol's documented per-message size cap.
+        if not self._check_compose_limit(text):
+            event.input.value = text  # keep their text so they can trim it
+            self._update_status()
+            return
         self._send(text)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Keep the live size counter in the status bar current as the operator
+        # types into the active mode's composer.
+        if (
+            event.input.id == "composer"
+            and self.view == "active"
+            and self._compose_limit
+        ):
+            try:
+                self._update_status()
+            except Exception:  # noqa: BLE001 - UI may be mid-teardown
+                pass
 
     async def _handle_command(self, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -3410,6 +3737,7 @@ class RadioTUI(App):
                 "/channel list|add <index> <#name> [secret], "
                 "/freq [<MHz|Hz>], /band [<name>], "
                 "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
+                "/attach <path>, /save, "
                 "/name <friendly name>, /close [<id>], "
                 "/whoami, /announce, /path [<id>], /quit"
             )
@@ -3470,6 +3798,10 @@ class RadioTUI(App):
             self.action_find_path()
         elif cmd == "/subject":
             self._set_winlink_subject(arg)
+        elif cmd == "/attach":
+            self._add_winlink_attachment(arg)
+        elif cmd == "/save":
+            self._winlink_save_attachments()
         elif cmd == "/connect":
             self._winlink_connect(arg or None)
         elif cmd in ("/gateway", "/gw"):
@@ -3506,6 +3838,12 @@ class RadioTUI(App):
         if self.active_transport == "winlink" and self._winlink_subject:
             msg.metadata["subject"] = self._winlink_subject
             self._winlink_subject = ""
+            self._update_winlink_bar()
+        # Winlink attachments: hand the queued file paths to the transport
+        # (it uploads them as multipart) and clear the queue.
+        if self.active_transport == "winlink" and self._winlink_attach:
+            msg.metadata["attach"] = list(self._winlink_attach)
+            self._winlink_attach = []
             self._update_winlink_bar()
         # Send over the ACTIVE mode only (no auto-selection / fallback).
         ok = await self.core.router.send(msg, force_transport=self.active_transport)
@@ -3578,7 +3916,8 @@ class RadioTUI(App):
             tag = f" [magenta]@{msg.group}[/magenta]"
         log.write(
             f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag} {who}: "
-            f"{msg.content}{lock}{status}"
+            f"{self._subject_md(msg)}{msg.content}{lock}{status}"
+            f"{self._attachments_md(msg)}"
         )
 
     def _log_system(self, text: str) -> None:
@@ -3673,9 +4012,10 @@ class RadioTUI(App):
             or (self.view in ("active", "nomadnet") and self._active_fav_only)
         )
         filt = "    [fav-only]" if fav_on else ""
+        counter = self._compose_counter_markup()
         self.query_one("#statusbar", Static).update(
             f" view: {self.view}    mode: {mode}{ident_part}    target: {target}    "
-            f"up: {up}{filt}"
+            f"up: {up}{filt}{counter}"
         )
 
 def run(config_path: str | None = None) -> None:

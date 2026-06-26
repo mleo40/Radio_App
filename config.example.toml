@@ -81,6 +81,8 @@ gateway = ""
 connect_url = ""
 # Seconds between inbox polls for newly received mail.
 poll_interval = 60
+# Where /save downloads received attachments (default shown).
+download_dir = "~/.local/share/radio_app/winlink"
 # When true, each send immediately dials the gateway; when false (default),
 # messages queue in Pat's outbox for the next session you start.
 auto_connect = false

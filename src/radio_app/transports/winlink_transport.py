@@ -30,9 +30,13 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import mimetypes
+import os
 import urllib.error
 import urllib.parse
 import urllib.request
+import uuid
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 
@@ -120,6 +124,11 @@ class WinlinkTransport(Transport):
         self._poll_task: asyncio.Task | None = None
         self._seen_mids: set[str] = set()
         self._primed = False  # first inbox sweep only records existing MIDs
+        # Correlate our outbound messages with Pat's outbox so we can upgrade a
+        # message from "queued in Pat" (SENT) to DELIVERED once a session has
+        # actually forwarded it (it disappears from the outbox). Maps Pat's
+        # outbox MID -> (our msg_id, recipient).
+        self._pending_out: dict[str, tuple[str, str]] = {}
 
     # -- config helpers -------------------------------------------------------
 
@@ -255,6 +264,58 @@ class WinlinkTransport(Transport):
         # Identity-carrying medium: use the operator callsign, not an anon id.
         return None
 
+    def validate_config(self) -> list[str]:
+        """Return human-readable warnings about the config (no network calls).
+
+        Catches the misconfigurations that would otherwise only surface as a
+        silent fallback or a failed dial: a malformed ``pat_url``, an unknown
+        ``connect`` method, unknown ``connect_order`` entries, an empty callsign,
+        or invalid modem ports. Empty list means the config looks usable.
+        """
+        warnings: list[str] = []
+        parts = urllib.parse.urlsplit(self._pat_url)
+        if parts.scheme not in ("http", "https") or not parts.hostname:
+            warnings.append(f"pat_url looks malformed: {self._pat_url!r}")
+
+        known = ", ".join(sorted(CONNECT_METHODS))
+        setting = self._connect_setting
+        if setting != _AUTO and setting not in CONNECT_METHODS:
+            warnings.append(
+                f"connect = {setting!r} is not a known method (use {known} "
+                "or 'auto')"
+            )
+
+        raw_order = self.config.get("connect_order")
+        if isinstance(raw_order, list):
+            unknown = [
+                str(x) for x in raw_order
+                if str(x).strip().lower() not in CONNECT_METHODS
+            ]
+            if unknown:
+                warnings.append(
+                    f"connect_order has unknown method(s): {', '.join(unknown)} "
+                    f"(known: {known})"
+                )
+            if self.is_auto and not self._connect_order():
+                warnings.append(
+                    "connect = 'auto' but connect_order lists no known methods"
+                )
+
+        if not self._callsign:
+            warnings.append("callsign is empty (set your Winlink callsign)")
+
+        for key in ("vara_port", "ardop_port"):
+            if key in self.config:
+                try:
+                    port = int(self.config[key])
+                    if not 1 <= port <= 65535:
+                        raise ValueError
+                except (TypeError, ValueError):
+                    warnings.append(
+                        f"{key} is not a valid TCP port: {self.config[key]!r}"
+                    )
+        return warnings
+
     # -- lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
@@ -262,6 +323,8 @@ class WinlinkTransport(Transport):
         # actually reachable is reported separately by check_reachable().
         self._running = True
         self._poll_task = asyncio.create_task(self._poll_loop())
+        for warning in self.validate_config():
+            log.warning("Winlink config: %s", warning)
         log.info(
             "Winlink transport started (pat=%s, method=%s)",
             self._pat_url, self._method.scheme,
@@ -287,6 +350,9 @@ class WinlinkTransport(Transport):
         """Queue an outbound message in Pat's outbox (optionally dial a session).
 
         Only DIRECT messages are meaningful for Winlink (email to a callsign).
+        Local file paths in ``metadata["attach"]`` are uploaded as Winlink
+        attachments (multipart); their base names are recorded in
+        ``metadata["attachments"]`` so the UI can show what was sent.
         """
         if msg.address_type is not AddressType.DIRECT or not msg.recipient:
             log.warning("Winlink only supports direct messages with a recipient.")
@@ -306,11 +372,28 @@ class WinlinkTransport(Transport):
         if cc:
             form["cc"] = cc if isinstance(cc, str) else ",".join(map(str, cc))
 
+        files = self._read_attachments(msg.metadata.get("attach") or [])
+
+        # Snapshot the outbox so we can identify the MID Pat assigns to this
+        # message (its POST does not return one) and correlate delivery later.
+        before = await self._outbox_mids()
         try:
-            await asyncio.to_thread(self._http_post_form, "/api/mailbox/out", form)
+            if files:
+                await asyncio.to_thread(
+                    self._http_post_multipart, "/api/mailbox/out", form, files
+                )
+            else:
+                await asyncio.to_thread(
+                    self._http_post_form, "/api/mailbox/out", form
+                )
         except Exception as exc:  # noqa: BLE001
             log.warning("Winlink outbox POST failed: %s", exc)
             return False
+
+        if files:
+            # Record what we attached for UI display (names, not the bytes).
+            msg.metadata["attachments"] = [name for name, _, _ in files]
+        await self._correlate_outbound(msg, before)
 
         msg.status = DeliveryStatus.SENT  # queued for the next forwarding session
 
@@ -322,6 +405,179 @@ class WinlinkTransport(Transport):
             except Exception as exc:  # noqa: BLE001
                 log.warning("Winlink auto-connect failed: %s", exc)
         return True
+
+    def _read_attachments(
+        self, paths: object
+    ) -> list[tuple[str, bytes, str]]:
+        """Read outbound attachment file paths into (name, bytes, content-type)."""
+        out: list[tuple[str, bytes, str]] = []
+        if not isinstance(paths, list):
+            return out
+        for p in paths:
+            path = str(p)
+            try:
+                with open(path, "rb") as fh:
+                    data = fh.read()
+            except OSError as exc:
+                log.warning("Winlink: cannot read attachment %s: %s", path, exc)
+                continue
+            name = os.path.basename(path) or "attachment"
+            ctype = mimetypes.guess_type(name)[0] or "application/octet-stream"
+            out.append((name, data, ctype))
+        return out
+
+    async def _correlate_outbound(
+        self, msg: UnifiedMessage, before: set[str] | None
+    ) -> None:
+        """After posting, learn the new outbox MID so delivery can be confirmed."""
+        if before is None:
+            return
+        after = await self._outbox_mids()
+        if after is None:
+            return
+        new = after - before
+        # Only correlate when exactly one message appeared (unambiguous).
+        if len(new) == 1:
+            self._pending_out[new.pop()] = (msg.msg_id, msg.recipient or "")
+
+    # -- Winlink standard forms ----------------------------------------------
+    async def list_forms(self) -> list[dict]:
+        """List installed Winlink form templates (flattened catalog tree).
+
+        Returns ``[{"name", "path", "folder"}]`` sorted by folder then name;
+        ``path`` is the template path :meth:`compose_form` expects. Empty when
+        no forms are installed (run :meth:`update_forms` to fetch them).
+        """
+        try:
+            body = await asyncio.to_thread(
+                self._http_get, "/api/formcatalog", _HTTP_TIMEOUT_S
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink form catalog fetch failed: %s", exc)
+            return []
+        try:
+            root = json.loads(body)
+        except (ValueError, TypeError):
+            return []
+        forms: list[dict] = []
+        _flatten_form_folder(root, "", forms)
+        forms.sort(key=lambda f: (f["folder"].lower(), f["name"].lower()))
+        return forms
+
+    async def update_forms(self) -> dict:
+        """Download/install the latest Winlink standard form templates.
+
+        Returns ``{"version", "action"}`` (action ``update``/``none``) or ``{}``
+        on failure. Pat performs the download, so it needs internet access.
+        """
+        try:
+            body = await asyncio.to_thread(
+                self._http_post_form, "/api/formsUpdate", {}
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink forms update failed: %s", exc)
+            return {}
+        try:
+            data = json.loads(body)
+        except (ValueError, TypeError):
+            return {}
+        return {
+            "version": str(data.get("newestVersion", "")),
+            "action": str(data.get("action", "")),
+        }
+
+    async def get_form_template(self, template_path: str) -> str:
+        """Fetch a template's processed text (for preview / prompt discovery)."""
+        query = urllib.parse.urlencode({"template": template_path})
+        try:
+            return await asyncio.to_thread(
+                self._http_get, f"/api/template?{query}", _HTTP_TIMEOUT_S
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink template fetch failed: %s", exc)
+            return ""
+
+    async def compose_form(
+        self,
+        template_path: str,
+        responses: dict[str, str] | None = None,
+        *,
+        to: str | None = None,
+        cc: str | None = None,
+        subject: str | None = None,
+        msg_id: str | None = None,
+    ) -> dict | None:
+        """Build a Winlink form and queue it in Pat's outbox.
+
+        Drives Pat's browserless form flow: build the form server-side (which
+        generates the ``RMS_Express_Form`` XML attachment, held under a one-time
+        ``forminstance`` key), retrieve the computed to/cc/subject/body, then
+        post to the outbox with the same key so Pat re-attaches the XML.
+
+        ``responses`` maps the template's text prompts to answers (an empty map
+        is valid — the form still builds with defaults). ``to``/``cc``/``subject``
+        override the form's computed values. Pass ``msg_id`` to correlate the
+        queued message for a later delivery receipt. Returns the built
+        ``{"to","cc","subject","body"}``, or ``None`` on failure.
+        """
+        if not self._running:
+            return None
+        key = uuid.uuid4().hex
+        cookie = {"Cookie": f"forminstance={key}"}
+        qs = urllib.parse.urlencode({"template": template_path})
+        # 1) Build the form (stores Message + XML attachment under the cookie).
+        try:
+            await asyncio.to_thread(
+                self._http_post_json,
+                f"/api/form?{qs}",
+                {"responses": responses or {}},
+                cookie,
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink form build failed: %s", exc)
+            return None
+        # 2) Retrieve the computed message fields.
+        try:
+            built_raw = await asyncio.to_thread(
+                self._http_get, "/api/form", _HTTP_TIMEOUT_S, cookie
+            )
+            built = json.loads(built_raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink form retrieve failed: %s", exc)
+            return None
+        out = {
+            "to": to if to is not None else str(built.get("msg_to", "")),
+            "cc": cc if cc is not None else str(built.get("msg_cc", "")),
+            "subject": (
+                subject if subject is not None
+                else str(built.get("msg_subject", ""))
+            ),
+            "body": str(built.get("msg_body", "")),
+        }
+        # 3) Queue to the outbox with the same cookie (Pat re-attaches the XML).
+        before = await self._outbox_mids() if msg_id else None
+        form_fields = {
+            "to": out["to"],
+            "cc": out["cc"],
+            "subject": out["subject"],
+            "body": out["body"],
+            "date": datetime.now(UTC).isoformat(),
+        }
+        try:
+            await asyncio.to_thread(
+                self._http_post_form, "/api/mailbox/out", form_fields, cookie
+            )
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink form outbox POST failed: %s", exc)
+            return None
+        if msg_id is not None and before is not None:
+            after = await self._outbox_mids()
+            if after is not None:
+                new = after - before
+                if len(new) == 1:
+                    self._pending_out[new.pop()] = (msg_id, out["to"])
+        return out
+
 
     async def connect_now(self, connect_url: str | None = None) -> int:
         """Trigger a Pat session and return Pat's ``NumReceived``.
@@ -380,9 +636,104 @@ class WinlinkTransport(Transport):
             received = int(json.loads(body).get("NumReceived", 0))
         except (ValueError, TypeError, json.JSONDecodeError):
             pass
-        # Pull anything new right away rather than waiting for the next tick.
+        # Pull anything new right away rather than waiting for the next tick,
+        # and confirm delivery of anything the session forwarded.
         await self._sweep_inbox()
+        await self._reconcile_outbox()
         return received
+
+    async def _outbox_mids(self) -> set[str] | None:
+        """Set of MIDs currently queued in Pat's outbox (None on error)."""
+        try:
+            raw = await asyncio.to_thread(
+                self._http_get, "/api/mailbox/out", _HTTP_TIMEOUT_S
+            )
+            data = json.loads(raw) or []
+        except Exception:  # noqa: BLE001 - treat any failure as "unknown"
+            return None
+        if not isinstance(data, list):
+            return None
+        return {str(e.get("MID", "")).strip() for e in data if e.get("MID")}
+
+    async def _reconcile_outbox(self) -> None:
+        """Emit a delivery receipt for any tracked message that left the outbox.
+
+        A message that was queued (tracked in :attr:`_pending_out`) but is no
+        longer in Pat's outbox after a session was forwarded to the CMS/RMS, so
+        we mark it DELIVERED via the standard delivery-receipt telemetry the UI
+        already understands (the same path Reticulum LXMF receipts use).
+        """
+        if not self._pending_out:
+            return
+        current = await self._outbox_mids()
+        if current is None:
+            return
+        forwarded = [mid for mid in self._pending_out if mid not in current]
+        for mid in forwarded:
+            ref_id, recipient = self._pending_out.pop(mid)
+            await self._emit_delivery(ref_id, recipient)
+
+    async def _emit_delivery(self, ref_id: str, recipient: str) -> None:
+        """Emit a 'delivered' receipt telemetry event for ``ref_id``."""
+        telem = UnifiedMessage(
+            sender=self.name,
+            content="",
+            address_type=AddressType.DIRECT,
+            transport=self.name,
+            metadata={
+                "kind": "delivery",
+                "ref_msg_id": ref_id,
+                "status": "delivered",
+                "recipient": recipient,
+            },
+        )
+        await self._emit(telem)
+
+    async def fetch_attachment(self, mid: str, name: str) -> bytes:
+        """Download one inbound attachment's raw bytes from Pat."""
+        path = (
+            f"/api/mailbox/in/{urllib.parse.quote(mid)}"
+            f"/{urllib.parse.quote(name)}"
+        )
+        return await asyncio.to_thread(self._http_get_bytes, path, _HTTP_TIMEOUT_S)
+
+    async def save_attachments(self, mid: str, dest_dir: str) -> list[str]:
+        """Download all attachments of an inbox message into ``dest_dir``.
+
+        Returns the list of saved local file paths.
+        """
+        try:
+            detail_raw = await asyncio.to_thread(
+                self._http_get,
+                f"/api/mailbox/in/{urllib.parse.quote(mid)}",
+                _HTTP_TIMEOUT_S,
+            )
+            detail = json.loads(detail_raw)
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink: cannot list attachments for %s: %s", mid, exc)
+            return []
+        names = [
+            f.get("Name")
+            for f in (detail.get("Files") or [])
+            if isinstance(f, dict) and f.get("Name")
+        ]
+        os.makedirs(dest_dir, exist_ok=True)
+        saved: list[str] = []
+        for name in names:
+            try:
+                data = await self.fetch_attachment(mid, name)
+            except Exception as exc:  # noqa: BLE001
+                log.warning("Winlink: attachment %s download failed: %s", name, exc)
+                continue
+            out_path = os.path.join(dest_dir, os.path.basename(name))
+            try:
+                with open(out_path, "wb") as fh:
+                    fh.write(data)
+            except OSError as exc:
+                log.warning("Winlink: cannot write %s: %s", out_path, exc)
+                continue
+            saved.append(out_path)
+        return saved
 
     async def path_status(self) -> list[dict]:
         """Probe each connection path's endpoint for the Health board.
@@ -419,6 +770,36 @@ class WinlinkTransport(Transport):
                 "detail": detail,
             })
         return out
+
+    async def stream_events(
+        self,
+        on_event: Callable[[dict], None],
+        should_stop: Callable[[], bool],
+    ) -> None:
+        """Stream Pat's live ``/ws`` events as decoded dicts to ``on_event``.
+
+        Best-effort live session feedback (Status/Progress/Notification). Parses
+        the host/port from ``pat_url`` and opens a minimal WebSocket; any failure
+        is swallowed so the UI never breaks if Pat has no WebSocket.
+        """
+        from . import winlink_ws
+
+        parts = urllib.parse.urlsplit(self._pat_url)
+        host = parts.hostname or "127.0.0.1"
+        port = parts.port or (443 if parts.scheme == "https" else 80)
+
+        def _on_text(text: str) -> None:
+            try:
+                event = json.loads(text)
+            except (ValueError, json.JSONDecodeError):
+                return
+            if isinstance(event, dict):
+                on_event(event)
+
+        try:
+            await winlink_ws.stream(host, port, "/ws", _on_text, should_stop)
+        except Exception as exc:  # noqa: BLE001 - feedback is optional
+            log.debug("Winlink event stream ended: %s", exc)
 
     async def list_gateways(
         self, mode: str | None = None, prefix: str | None = None
@@ -530,18 +911,84 @@ class WinlinkTransport(Transport):
 
     # -- HTTP plumbing (stdlib only; called via asyncio.to_thread) ------------
 
-    def _http_get(self, path: str, timeout: float) -> str:
-        req = urllib.request.Request(self._pat_url + path, method="GET")
+    def _http_get(self, path: str, timeout: float,
+                  headers: dict[str, str] | None = None) -> str:
+        req = urllib.request.Request(
+            self._pat_url + path, method="GET", headers=headers or {}
+        )
         with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
             return resp.read().decode("utf-8", "replace")
 
-    def _http_post_form(self, path: str, fields: dict[str, str]) -> str:
+    def _http_get_bytes(self, path: str, timeout: float) -> bytes:
+        req = urllib.request.Request(self._pat_url + path, method="GET")
+        with urllib.request.urlopen(req, timeout=timeout) as resp:  # noqa: S310
+            return resp.read()
+
+    def _http_post_form(self, path: str, fields: dict[str, str],
+                        headers: dict[str, str] | None = None) -> str:
         data = urllib.parse.urlencode(fields).encode("utf-8")
         req = urllib.request.Request(
             self._pat_url + path,
             data=data,
             method="POST",
-            headers={"Content-Type": "application/x-www-form-urlencoded"},
+            headers={
+                "Content-Type": "application/x-www-form-urlencoded",
+                **(headers or {}),
+            },
+        )
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:  # noqa: S310
+            return resp.read().decode("utf-8", "replace")
+
+    def _http_post_json(self, path: str, payload: dict,
+                        headers: dict[str, str] | None = None) -> str:
+        data = json.dumps(payload).encode("utf-8")
+        req = urllib.request.Request(
+            self._pat_url + path,
+            data=data,
+            method="POST",
+            headers={"Content-Type": "application/json", **(headers or {})},
+        )
+        with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:  # noqa: S310
+            return resp.read().decode("utf-8", "replace")
+
+
+    def _http_post_multipart(
+        self,
+        path: str,
+        fields: dict[str, str],
+        files: list[tuple[str, bytes, str]],
+    ) -> str:
+        """POST ``multipart/form-data`` with text fields and ``files`` parts.
+
+        Pat's outbox handler reads attachments from the multipart ``files``
+        field; everything else (to/subject/body/date) rides as normal fields.
+        Built with the stdlib so no extra dependency is needed.
+        """
+        boundary = "----RadioApp" + uuid.uuid4().hex
+        crlf = b"\r\n"
+        body = bytearray()
+        for key, value in fields.items():
+            body += b"--" + boundary.encode() + crlf
+            body += (
+                f'Content-Disposition: form-data; name="{key}"'.encode() + crlf
+            )
+            body += crlf + str(value).encode("utf-8") + crlf
+        for name, data, ctype in files:
+            body += b"--" + boundary.encode() + crlf
+            body += (
+                'Content-Disposition: form-data; name="files"; '
+                f'filename="{name}"'.encode()
+            ) + crlf
+            body += f"Content-Type: {ctype}".encode() + crlf + crlf
+            body += data + crlf
+        body += b"--" + boundary.encode() + b"--" + crlf
+        req = urllib.request.Request(
+            self._pat_url + path,
+            data=bytes(body),
+            method="POST",
+            headers={
+                "Content-Type": f"multipart/form-data; boundary={boundary}"
+            },
         )
         with urllib.request.urlopen(req, timeout=_HTTP_TIMEOUT_S) as resp:  # noqa: S310
             return resp.read().decode("utf-8", "replace")
@@ -556,6 +1003,33 @@ class WinlinkTransport(Transport):
         if len(first) > 60:
             first = first[:57] + "..."
         return first or "(no subject)"
+
+
+def _flatten_form_folder(node: object, prefix: str, out: list[dict]) -> None:
+    """Flatten Pat's nested form-catalog tree into a flat list of forms.
+
+    ``prefix`` is the accumulated folder path for ``node`` (the root's own name
+    is omitted). Appends ``{"name","path","folder"}`` for each template found.
+    """
+    if not isinstance(node, dict):
+        return
+    for form in node.get("forms") or []:
+        if not isinstance(form, dict):
+            continue
+        path = form.get("template_path")
+        if not path:
+            continue
+        out.append({
+            "name": str(form.get("name") or path),
+            "path": str(path),
+            "folder": prefix,
+        })
+    for sub in node.get("folders") or []:
+        if not isinstance(sub, dict):
+            continue
+        sub_name = str(sub.get("name") or "")
+        sub_prefix = f"{prefix}/{sub_name}".strip("/") if prefix else sub_name
+        _flatten_form_folder(sub, sub_prefix, out)
 
 
 def _addr_str(value: object) -> str:
@@ -576,6 +1050,4 @@ def _first_addr(value: object) -> str:
     if isinstance(value, list):
         return _addr_str(value[0]) if value else ""
     return _addr_str(value)
-
-
 

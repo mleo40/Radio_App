@@ -236,6 +236,14 @@ _BAND_EDGES: tuple[tuple[str, int, int], ...] = (
     ("6m", 50_000_000, 54_000_000),
 )
 
+# JS8Call submode speeds: STATION.STATUS reports SPEED as a small int.
+_SPEED_NAMES = {
+    "0": "normal",
+    "1": "fast",
+    "2": "turbo",
+    "4": "slow",
+}
+
 
 def band_for_freq(hz: int | None) -> str | None:
     """Return the amateur band name (e.g. ``"20m"``) for a dial frequency in Hz."""
@@ -284,6 +292,9 @@ class JS8CallTransport(Transport):
         # moves). Lets the panel show which band we're on without polling the rig.
         self._dial_freq: int | None = None
         self._audio_offset: int = 1500
+        # Fuller rig snapshot from STATION.STATUS (submode/speed + selected call).
+        self._speed: str = ""
+        self._selected_call: str = ""
 
     def set_identity(self, callsign: str, groups: tuple[str, ...] = ()) -> None:
         """Update the local callsign/groups used for inbound address routing.
@@ -424,6 +435,44 @@ class JS8CallTransport(Transport):
             except (TypeError, ValueError):
                 pass
 
+    def _update_status(self, params: dict) -> None:
+        """Cache speed/selected-callsign from a STATION.STATUS event."""
+        speed = params.get("SPEED")
+        if speed is not None:
+            # JS8Call reports the submode as an int (0=normal..3=turbo) or name.
+            self._speed = _SPEED_NAMES.get(str(speed), str(speed)).strip()
+        selected = params.get("SELECTED")
+        if selected is not None:
+            self._selected_call = str(selected).strip().upper()
+
+    async def radio_status(self) -> bool:
+        """Ask JS8Call for a full operating snapshot (STATION.GET_STATUS).
+
+        Passive: this only queries JS8Call's view of the rig (which it knows via
+        CAT/Hamlib). The reply arrives asynchronously as a ``STATION.STATUS``
+        event and updates the cached snapshot. Returns True once the request was
+        handed to JS8Call.
+        """
+        return await self._send_api({"type": "STATION.GET_STATUS", "value": ""})
+
+    def radio_status_snapshot(self) -> dict:
+        """Last-known rig operating state for the Health panel.
+
+        Returns dial/freq/offset/speed/selected-callsign/band plus ``cat`` which
+        is False when JS8Call has no dial frequency (i.e. no CAT/rig control).
+        """
+        offset = self._audio_offset
+        dial = self._dial_freq
+        return {
+            "dial": dial,
+            "offset": offset,
+            "freq": (dial + offset) if dial is not None else None,
+            "band": band_for_freq(dial),
+            "speed": self._speed,
+            "selected": self._selected_call,
+            "cat": dial is not None,
+        }
+
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
             return False
@@ -461,6 +510,13 @@ class JS8CallTransport(Transport):
         # (both the reply to our RIG.GET_FREQ and unsolicited dial-move events).
         if etype == "RIG.FREQ":
             self._update_freq(params)
+            return
+        # Fuller operating snapshot: JS8Call answers STATION.GET_STATUS with the
+        # dial/offset plus the current submode speed and the selected callsign.
+        # Cache it so the Health panel can show the rig's operating state.
+        if etype == "STATION.STATUS":
+            self._update_freq(params)
+            self._update_status(params)
             return
         # Track stations we hear for the reachability heuristic, and surface a
         # presence "announce" (like RNS) when a station resurfaces, so the UI's

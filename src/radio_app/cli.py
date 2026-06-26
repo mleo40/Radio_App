@@ -113,6 +113,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_ret.set_defaults(func=_cmd_reticulum)
 
+    p_wl = sub.add_parser("winlink", help="Winlink / Pat utilities")
+    p_wl.add_argument(
+        "action",
+        choices=["status", "connect", "gateways", "forms", "forms-update"],
+        nargs="?",
+        default="status",
+        help="status (default): check Pat; connect: run a session; "
+        "gateways: list nearby RMS gateways; forms: list installed Winlink "
+        "forms; forms-update: download the latest standard forms",
+    )
+    p_wl.add_argument(
+        "gateway", nargs="?", help="optional RMS gateway callsign for 'connect'"
+    )
+    p_wl.set_defaults(func=_cmd_winlink)
+
     p_fav = sub.add_parser(
         "favorites",
         help="manage favorite peers (callsigns / RNS hex hashes) for alerts",
@@ -401,13 +416,31 @@ def _ask_bool(prompt: str, default: bool) -> bool:
     return answer in ("y", "yes", "true", "1")
 
 
+def _probe_pat(url: str) -> bool:
+    """Best-effort check that a Pat HTTP API answers ``/api/status``.
+
+    Used only to give the operator a friendly "Pat is/ isn't reachable" hint
+    during setup; Winlink works regardless (Pat can be started later).
+    """
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            url.rstrip("/") + "/api/status", method="GET"
+        )
+        with urllib.request.urlopen(req, timeout=2.0):  # noqa: S310
+            return True
+    except Exception:  # noqa: BLE001 - any failure means "not reachable now"
+        return False
+
+
 def _cmd_setup(args: argparse.Namespace) -> int:
     """Interactive wizard: capture all user settings into the one config file.
 
     Radio_App is a single pane of glass over disparate transports, so this asks
-    once for everything (identity, Reticulum/rnsd, JS8Call, MeshCore) and writes
-    it to the single TOML config. The radio is driven by the transport app
-    (JS8Call), so there are no rig/CAT questions here.
+    once for everything (identity, Reticulum/rnsd, JS8Call, MeshCore, Winlink)
+    and writes it to the single TOML config. The radio is driven by the transport
+    app (JS8Call), so there are no rig/CAT questions here.
     """
     from .core.js8call_query import query_groups, query_station
     from .core.station import Station
@@ -509,6 +542,40 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             print(f"  - {p}", file=sys.stderr)
         return 2
 
+    # -- Winlink (store-and-forward email via a separately-installed Pat) -----
+    print("\nWinlink (email over radio/internet; a separately-installed Pat does"
+          " the work)")
+    wl = dict(cfg.transports.get("winlink", {}))
+    wl_enabled = _ask_bool("Enable Winlink?", wl.get("enabled", False))
+    if wl_enabled:
+        wl["pat_url"] = _ask(
+            "Pat HTTP API URL", wl.get("pat_url", "http://127.0.0.1:8080")
+        )
+        wl["callsign"] = _ask(
+            "Winlink callsign", wl.get("callsign", "") or station.callsign
+        )
+        # Sensible out-of-the-box defaults: auto-fallback telnet -> Mercury/VARA
+        # -> ARDOP, queue to the outbox, poll the inbox every minute. Only set
+        # what's missing so an existing hand-tuned block is preserved.
+        wl.setdefault("connect", "auto")
+        wl.setdefault("connect_order", ["telnet", "varahf", "ardop"])
+        wl.setdefault("poll_interval", 60)
+        wl.setdefault("auto_connect", False)
+        # The Winlink password and the modem both live INSIDE Pat, not here.
+        print("  checking whether Pat is reachable...")
+        if _probe_pat(wl["pat_url"]):
+            print(f"  Pat answered at {wl['pat_url']} \u2713")
+        else:
+            print(
+                f"  (no answer at {wl['pat_url']} yet - start it later with "
+                "'pat http')"
+            )
+        print(
+            "  note: configure your Winlink account password INSIDE Pat "
+            "(Radio_App never stores it)."
+        )
+    wl["enabled"] = wl_enabled
+
     # -- compliance (advanced) ----------------------------------------------
     allow_enc = _ask_bool(
         "\nAllow encrypted payloads on HF? (advanced; usually NO)",
@@ -524,13 +591,14 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     transports["reticulum"] = ret
     transports["js8call"] = js8
     transports["meshcore"] = mc
+    transports["winlink"] = wl
     cfg.data["transports"] = transports
     cfg.save()
 
     print(f"\nSaved configuration to {cfg.path}")
     print(f"  station   : {station.callsign or '(none)'}  {station.grid_square}")
     enabled = [
-        n for n in ("reticulum", "js8call", "meshcore")
+        n for n in ("reticulum", "js8call", "meshcore", "winlink")
         if transports[n].get("enabled")
     ]
     print(f"  transports: {', '.join(enabled) or '(none enabled)'}")
@@ -653,6 +721,137 @@ def _cmd_reticulum(args: argparse.Namespace) -> int:
                     pass
             except ModuleNotFoundError:
                 print("(RNS not importable; cannot show transport internals)")
+        return 0
+
+    return _run(_with_app(args.config, run))
+
+
+def _cmd_winlink(args: argparse.Namespace) -> int:
+    """Winlink/Pat utilities: check reachability, run a session, list gateways.
+
+    The radio session, modem and the Winlink account password all live inside
+    Pat (a separately-installed program). This command only talks to Pat's HTTP
+    API; it never sees or stores your Winlink password.
+    """
+    async def run(app: App) -> int:
+        t = next((x for x in app.transports if x.name == "winlink"), None)
+        if t is None:
+            print(
+                "Winlink transport is not enabled. Add a [transports.winlink] "
+                "block (run 'radioapp setup')."
+            )
+            return 1
+
+        pat_url = str(t.config.get("pat_url", ""))
+        if args.action == "status":
+            reachable = _probe_pat(pat_url)
+            summary = t.connect_summary() if hasattr(t, "connect_summary") else "?"
+            print(f"pat url          : {pat_url}")
+            print(f"pat reachable    : {'yes' if reachable else 'no'}")
+            print(f"callsign         : {t.config.get('callsign', '') or '(unset)'}")
+            print(f"connect method   : {summary}")
+            gw = t.config.get("gateway", "") or "(default CMS)"
+            print(f"gateway          : {gw}")
+            for warning in (
+                t.validate_config() if hasattr(t, "validate_config") else []
+            ):
+                print(f"config warning   : {warning}")
+            if not reachable:
+                print(
+                    "\nPat is not answering. Start it with 'pat http' and make "
+                    "sure pat_url points at it."
+                )
+            print(
+                "\nCredentials: your Winlink password is configured INSIDE Pat "
+                "(secure-login); Radio_App never stores it."
+            )
+            return 0 if reachable else 1
+
+        if args.action == "gateways":
+            if not hasattr(t, "list_gateways"):
+                print("This transport build cannot list gateways.")
+                return 1
+            try:
+                gateways = await t.list_gateways()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Gateway list failed: {exc}")
+                return 1
+            if not gateways:
+                print("No gateways returned (telnet mode, or none cached/in range).")
+                return 0
+            print(f"Nearby RMS gateways ({len(gateways)}):")
+            for gw in gateways[:30]:
+                call = gw.get("callsign") or gw.get("Callsign") or "?"
+                mode = gw.get("mode") or gw.get("Mode") or ""
+                dist = gw.get("distance") or gw.get("Distance") or ""
+                extra = " ".join(str(x) for x in (mode, dist) if x)
+                print(f"  {call}  {extra}")
+            return 0
+
+        if args.action == "forms":
+            if not hasattr(t, "list_forms"):
+                print("This transport build cannot list forms.")
+                return 1
+            try:
+                forms = await t.list_forms()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Form catalog failed: {exc}")
+                return 1
+            if not forms:
+                print(
+                    "No Winlink forms installed. Run "
+                    "'radioapp winlink forms-update' to download them."
+                )
+                return 0
+            print(f"Installed Winlink forms ({len(forms)}):")
+            last_folder = None
+            for f in forms:
+                folder = f.get("folder") or "(root)"
+                if folder != last_folder:
+                    print(f"\n  {folder}/")
+                    last_folder = folder
+                print(f"    {f['name']}   {f['path']}")
+            return 0
+
+        if args.action == "forms-update":
+            if not hasattr(t, "update_forms"):
+                print("This transport build cannot update forms.")
+                return 1
+            print("Asking Pat to download the latest Winlink standard forms ...")
+            try:
+                result = await t.update_forms()
+            except Exception as exc:  # noqa: BLE001
+                print(f"Forms update failed: {exc}")
+                return 1
+            if not result:
+                print("Forms update failed (is Pat online and reachable?).")
+                return 1
+            action, version = result.get("action", ""), result.get("version", "")
+            if action == "update":
+                print(f"Updated to standard forms version {version}.")
+            else:
+                print(f"Already up to date (version {version}).")
+            return 0
+
+        # connect
+        if not hasattr(t, "connect_now"):
+            print("This transport build cannot start a session.")
+            return 1
+        url = None
+        if args.gateway:
+            method = getattr(t, "_method", None)
+            scheme = method.scheme if method is not None else "telnet"
+            url = f"{scheme}://{args.gateway}"
+        target = url or (
+            t.connect_summary() if hasattr(t, "connect_summary") else "default"
+        )
+        print(f"Connecting via {target} ...")
+        try:
+            received = await t.connect_now(url)
+        except Exception as exc:  # noqa: BLE001
+            print(f"Session failed: {exc}")
+            return 1
+        print(f"Session complete — {received} message(s) received.")
         return 0
 
     return _run(_with_app(args.config, run))

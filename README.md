@@ -4,13 +4,15 @@ A single application for **uniform messaging over radio, the internet, and LoRa*
 Messages are normalized into one format regardless of the medium that carried them,
 so to the user it doesn't matter whether a message travelled via **Reticulum**
 (internet / LoRa / serial), **JS8Call** (HF weak-signal radio), **MeshCore**
-(license-free ISM LoRa mesh), or the **Mercury** HF modem.
+(license-free ISM LoRa mesh), **Winlink** (store-and-forward email over radio,
+via Pat), or the **Mercury** HF modem.
 
-> Status: **scaffolding**. The core (unified message model, router, best-transport
-> selection, group handling, inbound filtering, SQLite persistence, config, CLI) is
-> implemented and tested. The transport adapters provide full lifecycle +
-> capabilities; the wire-level translation to each radio stack is marked with
-> `TODO` so the app runs and is testable without any radio hardware.
+> Status: **working core + transports**. The core (unified message model, router,
+> best-transport selection, group handling, inbound filtering, SQLite persistence,
+> config, CLI, Textual TUI) is implemented and tested. The **Reticulum**,
+> **JS8Call**, **MeshCore** and **Winlink** transports are functional; the
+> **Mercury** adapter still has its wire-level translation marked `TODO`. The app
+> runs and the whole suite is testable without any radio hardware.
 
 ## Key ideas
 
@@ -18,9 +20,6 @@ so to the user it doesn't matter whether a message travelled via **Reticulum**
 - **Pluggable transports** — every medium implements one `Transport` interface and
   self-registers. Adding a platform (known or unknown) is a single new class, or a
   separate pip package discovered via entry points. No core changes.
-- **Best transport for the task** — the router scores reachable, capable transports
-  per a user-selectable **mode** (`auto`, `fastest`, `reliable`, `secure`,
-  `offgrid`, `broadcast`) and falls back across them.
 - **Groups** (`@TTP`, `@TTPNE`) — a first-class address type, mapped to each
   transport's native mechanism, with **subscriptions + filter rules** controlling
   what you receive.
@@ -32,11 +31,12 @@ so to the user it doesn't matter whether a message travelled via **Reticulum**
 ## Station identity, privacy & compliance
 
 - **Setup wizard** — run `radioapp setup` to capture **all** user settings in one
-  pass (display name, default mode, Reticulum/`rnsd` location, JS8Call connection,
-  callsign, grid square) and write them to the single config file. If JS8Call is
-  enabled and running, the wizard **asks JS8Call for your callsign and grid** so
-  you don't retype them (you can still override). The radio itself is driven by the
-  transport app (JS8Call), so there is **no rig/CAT configuration** in Radio_App.
+  pass (display name, Reticulum/`rnsd` location, JS8Call connection, MeshCore
+  connection, Winlink/Pat connection, callsign, grid square) and write them to the
+  single config file. If JS8Call is enabled and running, the wizard **asks JS8Call
+  for your callsign and grid** so you don't retype them (you can still override).
+  The radio itself is driven by the transport app (JS8Call), so there is **no
+  rig/CAT configuration** in Radio_App.
 - **Privacy separation** — your callsign/grid are attached only on **HF transports**
   (where identifying on the air is required). On the **Reticulum** transport the
   sender is replaced with an anonymous cryptographic identity and any operator PII
@@ -47,18 +47,25 @@ so to the user it doesn't matter whether a message travelled via **Reticulum**
   encrypted payload over an HF transport unless you both set
   `compliance.allow_encrypted_on_hf = true` **and** confirm an explicit warning at
   send time (a typed `I ACCEPT` in the CLI, or a red confirmation modal in the TUI).
+- **Per-protocol size limits** — each transport publishes its documented
+  per-message cap (`max_message_size`, e.g. MeshCore **134 bytes**, Winlink
+  **120 KB**). The composer enforces the active mode's cap: it **blocks** oversize
+  messages on transports with a real limit and shows a live `bytes/limit` counter
+  in the status bar. **JS8Call** has no published cap (it auto-frames long text
+  into successive transmissions), so it only **warns**. Slash-commands are exempt,
+  and the count is measured in **UTF-8 bytes** (an emoji/accent is several).
 
 ## Architecture
 
 ```
-        UI (CLI now; TUI/GUI later)  — thin layer over the core
+        UI (CLI + Textual TUI; GUI later) — thin layer over the core
                      │  UnifiedMessage
               ┌──────┴──────┐
               │   Router    │  selection · fallback · dedup · filtering · persist
               └──────┬──────┘
-         ┌────────────┼─────────────┐
-   Reticulum   JS8Call  MeshCore  Mercury     (+ future / plugin transports)
-  internet/LoRa  HF    ISM LoRa   HF modem
+       ┌──────────┬──────────┬──────────┬──────────┐
+  Reticulum   JS8Call   MeshCore   Winlink    Mercury   (+ plugin transports)
+ internet/LoRa   HF     ISM LoRa   email/RF   HF modem
 ```
 
 Source layout (`src/` layout, PEP 8):
@@ -75,10 +82,13 @@ src/radio_app/
 │   ├── groups.py          # Group + GroupRegistry (@TTP, subscriptions)
 │   ├── filters.py         # inbound filter rule engine
 │   └── store.py           # SQLite persistence
+├── ui/                    # Textual TUI (single pane of glass)
 └── transports/
     ├── base.py            # Transport ABC + TransportCapabilities + auto-registry
     ├── reticulum_transport.py
     ├── js8call_transport.py
+    ├── meshcore_transport.py
+    ├── winlink_transport.py   # wraps a user-installed Pat client over HTTP
     └── mercury_transport.py
 ```
 
@@ -114,6 +124,15 @@ The Reticulum transport is implemented on **RNS + LXMF** and provides real,
 end-to-end-encrypted **direct messaging** over internet, LoRa (RNode) or serial.
 Identity here is an **anonymous** Reticulum address — your callsign/grid are never
 attached on this medium.
+
+**Groups & broadcast.** Reticulum also supports shared **group channels** and a
+**broadcast** channel. A group (e.g. `@TTP`) maps to an RNS **GROUP destination**
+whose address *and* encryption key are derived from the channel name — so every
+node that knows the name joins the same encrypted channel, exactly like a
+MeshCore hashtag channel. Group/broadcast traffic is single-packet (≈300 chars)
+and delivered over shared/broadcast interfaces (LoRa mesh, a local segment);
+multi-hop transport-routed group delivery would need a propagation node (future).
+
 
 ```bash
 pip install -e ".[reticulum]"      # install RNS + LXMF
@@ -213,13 +232,37 @@ and gateway, with buttons:
 
 - **✎ Subject** — set the subject for the next message (or type `/subject <text>`).
 - **📡 Connect** — start a Pat session to send the outbox and receive mail
-  (`/connect [gateway]`).
-- **☰ Gateways** — list nearby RMS gateways from Pat (`/gateways`); pick one with
-  `/gateway <CALL>` then Connect.
+  (`/connect [gateway]`). While the session runs, **live progress** from Pat's
+  WebSocket (dialing → connected → tx/rx %) is logged in the message pane.
+- **☰ Gateways** — list nearby RMS gateways from Pat (`/gateways`); the callsigns
+  are **clickable** — click one to set it as the gateway and connect immediately
+  (or `/gateway <CALL>` then Connect).
 
 Address a message with `/to <callsign>` (e.g. `/to W1AW`), type the body, and
 send; the pending subject is attached and then cleared. With no conversation
 selected the pane shows all received Winlink mail.
+
+**Attachments.** Queue files for the next outbound message with `/attach <path>`
+(repeat for several; `/attach` lists the queue, `/attach clear` empties it); they
+upload as Winlink attachments when you send. For received mail, `/save` downloads
+the attachments of the latest message in the open conversation to your
+`download_dir` (default `~/.local/share/radio_app/winlink`). Attachment names are
+shown inline with a 📎 marker on both sent and received messages.
+
+**Delivery confirmation.** A sent message is **queued** in Pat's outbox; once a
+session actually forwards it (it leaves the outbox) the message is marked
+**✓ delivered** in the conversation — so "sent" never overstates delivery.
+
+From the command line, `radioapp winlink` mirrors this: `winlink status` checks
+that Pat is reachable and prints the connect method/gateway, `winlink gateways`
+lists RMS gateways, and `winlink connect [CALL]` runs a session.
+
+**Winlink forms.** Standard Winlink forms/templates (ICS-213, check-in, position,
+weather, …) are supported through Pat: `winlink forms-update` downloads the latest
+standard-forms set, `winlink forms` lists the installed templates, and the
+transport's `compose_form()` drives Pat's browserless build flow — it generates
+the `RMS_Express_Form` XML attachment and queues the completed form in the outbox
+for the next session.
 
 Notes:
 - Outbound messages are posted to Pat's **outbox**; with `auto_connect = false`
@@ -227,7 +270,8 @@ Notes:
   with `auto_connect = true`). Use the message `metadata["subject"]` to set the
   subject; otherwise the first line of the body is used.
 - Inbound mail is discovered by polling Pat's inbox (`poll_interval` seconds);
-  attachments are surfaced in `metadata["attachments"]`.
+  attachment names are surfaced in `metadata["attachments"]` and downloaded on
+  demand with `/save`.
 - `connect_url` is a full escape hatch that overrides `connect`/`gateway` with a
   raw Pat connect string (e.g. `ardop://N0XYZ?freq=7100`).
 - **Credentials:** your Winlink account password lives **inside Pat** (its own
@@ -281,6 +325,11 @@ radioapp transports               # list transports + capabilities
 radioapp status                   # what's up / connected
 radioapp nodes                    # discovered NomadNet sites
 radioapp peers                    # discovered LXMF peers
+radioapp winlink status           # check Pat reachability + connect method
+radioapp winlink gateways         # list nearby RMS gateways via Pat
+radioapp winlink connect [CALL]   # run a Winlink session (send outbox, get mail)
+radioapp winlink forms            # list installed Winlink form templates
+radioapp winlink forms-update     # download the latest standard forms
 radioapp send --to N0CALL --mode secure --encrypt "x"  # guarded on HF
 ```
 
@@ -372,7 +421,7 @@ radioapp tui              # launch it
 ```
 
 ```
- ① reticulum●  ② js8call○  ③ mercury○   ◷ Watch  ✚ Health        ⌨   <- mode selector
+ ① reticulum●  ② js8call○  ③ meshcore○  ④ winlink○   ◷ Watch  ✚ Health   ⌨   <- mode selector
 +---------------+------------------------------+
 | Conversations |  Messages (active mode)      |   <- operating-mode view
 |  (scoped to   |                              |
@@ -405,6 +454,9 @@ In-composer commands:
 | `/fav list` / `/fav rm <id>` / `/fav only` | list favorites / remove one / toggle the favorites-only filter |
 | `/freq` / `/freq <MHz\|Hz>` | (JS8Call) show / set the radio dial frequency |
 | `/band` / `/band <name>` | (JS8Call) list bands / switch band (e.g. `/band 20m`) |
+| `/subject <text>` | (Winlink) set the subject for the next message |
+| `/attach <path>` / `/save` | (Winlink) queue an outbound file / save received attachments |
+| `/connect [CALL]` / `/gateways` / `/gateway <CALL>` | (Winlink) run a session / list & pick RMS gateways |
 | `/monitor` | toggle the Monitor view |
 | `/mode` | reminder to press **F3** to change the active transport |
 | `/refresh` | reload conversations |
@@ -459,7 +511,6 @@ The router, message model, selection, filtering, persistence and UI are untouche
 ## Roadmap (not yet implemented)
 
 - Wire-level translation in the Mercury adapter (marked `TODO`).
-- Reticulum **group/broadcast** destinations (direct messaging works now).
 - RNS `Link`-based **live keyboard-to-keyboard** session path.
 - **NomadNet node hosting** (publishing pages). Read-only **page viewing is
   implemented** — see below.

@@ -12,6 +12,8 @@ crashing the app.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import json
 import logging
 import os
 from datetime import UTC, datetime
@@ -32,6 +34,64 @@ except ModuleNotFoundError:
 # Single-packet opportunistic delivery is fine below this size; larger messages
 # use a link + resource transfer (DIRECT).
 _OPPORTUNISTIC_MAX = 200
+
+# -- shared group / broadcast channels ---------------------------------------
+# Groups/broadcast use RNS GROUP destinations: a shared, symmetric-key channel
+# whose addressing identity AND encryption key are both derived from the group
+# *name* (not a per-node identity), so every node that knows the name lands on
+# the same destination hash and can decrypt the same traffic - the same model as
+# a MeshCore hashtag channel or a JS8 @GROUP. Delivery rides shared / broadcast
+# Reticulum interfaces (LoRa mesh, a local segment); multi-hop transport-routed
+# group delivery would need a propagation node (future work).
+_GROUP_APP_NAME = "radio_app"
+_GROUP_ASPECT = "group"
+# AddressType.BROADCAST maps to this reserved well-known channel, so "everyone"
+# is simply a group that every node joins on start.
+_BROADCAST_GROUP = "broadcast"
+# Group messages are single RNS packets; cap the encoded body near the packet
+# MDU so we reject (rather than silently truncate) oversize group sends.
+_GROUP_PAYLOAD_MAX = 383
+
+
+def group_shared_key(name: str) -> bytes:
+    """Deterministic 32-byte symmetric key for a named group channel.
+
+    Everyone who knows the group *name* derives the same key, turning a GROUP
+    destination into a shared encrypted channel. Pure/stdlib so it is
+    unit-testable without RNS.
+    """
+    norm = name.strip().lstrip("@").lower()
+    return hashlib.sha256(f"radio_app.group:{norm}".encode()).digest()
+
+
+def encode_group_payload(sender_hex: str, display_name: str, content: str) -> bytes:
+    """Pack a group message body (sender hash + display name + text)."""
+    return json.dumps(
+        {"s": sender_hex or "", "n": display_name or "", "c": content or ""},
+        separators=(",", ":"),
+    ).encode("utf-8")
+
+
+def decode_group_payload(data: object) -> dict | None:
+    """Parse a GROUP packet body produced by :func:`encode_group_payload`.
+
+    Returns ``{"sender", "name", "content"}`` or ``None`` for anything that is
+    not a well-formed group payload.
+    """
+    if not isinstance(data, (bytes, bytearray)):
+        return None
+    try:
+        obj = json.loads(bytes(data).decode("utf-8", errors="replace"))
+    except (ValueError, TypeError):
+        return None
+    if not isinstance(obj, dict) or "c" not in obj:
+        return None
+    return {
+        "sender": str(obj.get("s") or ""),
+        "name": str(obj.get("n") or ""),
+        "content": str(obj.get("c") or ""),
+    }
+
 
 
 def _display_name_from_app_data(app_data: object, use_lxmf: bool = True) -> str:
@@ -80,13 +140,31 @@ class ReticulumTransport(Transport):
         # the delivery/failure callbacks emit a 'delivery' telemetry event the UI
         # can use to annotate the sent message.
         self._sent_refs: dict[int, dict] = {}
+        # Named group channels to join at start (pushed in via set_identity), plus
+        # the live IN/OUT GROUP destinations keyed by normalised group name.
+        self._group_names: tuple[str, ...] = ()
+        self._groups_in: dict[str, object] = {}
+        self._groups_out: dict[str, object] = {}
+
+    def set_identity(self, callsign: str = "", groups: tuple[str, ...] = ()) -> None:
+        """Learn which named groups to join.
+
+        The callsign is intentionally ignored — Reticulum is anonymous and never
+        carries operator identity — but the app pushes the configured group names
+        here (the same call it makes to HF transports), and we join each as a
+        shared GROUP channel at :meth:`start`.
+        """
+        if groups:
+            self._group_names = tuple(
+                dict.fromkeys(g.strip().lstrip("@").lower() for g in groups if g)
+            )
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
             max_message_size=1_000_000,  # LXMF handles large/chunked payloads
-            supports_broadcast=False,  # group/broadcast not yet implemented
+            supports_broadcast=True,  # shared GROUP broadcast channel
             supports_addressing=True,
-            supports_groups=False,  # TODO: shared group destinations
+            supports_groups=True,  # shared-key GROUP destinations
             supports_encryption=True,  # E2E by default
             supports_delivery_confirmation=True,
             is_realtime=True,  # RNS Links enable live chat
@@ -212,6 +290,12 @@ class ReticulumTransport(Transport):
             self._announce_handler = _AnnounceHandler(self)
             RNS.Transport.register_announce_handler(self._announce_handler)
 
+        # Join shared group channels (incl. the reserved broadcast channel) so we
+        # receive group/broadcast traffic. GROUP destination hashes are derived
+        # from the channel name, so no announce/path discovery is needed.
+        self._join_group(_BROADCAST_GROUP)
+        for name in self._group_names:
+            self._join_group(name)
 
         self._running = True
         log.info(
@@ -254,8 +338,14 @@ class ReticulumTransport(Transport):
     async def send(self, msg: UnifiedMessage) -> bool:
         if not self._running or self._lxmf is None:
             return False
+        # Group / broadcast go to a shared GROUP channel (broadcast = a reserved
+        # well-known group). Direct messages use the LXMF SINGLE path below.
+        if msg.address_type is AddressType.GROUP:
+            return self._send_group(msg.group or "", msg)
+        if msg.address_type is AddressType.BROADCAST:
+            return self._send_group(_BROADCAST_GROUP, msg)
         if msg.address_type is not AddressType.DIRECT or not msg.recipient:
-            log.info("[reticulum] only direct messages are supported currently")
+            log.info("[reticulum] unsupported address type for send")
             return False
         try:
             dest_hash = bytes.fromhex(msg.recipient)
@@ -300,6 +390,146 @@ class ReticulumTransport(Transport):
         lxm.register_failed_callback(self._on_failed)
         self._lxmf.handle_outbound(lxm)
         return True
+
+    # -- group / broadcast ----------------------------------------------------
+    def _send_group(self, name: str, msg: UnifiedMessage) -> bool:
+        """Send a message to a shared GROUP channel (single encrypted packet)."""
+        norm = name.strip().lstrip("@").lower()
+        if not norm:
+            log.warning("[reticulum] group send with no channel name")
+            return False
+        our_hex = (
+            self._local_destination.hash.hex()
+            if self._local_destination is not None
+            else ""
+        )
+        payload = encode_group_payload(
+            our_hex, self.local_display_name(), msg.content
+        )
+        if len(payload) > _GROUP_PAYLOAD_MAX:
+            log.warning(
+                "[reticulum] group message too large (%d > %d bytes); not sent.",
+                len(payload),
+                _GROUP_PAYLOAD_MAX,
+            )
+            return False
+        return self._transmit_group(norm, payload)
+
+    def _transmit_group(self, norm: str, payload: bytes) -> bool:
+        """Transmit an encoded group payload on its GROUP destination.
+
+        Split out from :meth:`_send_group` so the encode/size logic is testable
+        without RNS. Returns True once the packet was handed to RNS.
+        """
+        out = self._group_out_destination(norm)
+        if out is None:
+            return False
+        try:
+            RNS.Packet(out, payload).send()
+            log.info("[reticulum] sent group message on #%s", norm)
+            return True
+        except Exception:  # noqa: BLE001 - never let one send crash the app
+            log.exception("[reticulum] group send failed on #%s", norm)
+            return False
+
+    def _join_group(self, name: str) -> object | None:
+        """Create + cache the IN GROUP destination for ``name`` and listen on it.
+
+        Idempotent. Returns the IN destination (or ``None`` when RNS is down /
+        creation failed). The packet callback is bound to the channel name so
+        inbound packets are attributed to the right group.
+        """
+        norm = name.strip().lstrip("@").lower()
+        if not norm or not _HAVE_RNS:
+            return None
+        existing = self._groups_in.get(norm)
+        if existing is not None:
+            return existing
+        try:
+            dest = self._make_group_destination(norm, RNS.Destination.IN)
+            dest.set_packet_callback(
+                lambda data, packet, _n=norm: self._group_packet_received(
+                    _n, data, packet
+                )
+            )
+        except Exception:  # noqa: BLE001
+            log.exception("[reticulum] could not join group #%s", norm)
+            return None
+        self._groups_in[norm] = dest
+        log.info(
+            "[reticulum] joined group channel #%s <%s>", norm, dest.hash.hex()[:12]
+        )
+        return dest
+
+    def _group_out_destination(self, norm: str) -> object | None:
+        """Create + cache the OUT GROUP destination for a (normalised) name."""
+        if not _HAVE_RNS:
+            return None
+        cached = self._groups_out.get(norm)
+        if cached is not None:
+            return cached
+        try:
+            out = self._make_group_destination(norm, RNS.Destination.OUT)
+        except Exception:  # noqa: BLE001
+            log.exception("[reticulum] could not open group #%s for sending", norm)
+            return None
+        self._groups_out[norm] = out
+        # Sending to an ad-hoc group also subscribes us so we hear the replies.
+        self._join_group(norm)
+        return out
+
+    def _make_group_destination(self, norm: str, direction):
+        """Build a shared GROUP destination for a channel name.
+
+        Both the addressing identity and the symmetric encryption key are derived
+        deterministically from the name, so every node that knows the name lands
+        on the same destination hash and can decrypt the channel.
+        """
+        ident = RNS.Identity(create_keys=False)
+        ident.load_private_key(
+            hashlib.sha512(f"radio_app.gid:{norm}".encode()).digest()
+        )
+        dest = RNS.Destination(
+            ident,
+            direction,
+            RNS.Destination.GROUP,
+            _GROUP_APP_NAME,
+            _GROUP_ASPECT,
+            norm,
+        )
+        dest.load_private_key(group_shared_key(norm))
+        return dest
+
+    def _group_packet_received(self, group_name: str, data: object, packet) -> None:
+        """Handle an inbound GROUP packet (called from an RNS thread)."""
+        parsed = decode_group_payload(data)
+        if parsed is None:
+            return
+        our_hex = (
+            self._local_destination.hash.hex()
+            if self._local_destination is not None
+            else None
+        )
+        sender = parsed["sender"]
+        # Ignore our own transmissions echoed back on a shared medium.
+        if our_hex and sender and sender.lower() == our_hex.lower():
+            return
+        is_broadcast = group_name == _BROADCAST_GROUP
+        msg = UnifiedMessage(
+            sender=sender or "unknown",
+            content=parsed["content"],
+            address_type=(
+                AddressType.BROADCAST if is_broadcast else AddressType.GROUP
+            ),
+            group=None if is_broadcast else group_name,
+            transport=self.name,
+            metadata={
+                "encrypted": True,
+                "rns_source": sender,
+                "display_name": parsed["name"],
+            },
+        )
+        self._dispatch_to_loop(msg)
 
     # -- receiving (called from an RNS thread) --------------------------------
     def _lxmf_delivery(self, lxm) -> None:
@@ -510,6 +740,10 @@ class ReticulumTransport(Transport):
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running or not _HAVE_RNS:
             return False
+        # Shared group/broadcast channels are always sendable when RNS is up
+        # (delivery is broadcast on the medium; no per-recipient path needed).
+        if msg.address_type in (AddressType.GROUP, AddressType.BROADCAST):
+            return True
         if msg.address_type is not AddressType.DIRECT or not msg.recipient:
             return False
         try:

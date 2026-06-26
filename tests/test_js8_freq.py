@@ -55,3 +55,39 @@ def test_update_freq_ignores_bad_values():
     t._update_freq({"DIAL": "not-a-number"})  # ignored, keeps previous
     assert t.dial_freq == 7_078_000
 
+
+def test_radio_status_snapshot_without_cat():
+    t = JS8CallTransport({})
+    snap = t.radio_status_snapshot()
+    assert snap["cat"] is False
+    assert snap["dial"] is None
+    assert snap["freq"] is None
+    assert snap["band"] is None
+    assert snap["speed"] == ""
+    assert snap["selected"] == ""
+
+
+def test_station_status_event_populates_snapshot():
+    t = JS8CallTransport({})
+    # Mimic the params JS8Call sends in a STATION.STATUS event.
+    t._update_freq({"DIAL": 14_078_000, "OFFSET": 1200})
+    t._update_status({"SPEED": 0, "SELECTED": "ke7xyz"})
+    snap = t.radio_status_snapshot()
+    assert snap["cat"] is True
+    assert snap["dial"] == 14_078_000
+    assert snap["offset"] == 1200
+    assert snap["freq"] == 14_079_200
+    assert snap["band"] == "20m"
+    assert snap["speed"] == "normal"          # 0 -> normal
+    assert snap["selected"] == "KE7XYZ"       # upper-cased
+
+
+def test_update_status_maps_speed_names_and_passthrough():
+    t = JS8CallTransport({})
+    t._update_status({"SPEED": 2})
+    assert t.radio_status_snapshot()["speed"] == "turbo"
+    t._update_status({"SPEED": "fancy"})      # unknown -> passthrough
+    assert t.radio_status_snapshot()["speed"] == "fancy"
+
+
+

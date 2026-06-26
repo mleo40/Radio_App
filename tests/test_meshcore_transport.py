@@ -114,6 +114,12 @@ def test_send_direct_rejects_unusable_recipient():
     assert asyncio.run(t.send(msg)) is False
 
 
+def test_capabilities_documented_message_size():
+    """MeshCore caps the per-message payload at its documented 134 bytes."""
+    caps = MeshCoreTransport({}).capabilities()
+    assert caps.max_message_size == 134
+
+
 def test_send_group_uses_channel_index():
     t = _running_transport()
     msg = UnifiedMessage.to_group("me", "2", "net in 5")

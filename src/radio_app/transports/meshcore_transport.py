@@ -119,7 +119,7 @@ class MeshCoreTransport(Transport):
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
-            max_message_size=160,            # LoRa text payload; tune to firmware
+            max_message_size=134,            # MeshCore direct text payload (bytes)
             supports_broadcast=True,
             supports_addressing=True,        # direct messages to a contact
             supports_groups=True,            # MeshCore channels
