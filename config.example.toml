@@ -20,11 +20,13 @@ database = "conversations.db"
 [transports.reticulum]
 enabled = true
 config_path = ""
-shared_instance = true
+# The app ONLY attaches to an external rnsd shared instance; it never starts its
+# own. If rnsd isn't running yet, it keeps retrying every reconnect_interval
+# seconds and attaches automatically once rnsd appears.
+reconnect_interval = 10
 announce_on_start = true
 announce_monitor = true
 display_name = ""
-manage_interface = false
 
 [transports.reticulum.rnode]
 port = "/dev/ttyUSB0"

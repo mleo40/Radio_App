@@ -159,12 +159,14 @@ radioapp send --to <peer_lxmf_hex> "hello over LoRa"
 ```
 
 Notes:
-- **Use a running `rnsd` (recommended):** if you run the Reticulum daemon, set
-  `shared_instance = true` in `[transports.reticulum]`. The app then connects to
-  `rnsd` over a local socket and shares its RNode — exactly like `nomadnet` does —
-  instead of opening the serial port itself (only one process can own an RNode).
-  Even with `shared_instance = false`, RNS auto-connects to a running shared
-  instance if one exists for the same config dir; `true` just makes it required.
+- **The app only ever attaches to an external `rnsd` — it never starts its own
+  Reticulum instance.** Run the Reticulum daemon (`rnsd`) and the app connects to
+  it over the local shared-instance socket, sharing its RNode/interfaces (exactly
+  like `nomadnet` does; only one process can own an RNode). If `rnsd` isn't up
+  when the app starts, the Reticulum transport stays down and **keeps retrying in
+  the background** (every `reconnect_interval` seconds, default 10) — so the
+  moment `rnsd` comes online the transport attaches automatically, no restart
+  needed.
 - `setup-rnode` never overwrites an existing `~/.reticulum/config`; if you already
   configured Reticulum, edit that file by hand instead.
 - Frequency/bandwidth/SF/CR **must match** the other stations in your LoRa network.

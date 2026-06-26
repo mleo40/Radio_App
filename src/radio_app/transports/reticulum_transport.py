@@ -145,6 +145,16 @@ class ReticulumTransport(Transport):
         self._group_names: tuple[str, ...] = ()
         self._groups_in: dict[str, object] = {}
         self._groups_out: dict[str, object] = {}
+        # We only ever ATTACH to an external rnsd shared instance — we never start
+        # our own. If rnsd isn't up yet we keep retrying in the background so the
+        # transport comes online automatically once rnsd appears.
+        self._configdir: str | None = None
+        self._stopping = False
+        self._reconnect_task: asyncio.Task | None = None
+        self._reconnect_interval = float(
+            (config or {}).get("reconnect_interval", 10.0)
+        )
+        self._connect_setup_done = False
 
     def set_identity(self, callsign: str = "", groups: tuple[str, ...] = ()) -> None:
         """Learn which named groups to join.
@@ -185,6 +195,7 @@ class ReticulumTransport(Transport):
             self._running = False
             return
         self._loop = asyncio.get_running_loop()
+        self._stopping = False
         raw_configdir = self.config.get("config_path") or None
         # RNS does NOT expand "~" itself: a literal "~/.reticulum" becomes a
         # NEW directory under the cwd, which won't match where rnsd is running
@@ -194,67 +205,96 @@ class ReticulumTransport(Transport):
             configdir = os.path.expanduser(os.path.expandvars(str(raw_configdir)))
             if configdir != raw_configdir:
                 log.info("expanded config_path %r -> %r", raw_configdir, configdir)
-        # When connecting to a locally running rnsd (shared instance), the daemon
-        # owns the hardware - we must NOT also try to write/own an RNode interface.
-        shared = bool(self.config.get("shared_instance", False))
-        if self.config.get("manage_interface", False) and not shared:
-            try:
-                ensure_rnode_interface(configdir, self.config.get("rnode", {}))
-            except Exception:  # noqa: BLE001
-                log.exception("could not write managed RNode interface")
-        # Initialise RNS. If an rnsd shared instance is already running with this
-        # config dir, RNS connects to it automatically; require_shared_instance
-        # makes that mandatory (fail fast if rnsd is not running).
+        self._configdir = configdir
+        # Try once now; if rnsd isn't up yet, keep retrying in the background so
+        # the transport attaches automatically the moment rnsd comes online.
+        if not await asyncio.to_thread(self._attempt_connect):
+            log.info(
+                "Reticulum: rnsd not reachable yet; retrying every %.0fs in the "
+                "background. The transport will come online once rnsd appears.",
+                self._reconnect_interval,
+            )
+            self._schedule_reconnect()
+
+    def _schedule_reconnect(self) -> None:
+        """Start (or keep) the background task that retries attaching to rnsd."""
+        if self._stopping:
+            return
+        if self._reconnect_task is not None and not self._reconnect_task.done():
+            return
+        try:
+            self._reconnect_task = asyncio.create_task(self._reconnect_loop())
+        except RuntimeError:
+            # No running loop (e.g. a synchronous unit test): skip retries.
+            self._reconnect_task = None
+
+    async def _reconnect_loop(self) -> None:
+        while not self._stopping and not self._running:
+            await asyncio.sleep(self._reconnect_interval)
+            if self._stopping or self._running:
+                break
+            if await asyncio.to_thread(self._attempt_connect):
+                log.info("Reticulum: attached to rnsd after retry; transport up.")
+                break
+
+    def _attempt_connect(self) -> bool:
+        """Attach to an external rnsd shared instance. Never starts our own.
+
+        Returns True once attached and fully set up, False if rnsd isn't
+        reachable yet (caller keeps retrying) or setup failed. Synchronous (RNS
+        calls block); run it via ``asyncio.to_thread``.
+        """
+        # require_shared_instance=True makes RNS refuse to spin up its own
+        # instance: it attaches to a running rnsd or raises. We NEVER want this
+        # process to own the hardware / become the shared instance itself.
         try:
             self._reticulum = RNS.Reticulum(
-                configdir=configdir,
-                require_shared_instance=shared,
+                configdir=self._configdir,
+                require_shared_instance=True,
             )
         except SystemError as exc:
-            # Most common: shared_instance = true but rnsd isn't running. Fail
-            # gracefully (transport stays down) instead of dumping a traceback.
-            if shared:
-                log.warning(
-                    "Reticulum could not attach to a shared instance (rnsd): %s. "
-                    "Is rnsd running? Either start it, or set "
-                    "[transports.reticulum] shared_instance = false to let the "
-                    "app open the interface itself.",
-                    exc,
-                )
-            else:
-                log.warning("Reticulum failed to start: %s", exc)
-            self._running = False
-            return
+            # rnsd isn't running (or not sharing this config dir) yet.
+            log.debug("Reticulum: shared instance not available yet: %s", exc)
+            self._reticulum = None
+            return False
         except Exception as exc:  # noqa: BLE001 - never crash the whole app
-            log.warning("Reticulum failed to start: %s", exc)
-            self._running = False
-            return
-        # Diagnostic summary: this is the #1 reason "the monitor is silent"
-        # even though rnsd is hearing announces - the app started its own RNS
-        # instance with zero interfaces instead of attaching to rnsd.
-        iface_count = 0
-        try:
-            iface_count = len(getattr(RNS.Transport, "interfaces", []) or [])
-        except Exception:  # noqa: BLE001
-            pass
+            log.warning("Reticulum connect attempt failed: %s", exc)
+            self._reticulum = None
+            return False
+
+        # Belt-and-suspenders: if somehow we didn't attach to a shared instance,
+        # refuse to run as a standalone instance and retry instead.
         is_connected_shared = bool(
             getattr(self._reticulum, "is_connected_to_shared_instance", False)
         )
-        log.info(
-            "Reticulum up: shared_instance=%s connected_to_shared=%s interfaces=%d",
-            shared, is_connected_shared, iface_count,
-        )
-        if not is_connected_shared and iface_count == 0:
-            log.warning(
-                "Reticulum has NO interfaces and is NOT attached to a shared "
-                "instance (rnsd). The Monitor will stay empty because this "
-                "process cannot receive anything from the network. If rnsd is "
-                "running, set [transports.reticulum] shared_instance = true in "
-                "your config. Otherwise enable manage_interface or add an "
-                "interface to ~/.reticulum/config."
+        if not is_connected_shared:
+            log.debug(
+                "Reticulum: not attached to a shared instance; will keep trying."
             )
-        elif shared:
-            log.info("Reticulum: connected to shared instance (rnsd).")
+            try:
+                if hasattr(RNS, "exit"):
+                    RNS.exit()
+            except Exception:  # noqa: BLE001
+                pass
+            self._reticulum = None
+            return False
+        log.info("Reticulum: connected to shared instance (rnsd).")
+
+        # One-time setup (identity, LXMF, handlers, group joins) the first time we
+        # successfully attach. Guarded so a reconnect never double-registers.
+        if not self._connect_setup_done:
+            self._setup_after_connect()
+            self._connect_setup_done = True
+
+        self._running = True
+        log.info(
+            "Reticulum transport up. Local LXMF address: %s",
+            RNS.prettyhexrep(self._local_destination.hash),
+        )
+        return True
+
+    def _setup_after_connect(self) -> None:
+        """One-time identity / LXMF / announce-handler / group setup."""
         # Persistent anonymous identity stored under the RNS storage path.
         storage = self._storage_dir()
         os.makedirs(storage, exist_ok=True)
@@ -297,14 +337,12 @@ class ReticulumTransport(Transport):
         for name in self._group_names:
             self._join_group(name)
 
-        self._running = True
-        log.info(
-            "Reticulum transport up. Local LXMF address: %s",
-            RNS.prettyhexrep(self._local_destination.hash),
-        )
-
     async def stop(self) -> None:
         self._running = False
+        self._stopping = True
+        if self._reconnect_task is not None:
+            self._reconnect_task.cancel()
+            self._reconnect_task = None
         if getattr(self, "_announce_handler", None) is not None and _HAVE_RNS:
             try:
                 RNS.Transport.deregister_announce_handler(self._announce_handler)
