@@ -321,6 +321,7 @@ class JS8CallTransport(Transport):
             supports_groups=True,         # native @GROUP support
             supports_encryption=False,    # prohibited on amateur bands
             supports_delivery_confirmation=False,
+            supports_chunking=True,       # router splits long messages into frames
             is_realtime=False,            # slow turn-taking
             typical_latency_s=30.0,
             needs_internet=False,

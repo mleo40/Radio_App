@@ -11,8 +11,18 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Callable
+from dataclasses import replace
 
 from ..transports.base import Transport
+from .chunking import (
+    Reassembler,
+    group_id,
+    make_ack,
+    needs_chunking,
+    parse_ack,
+    parse_chunk,
+    segment,
+)
 from .compliance import ComplianceGuard
 from .filters import FilterAction, FilterEngine
 from .groups import GroupRegistry
@@ -40,6 +50,8 @@ class Router:
         default_mode: SelectionMode = SelectionMode.AUTO,
         station: Station | None = None,
         compliance: ComplianceGuard | None = None,
+        ack_timeout: float = 30.0,
+        ack_retries: int = 2,
     ) -> None:
         self._transports = transports
         self._by_name = {t.name: t for t in transports}
@@ -52,6 +64,16 @@ class Router:
         self._compliance = compliance or ComplianceGuard()
         self._ui_callbacks: list[UiCallback] = []
         self._seen: set[str] = set()  # in-memory dedup cache
+        # -- app-level chunking / ACK-retry (small-MTU transports) ------------
+        self._reassembler = Reassembler()
+        self._ack_timeout = ack_timeout
+        self._ack_retries = ack_retries
+        # Outbound chunk groups awaiting ACKs: (transport, gid) -> state dict.
+        self._pending_sends: dict[tuple[str, str], dict] = {}
+        # Background retransmit tasks, same key, so we can cancel/replace them.
+        self._retry_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # Inbound groups we've already fully reassembled (drop late duplicates).
+        self._completed: set[tuple[str, str]] = set()
 
         for transport in transports:
             transport.on_receive(self._handle_inbound)
@@ -139,11 +161,138 @@ class Router:
             return False
         # Privacy: per-transport identity (callsign on HF, anonymous on RNS).
         outbound = apply_outbound_privacy(msg, transport, self._station)
+        caps = transport.capabilities()
+        # App-level chunking: split a body that won't fit one frame on a small-MTU
+        # medium into several framed parts the receiver reassembles.
+        if caps.supports_chunking and needs_chunking(
+            outbound.content, caps.max_message_size
+        ):
+            return await self._send_chunked(transport, outbound, caps)
         try:
             return await transport.send(outbound)
         except Exception:  # noqa: BLE001 - never let one transport break a send
             log.exception("send failed on %s", transport.name)
             return False
+
+    # -- chunking / ACK-retry -------------------------------------------------
+
+    async def _raw_send(self, transport: Transport, msg: UnifiedMessage) -> bool:
+        """Hand one already-prepared frame to a transport, swallowing errors."""
+        try:
+            return await transport.send(msg)
+        except Exception:  # noqa: BLE001
+            log.exception("send failed on %s", transport.name)
+            return False
+
+    async def _send_chunked(
+        self, transport: Transport, outbound: UnifiedMessage, caps
+    ) -> bool:
+        """Segment ``outbound`` and transmit each part; arm ACK-retry if useful."""
+        gid = group_id(outbound.msg_id)
+        parts = segment(outbound.content, caps.max_message_size, gid=gid)
+        log.info(
+            "[chunk] %s: %d parts over %s", gid, len(parts), transport.name
+        )
+        ok = True
+        for part in parts:
+            if not await self._raw_send(transport, replace(outbound, content=part)):
+                ok = False
+        # Only retransmit where the medium can't confirm delivery itself and we
+        # can address a reply target (DIRECT messages get ACKs from the peer).
+        if (
+            ok
+            and self._ack_retries > 0
+            and not caps.supports_delivery_confirmation
+            and outbound.address_type is AddressType.DIRECT
+        ):
+            self._arm_retry(transport, outbound, gid, parts)
+        return ok
+
+    def _arm_retry(
+        self,
+        transport: Transport,
+        outbound: UnifiedMessage,
+        gid: str,
+        parts: list[str],
+    ) -> None:
+        key = (transport.name, gid)
+        self._pending_sends[key] = {"acked": set(), "total": len(parts)}
+        old = self._retry_tasks.pop(key, None)
+        if old is not None:
+            old.cancel()
+        try:
+            self._retry_tasks[key] = asyncio.create_task(
+                self._retry_loop(transport, outbound, key, parts)
+            )
+        except RuntimeError:
+            # No running loop (e.g. a unit test sending synchronously): skip the
+            # background retransmit — the parts were already sent once.
+            self._pending_sends.pop(key, None)
+
+    async def _retry_loop(
+        self,
+        transport: Transport,
+        outbound: UnifiedMessage,
+        key: tuple[str, str],
+        parts: list[str],
+    ) -> None:
+        total = len(parts)
+        try:
+            for attempt in range(self._ack_retries):
+                await asyncio.sleep(self._ack_timeout)
+                state = self._pending_sends.get(key)
+                if state is None:
+                    return
+                missing = [s for s in range(1, total + 1) if s not in state["acked"]]
+                if not missing:
+                    return
+                log.info(
+                    "[chunk] %s: retransmit %d/%d parts (attempt %d)",
+                    key[1],
+                    len(missing),
+                    total,
+                    attempt + 1,
+                )
+                for seq in missing:
+                    await self._raw_send(
+                        transport, replace(outbound, content=parts[seq - 1])
+                    )
+        finally:
+            self._pending_sends.pop(key, None)
+            self._retry_tasks.pop(key, None)
+
+    def _note_ack(self, transport_name: str, gid: str, received: set[int]) -> None:
+        state = self._pending_sends.get((transport_name, gid))
+        if state is not None:
+            state["acked"].update(received)
+
+    def _maybe_send_ack(
+        self, msg: UnifiedMessage, part, *, final: bool = False
+    ) -> None:
+        """Acknowledge received chunk parts so the sender can stop retransmitting.
+
+        Only for DIRECT messages on media without native delivery confirmation;
+        the ACK is a tiny control frame addressed back to the original sender.
+        """
+        if msg.address_type is not AddressType.DIRECT:
+            return
+        transport = self._by_name.get(msg.transport)
+        if transport is None or not transport.running:
+            return
+        if transport.capabilities().supports_delivery_confirmation:
+            return
+        if final:
+            received: set[int] = set(range(1, part.total + 1))
+        else:
+            received = self._reassembler.received_seqs(msg.sender or "", part.gid)
+        frame = make_ack(part.gid, received, part.total)
+        ack_msg = UnifiedMessage.direct(
+            sender=msg.recipient or "", recipient=msg.sender or "", content=frame
+        )
+        try:
+            asyncio.create_task(self._raw_send(transport, ack_msg))
+        except RuntimeError:
+            pass  # no loop running (sync test path)
 
     def _finalize(
         self, msg: UnifiedMessage, ok: bool, transport: str | None = None
@@ -172,6 +321,34 @@ class Router:
                 except Exception:  # noqa: BLE001
                     log.exception("ui callback failed")
             return
+
+        # App-level chunking: absorb ACK frames and reassemble multi-frame
+        # messages before they reach dedup / filtering / persistence. Frames that
+        # aren't chunk/ACK control frames fall straight through untouched.
+        text = msg.content or ""
+        ack = parse_ack(text)
+        if ack is not None:
+            self._note_ack(msg.transport, ack.gid, set(ack.received))
+            return
+        part = parse_chunk(text)
+        if part is not None:
+            source = msg.sender or ""
+            gkey = (source, part.gid)
+            if gkey in self._completed:
+                # A late duplicate of an already-finished message: re-ACK so the
+                # sender stops, but don't surface it twice.
+                self._maybe_send_ack(msg, part, final=True)
+                return
+            full = self._reassembler.add(source, part)
+            if full is None:
+                self._maybe_send_ack(msg, part)
+                return
+            self._completed.add(gkey)
+            if len(self._completed) > 1024:
+                self._completed.clear()
+            msg.content = full
+            self._maybe_send_ack(msg, part, final=True)
+            # Fall through with the fully reassembled message.
 
         # De-duplicate across paths (same logical message on two transports).
         if msg.msg_id in self._seen or self._store.exists(msg.msg_id):

@@ -73,6 +73,10 @@ class TransportCapabilities:
     supports_groups: bool = False        # native named-group support?
     supports_encryption: bool = False    # end-to-end?
     supports_delivery_confirmation: bool = False
+    #: Opt in to the router's app-level chunking/reassembly for messages that
+    #: exceed ``max_message_size``. Only meaningful for small-MTU text media
+    #: (JS8Call, MeshCore); larger transports carry whole messages natively.
+    supports_chunking: bool = False
     is_realtime: bool = False            # suitable for live keyboard chat?
     typical_latency_s: float = 30.0
     needs_internet: bool = False         # excluded when off-grid

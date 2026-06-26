@@ -125,6 +125,7 @@ class MeshCoreTransport(Transport):
             supports_groups=True,            # MeshCore channels
             supports_encryption=True,        # MeshCore encrypts natively
             supports_delivery_confirmation=True,  # MSG_SENT / ACK
+            supports_chunking=True,          # router splits oversize text payloads
             is_realtime=False,
             typical_latency_s=5.0,
             needs_internet=False,

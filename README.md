@@ -54,6 +54,14 @@ via Pat), or the **Mercury** HF modem.
   in the status bar. **JS8Call** has no published cap (it auto-frames long text
   into successive transmissions), so it only **warns**. Slash-commands are exempt,
   and the count is measured in **UTF-8 bytes** (an emoji/accent is several).
+- **App-level chunking + ACK/retry** — on small-MTU media (**JS8Call** ~80 B,
+  **MeshCore** 134 B) the router transparently splits a longer message into
+  compact framed parts (`RC|gid|seq/total|…`) and reassembles them on the
+  receiver, so you can send bodies larger than one on-air frame. On a medium
+  without native delivery confirmation (JS8Call) the receiver returns a tiny ACK
+  frame and the sender retransmits only the parts that weren't acknowledged.
+  Single-frame messages carry **zero** overhead, and non-chunk traffic is
+  untouched. Opt-in per transport via the `supports_chunking` capability.
 
 ## Architecture
 
@@ -523,7 +531,6 @@ The router, message model, selection, filtering, persistence and UI are untouche
 - **NomadNet node hosting** (publishing pages). Read-only **page viewing is
   implemented** — see below.
 - **Desktop GUI** + visual config editor over the same single config file.
-- App-level ACK/retry and message chunking for small-MTU transports.
 
 See [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md) for the queued feature backlog.
 
