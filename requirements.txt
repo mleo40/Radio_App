@@ -1,0 +1,8 @@
+# Minimal runtime dependencies (core + CLI).
+# For a full install with transports, prefer:  pip install -e ".[all]"
+tomli-w>=1.0
+
+# Reticulum transport (uncomment or install via extras: pip install -e ".[reticulum]")
+# rns>=0.7
+# lxmf>=0.5
+

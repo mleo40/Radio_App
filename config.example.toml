@@ -1,0 +1,136 @@
+favorites = [
+    { id = "W1AW", label = "", last_seen = "2026-06-26T03:35:01.790236+00:00" },
+]
+
+[general]
+display_name = "Anonymous"
+default_mode = "auto"
+history_retention_days = 0
+
+[station]
+callsign = ""
+grid_square = ""
+
+[compliance]
+allow_encrypted_on_hf = false
+
+[storage]
+database = "conversations.db"
+
+[transports.reticulum]
+enabled = true
+config_path = ""
+shared_instance = true
+announce_on_start = true
+announce_monitor = true
+display_name = ""
+manage_interface = false
+
+[transports.reticulum.rnode]
+port = "/dev/ttyUSB0"
+frequency = 915000000
+bandwidth = 125000
+spreadingfactor = 8
+codingrate = 5
+txpower = 7
+
+[transports.js8call]
+enabled = false
+host = "127.0.0.1"
+port = 2442
+callsign = "N0CALL"
+presence_quiet_seconds = 600
+
+[transports.mercury]
+enabled = false
+host = "127.0.0.1"
+port = 7373
+
+[transports.meshcore]
+enabled = false
+connection = "serial"
+port = "/dev/ttyACM0"
+baud = 115200
+host = "127.0.0.1"
+tcp_port = 5000
+
+# Winlink (store-and-forward email over radio) via a separately-installed Pat
+# client (https://github.com/la5nta/pat). Pat is NOT bundled — install it
+# yourself and run `pat http`; this app talks to its HTTP API.
+[transports.winlink]
+enabled = false
+# Base URL of the running Pat HTTP server.
+pat_url = "http://127.0.0.1:8080"
+# Your Winlink callsign (used as the local mailbox identity).
+callsign = "N0CALL"
+# How Pat reaches a gateway. "auto" tries each path in `connect_order` and uses
+# the first that's reachable and connects — you don't pick telnet vs a modem.
+# Or force one: "telnet" | "ardop" | "varahf" (incl. Mercury) | "varafm" |
+# "pactor" | "ax25".
+connect = "auto"
+connect_order = ["telnet", "varahf", "ardop"]
+# Probe host/ports used to detect which RF modem is running before dialing it
+# (and to show modem up/down on the Health board).
+probe_host = "127.0.0.1"
+vara_port = 8300            # Mercury or VARA HF control port
+ardop_port = 8515          # ARDOP TNC port
+# RMS gateway callsign for RF, or leave empty for telnet (Pat's default CMS).
+# You can also set per-method gateways, e.g. varahf_gateway = "KW1U".
+gateway = ""
+# Optional full escape hatch: a raw Pat connect URL that overrides everything.
+connect_url = ""
+# Seconds between inbox polls for newly received mail.
+poll_interval = 60
+# When true, each send immediately dials the gateway; when false (default),
+# messages queue in Pat's outbox for the next session you start.
+auto_connect = false
+
+[groups.TTP]
+display_name = "TTP Net"
+transports = [
+    "js8call",
+    "reticulum",
+]
+
+[groups.TTPNE]
+display_name = "TTP NE Region"
+transports = [
+    "js8call",
+]
+
+[subscriptions]
+groups = [
+    "TTP",
+    "TTPNE",
+]
+show_unsubscribed = false
+
+[[filters]]
+name = "TTP on HF gets my attention"
+action = "notify"
+
+[filters.match]
+group = "TTP"
+transport = "js8call"
+
+[[filters]]
+name = "Keep all TTP* groups quietly"
+action = "file"
+
+[filters.match]
+group = "TTP*"
+
+[[filters]]
+name = "Default"
+action = "show"
+
+[ui]
+theme = ""
+# Landing surface shown at startup. Leave empty to open the first configured
+# transport (the default). Other options: a transport name (e.g. "meshcore",
+# "js8call", "reticulum"), "nomadnet", "watch", "health", or "favorites".
+home = ""
+
+[logging]
+file = "radio_app.log"
+level = "INFO"

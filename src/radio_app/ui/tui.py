@@ -1,0 +1,3683 @@
+"""Textual terminal UI (TUI) for Radio_App — a single pane of glass.
+
+A persistent **mode selector** (top bar) is the primary control: each configured
+transport is one operating **mode** with its own workspace, plus two utility
+views — **Watch** and **Health**. Selecting a mode re-skins the workspace and
+binds sending to that transport. See DESIGN.md for the full model.
+
+Surfaces:
+* OPERATING MODE (interact): pick a transport; its contacts/conversations show
+  and sending is bound to it. Capability detail (identity, encrypted/plaintext)
+  appears in the status bar.
+* WATCH (observe): a unified, read-only live stream of ALL messages — both
+  received and the ones you send — from every transport, regardless of the
+  active mode. Selecting an item opens that conversation and switches the active
+  mode to its transport.
+* HEALTH (verify): passive per-transport reachability probes (no transmission) —
+  "can we reach rnsd / the JS8Call API / the modem socket right now?".
+
+Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ unknown.
+
+Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
+       F5 = cycle Watch/Health/Favorites   Ctrl+R = refresh
+       Ctrl+C / Ctrl+Q / q = quit
+Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
+  /favorites,  /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
+"""
+
+from __future__ import annotations
+
+import asyncio
+from collections import deque
+from datetime import UTC, datetime, timedelta
+
+from textual import work
+from textual.app import App, ComposeResult
+from textual.binding import Binding
+from textual.containers import Horizontal, Vertical, VerticalScroll
+from textual.message import Message
+from textual.screen import ModalScreen
+from textual.widgets import (
+    Button,
+    ContentSwitcher,
+    Footer,
+    Header,
+    Input,
+    Label,
+    ListItem,
+    ListView,
+    RichLog,
+    Static,
+)
+
+from ..app import App as CoreApp
+from ..config import Config
+from ..core.favorites import Favorite
+from ..core.message import AddressType, DeliveryStatus, UnifiedMessage
+from ..core.micron import parse_address, render_micron
+from ..core.station import Station
+from ..transports.base import ReachabilityStatus, Transport
+from ..transports.js8call_transport import (
+    JS8_BAND_DIAL_HZ,
+    band_for_freq,
+    dial_for_band,
+)
+
+
+def _parse_freq_to_hz(text: str) -> int | None:
+    """Parse a user-typed frequency into Hz.
+
+    Accepts MHz (``14.078``) or raw Hz (``14078000``); a trailing ``hz``/``mhz``
+    unit is tolerated. Values below 100000 are treated as MHz, the rest as Hz.
+    Returns None on anything unparseable.
+    """
+    s = text.strip().lower().replace(",", "")
+    for unit in ("mhz", "hz"):
+        if s.endswith(unit):
+            s = s[: -len(unit)].strip()
+            break
+    try:
+        val = float(s)
+    except ValueError:
+        return None
+    if val <= 0:
+        return None
+    return int(round(val * 1_000_000)) if val < 100_000 else int(val)
+
+
+class Incoming(Message):
+    """Posted to the UI thread when the router accepts an inbound message."""
+
+    def __init__(self, msg: UnifiedMessage, action: str) -> None:
+        super().__init__()
+        self.msg = msg
+        self.action = action
+
+
+class SetupScreen(ModalScreen[dict | None]):
+    """First-run modal: capture callsign + grid square.
+
+    The radio is driven by the transport app (JS8Call), so there is no rig
+    selection here. Values may be pre-filled from JS8Call when it is reachable.
+    """
+
+    CSS = """
+    SetupScreen { align: center middle; }
+    #setup-box {
+        width: 64; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #setup-box Input { margin-bottom: 1; }
+    #setup-buttons { height: auto; align-horizontal: right; }
+    """
+
+    def __init__(self, station: Station, source_note: str = "") -> None:
+        super().__init__()
+        self._station = station
+        self._source_note = source_note
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="setup-box"):
+            intro = "[b]Station setup[/b]\nUsed on HF only; Reticulum stays anonymous."
+            if self._source_note:
+                intro += f"\n[dim]{self._source_note}[/dim]"
+            yield Static(intro)
+            yield Input(
+                value=self._station.callsign,
+                placeholder="Callsign (e.g. N0CALL)",
+                id="s-call",
+            )
+            yield Input(
+                value=self._station.grid_square,
+                placeholder="Grid square (e.g. FN31pr)",
+                id="s-grid",
+            )
+            yield Static("", id="setup-error")
+            with Horizontal(id="setup-buttons"):
+                yield Button("Skip", id="s-skip", variant="default")
+                yield Button("Save", id="s-save", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "s-skip":
+            self.dismiss(None)
+            return
+        station = Station(
+            callsign=self.query_one("#s-call", Input).value,
+            grid_square=self.query_one("#s-grid", Input).value,
+        )
+        problems = station.validate()
+        if problems:
+            self.query_one("#setup-error", Static).update(
+                "[red]" + "; ".join(problems) + "[/red]"
+            )
+            return
+        self.dismiss(
+            {
+                "callsign": station.callsign,
+                "grid_square": station.grid_square,
+            }
+        )
+
+
+class ConfirmEncryptScreen(ModalScreen[bool]):
+    """Explicit, unmistakable confirmation before encrypted HF transmission."""
+
+    CSS = """
+    ConfirmEncryptScreen { align: center middle; }
+    #warn-box {
+        width: 72; height: auto; padding: 1 2;
+        border: thick $error; background: $surface;
+    }
+    #warn-buttons { height: auto; align-horizontal: right; }
+    """
+
+    def __init__(self, warning: str) -> None:
+        super().__init__()
+        self._warning = warning
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="warn-box"):
+            yield Static(f"[b red]{self._warning}[/b red]")
+            with Horizontal(id="warn-buttons"):
+                yield Button("Cancel", id="c-no", variant="primary")
+                yield Button("I ACCEPT - transmit", id="c-yes", variant="error")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "c-yes")
+
+
+class ModeScreen(ModalScreen[str | None]):
+    """Deprecated: the mode menu was replaced by the persistent selector + F3
+    cycling. Kept as a thin stub only to avoid breaking any external imports;
+    no longer used by the app. Safe to delete once nothing references it.
+    """
+
+
+class BrowseScreen(ModalScreen[None]):
+    """Read-only NomadNet page viewer with link navigation + history."""
+
+    CSS = """
+    BrowseScreen { align: center middle; }
+    #browse-box {
+        width: 90%; height: 90%; padding: 0 1;
+        border: thick $primary; background: $surface;
+    }
+    #browse-addr { height: 1; color: $accent; }
+    #browse-body { height: 1fr; border: solid $panel; padding: 0 1; }
+    #browse-status { height: 1; color: $text-muted; }
+    #browse-input { height: 3; }
+    """
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("ctrl+b", "back", "Back"),
+        ("ctrl+r", "reload", "Reload"),
+    ]
+
+    def __init__(
+        self,
+        browser,
+        dest: str,
+        path: str = "/page/index.mu",
+        fields: dict | None = None,
+    ) -> None:
+        super().__init__()
+        self._browser = browser
+        self._current = (dest, path, fields or {})
+        self._history: list[tuple[str, str, dict]] = []
+        self._links: list = []
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="browse-box"):
+            yield Static("", id="browse-addr")
+            with VerticalScroll(id="browse-body"):
+                yield Static("", id="browse-content", markup=True)
+            yield Static("", id="browse-status")
+            yield Input(
+                placeholder="link # to follow · <hash>:/page/x.mu · "
+                "Ctrl+B back · Ctrl+R reload · Esc close",
+                id="browse-input",
+            )
+
+    def on_mount(self) -> None:
+        self.query_one("#browse-input", Input).focus()
+        self._load(*self._current, push=False)
+
+    @work
+    async def _load(
+        self, dest: str, path: str, fields: dict, push: bool = True
+    ) -> None:
+        addr = self.query_one("#browse-addr", Static)
+        status = self.query_one("#browse-status", Static)
+        content = self.query_one("#browse-content", Static)
+        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
+        status.update("loading...")
+        res = await self._browser.fetch(dest, path, field_data=fields or None)
+        if not res.ok:
+            content.update(f"[red]Error:[/red] {res.error}")
+            status.update("failed")
+            return
+        # Canonicalise to the *resolved* full destination hash. The caller may
+        # have passed a short prefix (node lists show truncated hashes; the
+        # address bar accepts prefixes). If we kept that prefix as the page's
+        # base, every relative link (`:/page/x.mu`) would inherit it and get
+        # re-resolved against the live announce set on the next hop - which can
+        # silently land on a *different* node that shares the prefix. Pinning to
+        # the full hash keeps in-node links on the same node.
+        dest = res.dest or dest
+        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
+        page = render_micron(res.content, base_dest=dest)
+        content.update(page.markup or "[dim](empty page)[/dim]")
+        self._links = page.links
+        if push and self._current != (dest, path, fields):
+            self._history.append(self._current)
+        self._current = (dest, path, fields)
+        self.query_one("#browse-body", VerticalScroll).scroll_home(animate=False)
+        nlinks = len(self._links)
+        hint = " · type a number to follow" if nlinks else ""
+        status.update(f"ok · {nlinks} link(s){hint}")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+        if text.isdigit():
+            self._follow(int(text))
+            return
+        low = text.lower()
+        if low in ("b", "back"):
+            self.action_back()
+        elif low in ("r", "reload"):
+            self.action_reload()
+        elif low in ("q", "quit", "close"):
+            self.dismiss(None)
+        else:
+            base = self._current[0]
+            dest, path, fields = parse_address(text, base_dest=base)
+            if not dest:
+                self.query_one("#browse-status", Static).update("no node hash given")
+                return
+            self._load(dest, path, fields)
+
+    def _follow(self, idx: int) -> None:
+        if idx < 1 or idx > len(self._links):
+            self.query_one("#browse-status", Static).update(f"no link #{idx}")
+            return
+        link = self._links[idx - 1]
+        dest = link.resolve_dest(self._current[0])
+        self._load(dest, link.path, link.fields)
+
+    def action_back(self) -> None:
+        if not self._history:
+            self.query_one("#browse-status", Static).update("no history")
+            return
+        dest, path, fields = self._history.pop()
+        self._load(dest, path, fields, push=False)
+
+    def action_reload(self) -> None:
+        self._load(*self._current, push=False)
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class RadioTUI(App):
+    """The Textual application."""
+
+    CSS = """
+    #modebar { height: 3; background: $boost; padding: 0 1; }
+    #modebar Button {
+        height: 1; min-width: 6; margin: 0 1 0 0; border: none;
+        padding: 0 1;
+    }
+    #modebar Button.-active { text-style: bold reverse; }
+    #modebar #modebar-spacer { width: 1fr; height: 1; }
+    #modebar #input-ind { width: auto; height: 1; color: $text-muted; padding: 0 1; }
+    .-touch #modebar { height: 5; }
+    .-touch #modebar Button { height: 3; min-width: 12; }
+    #main { height: 1fr; }
+    #active-view { height: 1fr; }
+    #active-banner { height: auto; color: $warning; padding: 0 1; }
+    #mesh-bar { height: 1; padding: 0 1; display: none; }
+    #mesh-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #mesh-bar-label { width: auto; color: $accent; }
+    #mesh-spacer { width: 1fr; }
+    .-touch #mesh-bar { height: 3; }
+    .-touch #mesh-bar Button { height: 3; min-width: 12; }
+    #js8-bar { height: 1; padding: 0 1; display: none; }
+    #js8-bar Button { height: 1; min-width: 5; border: none; margin: 0 1 0 0; }
+    #js8-bar-label { width: auto; color: $accent; }
+    #js8-spacer { width: 1fr; }
+    .-touch #js8-bar { height: 3; }
+    .-touch #js8-bar Button { height: 3; min-width: 8; }
+    #js8-query-bar { height: 1; padding: 0 1; display: none; }
+    #js8-query-bar Button { height: 1; min-width: 8; border: none; margin: 0 1 0 0; }
+    #js8-query-label { width: auto; color: $accent; }
+    #js8-query-spacer { width: 1fr; }
+    .-touch #js8-query-bar { height: 3; }
+    .-touch #js8-query-bar Button { height: 3; min-width: 10; }
+    #winlink-bar { height: 1; padding: 0 1; display: none; }
+    #winlink-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #winlink-bar-label { width: auto; color: $accent; }
+    #winlink-spacer { width: 1fr; }
+    .-touch #winlink-bar { height: 3; }
+    .-touch #winlink-bar Button { height: 3; min-width: 12; }
+    #active-body { height: 1fr; }
+    #threads { width: 32; border-right: solid $panel; }
+    #right { width: 1fr; }
+    #messages { height: 1fr; padding: 0 1; }
+    #monitor-view { height: 1fr; }
+    #monitor-ticker { height: 1; color: $accent; padding: 0 1; }
+    #watch-bar { height: 1; }
+    #monitor-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #watch-spacer { width: 1fr; height: 1; }
+    #watch-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #monitor { height: 1fr; }
+    #nomadnet-view { height: 1fr; }
+    #nomad-help { height: 1; color: $text-muted; padding: 0 1; }
+    #nomad-bar { height: 1; padding: 0 1; }
+    #nomad-spacer { width: 1fr; }
+    #nomad-nodes { height: 1fr; }
+    #health-view { height: 1fr; }
+    #health-help { height: 1; color: $text-muted; padding: 0 1; }
+    #health-log { height: 1fr; padding: 0 1; }
+    #favorites-view { height: 1fr; }
+    #fav-help { height: auto; color: $text-muted; padding: 0 1; }
+    #fav-bar { height: 1; padding: 0 1; }
+    #fav-spacer { width: 1fr; }
+    #favorites-list { height: 1fr; }
+    #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
+    #composer { height: 3; }
+    """
+    # Quit is wired in two ways so it always works:
+    #   - Ctrl+C / Ctrl+Q are priority bindings, so they fire even when an
+    #     Input widget (composer or NomadNet address bar) currently has focus.
+    #     Without priority, Input swallows the key and quit silently fails in
+    #     chat/NomadNet modes.
+    #   - 'q' is a normal binding for the read-only views (Watch / Health),
+    #     where the composer is disabled and a single keystroke is faster.
+    BINDINGS = [
+        Binding("ctrl+c", "quit", "Quit", priority=True),
+        Binding("ctrl+q", "quit", "Quit", priority=True),
+        Binding("q", "quit", "Quit"),
+        ("f3", "choose_mode", "Next mode"),
+        ("f4", "toggle_fav_only", "Fav-only"),
+        ("f5", "cycle_utility", "Watch/Health/Fav"),
+        ("f", "toggle_nomad_favorite", "Save node"),
+        ("i", "identity", "My address"),
+        ("ctrl+n", "announce", "Announce"),
+        ("ctrl+p", "find_path", "Find path"),
+        Binding("ctrl+w", "close_chat", "Close chat", priority=True),
+        ("delete", "remove_favorite", "Remove fav"),
+        Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
+        ("ctrl+r", "refresh", "Refresh"),
+    ]
+
+    def check_action(
+        self, action: str, parameters: tuple[object, ...]
+    ) -> bool | None:
+        """Gate context-specific bindings (and hide them from the footer).
+
+        The favorites-only filter (F4) applies to the Watch feed *and* to each
+        operating mode: a chat mode's conversation list, plus the NomadNet node
+        list. It is enabled/shown on those and hidden on the read-only
+        Health/Favorites surfaces. Returning ``False`` both disables the key and
+        removes it from the footer; ``True`` is the default for every other
+        action.
+        """
+        if action == "toggle_fav_only":
+            return self.view in ("monitor", "active", "nomadnet")
+        # Reticulum-only tools: only meaningful in the Reticulum chat mode.
+        if action in ("identity", "find_path"):
+            return self.view == "active" and self.active_transport == "reticulum"
+        # Announce is available in both Reticulum (LXMF announce) and MeshCore
+        # (node advert) modes.
+        if action == "announce":
+            return self.view == "active" and self.active_transport in (
+                "reticulum",
+                "meshcore",
+            )
+        # Close-chat only applies when a conversation is open in a chat mode.
+        if action == "close_chat":
+            return self.view == "active" and self.current_target is not None
+        return True
+
+    def __init__(self, config_path: str | None = None) -> None:
+        super().__init__()
+        self._config_path = config_path
+        self.core: CoreApp | None = None
+        self.active_transport: str | None = None
+        self.current_target: str | None = None
+        self.view: str = "active"
+        self._thread_keys: list[str] = []
+        # Conversations the operator has opened in each mode, kept so the left
+        # pane stays stable when you leave a mode and come back — even for
+        # conversations with no stored messages yet. transport -> ordered keys.
+        self._opened_threads: dict[str, list[str]] = {}
+        self._monitor_entries: list[tuple[str, str]] = []
+        # Full history of non-announce Monitor messages so the list can be
+        # rebuilt when the favorites-only filter is toggled.
+        self._monitor_msgs: list[UnifiedMessage] = []
+        self._monitor_fav_only = False
+        # Per-mode favorites-only filter: when on, the active mode's thread list
+        # is restricted to conversations with favorite peers (F4 in chat modes).
+        self._active_fav_only = False
+        self._encrypt_approved = False
+        self._theme_ready = False
+        # Per-transport announce telemetry. Announces are intentionally NOT
+        # rendered as Monitor rows (too noisy), but we keep a rolling count and
+        # last-heard timestamp so the status bar can prove the transport is
+        # live and hearing the network.
+        self._announce_stats: dict[str, dict] = {}
+        # Per-transport traffic telemetry (kind='traffic'). Like announces these
+        # are not rendered as Monitor rows; we keep a rolling count + last-heard
+        # timestamp so the status bar can prove a transport is actively hearing
+        # the band (e.g. JS8 RX frames) even when frames carry no text.
+        self._traffic_stats: dict[str, dict] = {}
+        # Running count of delivered (non-telemetry) messages per transport,
+        # for the Health board's "traffic volume" indicator.
+        self._msg_counts: dict[str, int] = {}
+        # Bounded history of recent FAVORITE peer announces (any transport)
+        # that powers the Monitor view's "Favorites" ticker. Unknown peers are
+        # not tracked here - the bell only rings for marked favorites.
+        self._fav_recent: deque[tuple[datetime, str, str]] = deque(maxlen=8)
+        # Latest reachability status per transport name, feeding the mode
+        # selector's health dots. Updated by a passive timer probe (no TX).
+        self._health: dict[str, ReachabilityStatus] = {}
+        # Latest device telemetry per transport that exposes it (e.g. MeshCore
+        # battery + radio params), shown on the Health board. Updated by the
+        # same passive probe timer as the reachability dots.
+        self._device_telemetry: dict[str, dict] = {}
+        # Last input method seen ("key" or "pointer"), shown as a glyph and used
+        # to offer a touch-friendly (larger) layout.
+        self._input_mode = "key"
+        self._touch_layout = False
+        # Watch surface: when paused, new rows are buffered, not rendered live.
+        self._watch_paused = False
+        # Watch surface: sort the feed by mode (transport) instead of time.
+        self._watch_sort_by_mode = False
+        # Discovery feed for Health mode: identity -> {label, transport, ts}.
+        # NomadNet node list row indices -> node dict.
+        self._nomad_nodes: list[dict] = []
+        # Favorites view row indices -> favorite id ("" for section headers).
+        self._fav_keys: list[str] = []
+        # Outbound delivery state per message id (e.g. Reticulum LXMF receipts):
+        # msg_id -> "delivered" | "failed". Used to annotate sent messages with a
+        # delivery indicator in the conversation log.
+        self._delivery_status: dict[str, str] = {}
+        # Pending subject line for the next Winlink message (set via the Subject
+        # button or /subject). Cleared after a Winlink send consumes it.
+        self._winlink_subject: str = ""
+        # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
+        # endpoint up/down), shown under its line on the Health board.
+        self._winlink_paths: list[dict] = []
+
+    # -- layout ---------------------------------------------------------------
+    def compose(self) -> ComposeResult:
+        yield Header(show_clock=True)
+        yield Horizontal(id="modebar")
+        with ContentSwitcher(initial="active-view", id="main"):
+            with Vertical(id="active-view"):
+                yield Static("", id="active-banner")
+                with Horizontal(id="mesh-bar"):
+                    yield Static("MeshCore", id="mesh-bar-label")
+                    yield Static("", id="mesh-spacer")
+                    yield Button(
+                        "\u2605 Favorite", id="mesh-fav", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4e3 Announce", id="mesh-announce", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f30a Flood", id="mesh-announce-flood", classes="modebtn"
+                    )
+                with Horizontal(id="js8-bar"):
+                    yield Static("JS8Call", id="js8-bar-label")
+                    yield Static("", id="js8-spacer")
+                    for _band in ("80m", "40m", "30m", "20m", "17m", "15m", "10m"):
+                        yield Button(
+                            _band, id=f"js8-band-{_band}", classes="modebtn"
+                        )
+                    yield Button("\u21bb", id="js8-freq-refresh", classes="modebtn")
+                with Horizontal(id="winlink-bar"):
+                    yield Static("Winlink", id="winlink-bar-label")
+                    yield Static("", id="winlink-spacer")
+                    yield Button(
+                        "\u270e Subject", id="winlink-subject", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4e1 Connect", id="winlink-connect", classes="modebtn"
+                    )
+                    yield Button(
+                        "\u2630 Gateways", id="winlink-gateways", classes="modebtn"
+                    )
+                with Horizontal(id="active-body"):
+                    yield ListView(id="threads")
+                    with Vertical(id="right"):
+                        yield RichLog(
+                            id="messages", wrap=True, markup=True, highlight=False
+                        )
+                with Horizontal(id="js8-query-bar"):
+                    yield Static("Quick query:", id="js8-query-label")
+                    yield Static("", id="js8-query-spacer")
+                    for _q in ("SNR", "HEARING", "STATUS", "INFO"):
+                        yield Button(
+                            f"{_q}?", id=f"js8-query-{_q}", classes="modebtn"
+                        )
+            with Vertical(id="monitor-view"):
+                yield Static(
+                    "Favorites: (none added — '/fav add <id>' to track)",
+                    id="monitor-ticker",
+                )
+                with Horizontal(id="watch-bar"):
+                    yield Static(
+                        "Watch - all transports (read-only). "
+                        "Enter opens an item; [F4] favorites only.",
+                        id="monitor-help",
+                    )
+                    yield Static("", id="watch-spacer")
+                    yield Button("⏸ Pause", id="watch-pause", classes="modebtn")
+                    yield Button("\u21c5 By mode", id="watch-sort", classes="modebtn")
+                    yield Button("✖ Clear", id="watch-clear", classes="modebtn")
+                yield ListView(id="monitor")
+            with Vertical(id="nomadnet-view"):
+                yield Static(
+                    "NomadNet pages (read-only) — Enter/tap a node to browse, "
+                    "or type an address below. [f] save/unsave · [F4] favorites.",
+                    id="nomad-help",
+                )
+                with Horizontal(id="nomad-bar"):
+                    yield Static("", id="nomad-spacer")
+                    yield Button(
+                        "\u2605 Save/Unsave", id="nomad-fav", classes="modebtn"
+                    )
+                yield ListView(id="nomad-nodes")
+            with Vertical(id="health-view"):
+                yield Static(
+                    "Health - transport reachability (passive; no transmit). "
+                    "[F5] re-check · [Ctrl+R] refresh",
+                    id="health-help",
+                )
+                yield RichLog(
+                    id="health-log", wrap=True, markup=True, highlight=False
+                )
+            with Vertical(id="favorites-view"):
+                yield Static(
+                    "Favorites - saved NomadNet servers, callsigns, JS8Call "
+                    "groups, MeshCore channels/contacts & hashes. Add (works "
+                    "offline): type "
+                    "'[node|peer|call|group|channel|contact] <id> [label]' below "
+                    "+ Enter — e.g. 'node a1b2... HomeNode', '@TTP net' for a "
+                    "JS8Call group, 'channel ops Ops net', or 'contact a1b2c3... "
+                    "Bob'. Enter on a row opens it. Delete: select a row, then "
+                    "Remove (or Ctrl+D, or '/fav rm <id>').",
+                    id="fav-help",
+                )
+                with Horizontal(id="fav-bar"):
+                    yield Static("", id="fav-spacer")
+                    yield Button(
+                        "\u2913 Import JS8 groups", id="fav-import-groups",
+                        classes="modebtn",
+                    )
+                    yield Button("\u2716 Remove", id="fav-remove", classes="modebtn")
+                yield ListView(id="favorites-list")
+        yield Static("", id="statusbar")
+        yield Input(placeholder="Type a message or /help ...", id="composer")
+        yield Footer()
+
+    # -- lifecycle ------------------------------------------------------------
+    async def on_mount(self) -> None:
+        cfg = Config.load(self._config_path)
+        # File-only logging (Textual owns the terminal). The log path is shown
+        # in the welcome message so users know where to `tail -f` it.
+        from ..logging_setup import configure_logging
+
+        log_path = configure_logging(cfg, stderr=False)
+        self.core = CoreApp(cfg)
+        await self.core.start()
+        self.core.router.add_ui_callback(self._on_router_message)
+        self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
+        self.title = f"Radio_App - {cfg.display_name}"
+        self._build_mode_selector()
+        self._update_modebar()
+        self._update_status()
+        self._update_monitor_help()
+        self.query_one("#composer", Input).focus()
+        self._log_system("Welcome. F3 cycles modes; F2 opens Watch.")
+        if log_path is not None:
+            self._log_system(f"Logs: tail -f {log_path}")
+        # Restore the saved theme/palette, then allow future changes to persist.
+        saved_theme = cfg.ui.get("theme", "")
+        if saved_theme and saved_theme in self.available_themes:
+            self.theme = saved_theme
+        self._theme_ready = True
+        # Keep the "ago" text in the Monitor ticker fresh even when no new
+        # announces arrive.
+        self.set_interval(2.0, self._refresh_monitor_ticker)
+        # Passively probe each transport's reachability for the health dots.
+        self.set_interval(5.0, self._refresh_health)
+        self.call_after_refresh(self._refresh_health)
+        self.call_after_refresh(self._initial_flow)
+
+    def watch_theme(self, theme: str) -> None:
+        """Persist the theme/palette selection to the single config file."""
+        if not self._theme_ready or self.core is None:
+            return
+        try:
+            self.core.config.set("ui", "theme", theme)
+            self.core.config.save()
+        except Exception:  # noqa: BLE001 - never let persistence break the UI
+            pass
+
+    @work
+    async def _initial_flow(self) -> None:
+        if self.core is None:
+            return
+        if not self.core.station.is_configured:
+            await self._do_setup()
+        # Open the configured landing surface (or auto-select the first mode).
+        # F3 then cycles between modes.
+        if self.active_transport is None and self.view == "active":
+            self._open_home_view()
+
+    def _open_home_view(self) -> None:
+        """Open the startup landing surface.
+
+        Honors ``[ui].home`` in the config: a transport name (e.g. ``meshcore``)
+        opens that chat mode; ``nomadnet``/``watch``/``health``/``favorites`` open
+        the matching utility surface. Empty or unrecognized falls back to the
+        first configured transport (the historical default).
+        """
+        if self.core is None:
+            return
+        home = str(self.core.config.ui.get("home", "") or "").strip().lower()
+        names = [t.name for t in self.core.transports]
+        if home in ("health",):
+            self.action_health()
+            return
+        if home in ("watch", "monitor"):
+            self._show_watch()
+            return
+        if home in ("favorites", "favourites", "favs"):
+            self._show_favorites()
+            return
+        if home in ("nomadnet", "nomad"):
+            self._show_nomadnet()
+            return
+        if home and home in names:
+            self._select_mode(home)
+            return
+        if home:
+            self._log_system(
+                f"[ui].home = {home!r} is not available; "
+                "starting on the first mode."
+            )
+        # Default: first configured transport (preserves prior behavior).
+        first = next((t.name for t in self.core.transports), None)
+        if first is not None:
+            self._select_mode(first)
+        else:
+            self._log_system(
+                "No transports configured. Enable one in your config."
+            )
+
+    async def _do_setup(self) -> None:
+        if self.core is None:
+            return
+        # If JS8Call is enabled, ask it for callsign/grid so the user need not
+        # retype what JS8Call already knows (they can still override).
+        station = self.core.station
+        source_note = ""
+        js8 = self.core.config.transports.get("js8call", {})
+        if js8.get("enabled") and not station.callsign:
+            from ..core.js8call_query import query_station
+
+            info = await asyncio.to_thread(
+                query_station,
+                js8.get("host", "127.0.0.1"),
+                int(js8.get("port", 2442)),
+            )
+            if info.any_found:
+                station = Station(
+                    callsign=info.callsign or station.callsign,
+                    grid_square=info.grid or station.grid_square,
+                )
+                source_note = "Pre-filled from JS8Call - edit if needed."
+        result = await self.push_screen_wait(SetupScreen(station, source_note))
+        if not result:
+            self._log_system("Station not set. HF transports need a callsign.")
+            return
+        cfg = self.core.config
+        for key, value in result.items():
+            cfg.set("station", key, value)
+        cfg.save()
+        self.core.station = Station(**result)
+        self.core.router._station = self.core.station
+        self._log_system(f"Station saved: {self.core.station.callsign}")
+
+
+    async def on_unmount(self) -> None:
+        if self.core is not None:
+            await self.core.stop()
+
+    # -- router bridge --------------------------------------------------------
+    def _on_router_message(self, msg: UnifiedMessage, action) -> None:
+        self.post_message(Incoming(msg, getattr(action, "value", str(action))))
+
+    def on_incoming(self, event: Incoming) -> None:
+        msg = event.msg
+        # Announces are presence beacons - useful as a "transport is alive"
+        # signal but far too chatty to render inline. Aggregate them into a
+        # rolling counter shown in the status bar, then stop.
+        if msg.metadata.get("kind") == "announce":
+            self._record_announce(msg)
+            self._update_status()
+            if self.view == "health":
+                self._render_health()
+            return
+        # Traffic beacons are a pure "transport is hearing the band" signal -
+        # tally them for the status bar (like announces) and stop.
+        if msg.metadata.get("kind") == "traffic":
+            self._record_traffic(msg)
+            self._update_status()
+            if self.view == "health":
+                self._render_health()
+            return
+        # Delivery receipts (e.g. LXMF) annotate a previously-sent message with a
+        # delivered/failed indicator; they are not conversations.
+        if msg.metadata.get("kind") == "delivery":
+            self._record_delivery(msg)
+            return
+        # Real (non-telemetry) messages: tally per transport for the Health
+        # traffic-volume readout.
+        if msg.transport:
+            self._msg_counts[msg.transport] = (
+                self._msg_counts.get(msg.transport, 0) + 1
+            )
+            if self.view == "health":
+                self._render_health()
+        # The Monitor always receives everything else, regardless of active mode.
+        self._append_monitor(msg)
+        # Watch traffic bumps a favorite's "last seen": anything we hear on the
+        # air counts (broadcasts, traffic to others, direct messages), so the
+        # timestamp reflects when the station was last *heard*, not just when it
+        # messaged us.
+        self._note_favorite_sighting(
+            msg.metadata.get("rns_dest") or msg.sender or "",
+            msg.metadata.get("display_name") or "",
+            msg.timestamp,
+            msg.transport or "?",
+        )
+        if event.action == "drop":
+            return  # filtered out of active views/alerts (still in the Monitor)
+        # The active view only updates for the active mode. With a conversation
+        # open we render just that thread; with none selected the mode shows an
+        # all-messages firehose, so any new message for the mode is appended.
+        if msg.transport == self.active_transport:
+            self._refresh_threads()
+            if self.view == "active" and (
+                self.current_target is None
+                or msg.thread_key == self.current_target
+            ):
+                self._render_message(msg)
+        if event.action == "notify":
+            self.bell()
+
+    def _record_announce(self, msg: UnifiedMessage) -> None:
+        transport = msg.transport or "?"
+        stats = self._announce_stats.setdefault(
+            transport, {"count": 0, "last_ts": None, "last_peer": ""}
+        )
+        stats["count"] += 1
+        stats["last_ts"] = msg.timestamp
+        peer_label = (
+            msg.metadata.get("display_name")
+            or (msg.metadata.get("rns_dest", msg.sender) or "")[:12]
+        )
+        stats["last_peer"] = peer_label
+
+        # (The old "recently heard -> add contact" discovery list lived here.
+        # It was removed in favour of an RNS interface-stats readout on the
+        # Health board, which is the actual rnsd/RNode health signal.)
+
+        # An announce is also a sighting: bump "last seen" / fire back-online.
+        rns_dest = msg.metadata.get("rns_dest") or msg.sender or ""
+        display_name = msg.metadata.get("display_name") or ""
+        self._note_favorite_sighting(
+            rns_dest, display_name, msg.timestamp, transport, peer_label
+        )
+        # Self-healing classification: the announce aspect is the only reliable
+        # peer-vs-site signal, so when we hear one for a saved contact, persist
+        # the correct kind onto it (node = NomadNet site, peer = LXMF identity).
+        aspect = msg.metadata.get("aspect")
+        if aspect in ("site", "peer"):
+            self._learn_favorite_kind(
+                rns_dest, "node" if aspect == "site" else "peer"
+            )
+
+    def _learn_favorite_kind(self, ident: str, kind: str) -> None:
+        """Persist an authoritatively-known kind onto a matching favorite.
+
+        Reticulum can't tell a NomadNet site from an LXMF peer by hash alone, but
+        an announce's aspect can. When such an announce matches a saved contact,
+        we record ``node``/``peer`` on it so it's opened (browse vs. message) and
+        grouped correctly from then on - without the user having to label it.
+        """
+        if self.core is None or not ident or kind not in ("node", "peer"):
+            return
+        fav = self.core.favorites.match(ident)
+        # Never override an explicit callsign/group classification.
+        if fav is None or fav.kind == kind or fav.kind in ("group", "callsign"):
+            return
+        fav.kind = kind
+        try:
+            self.core.favorites.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not update contact type: {exc}")
+            return
+        if self.view == "favorites":
+            self._render_favorites()
+        elif self.view == "nomadnet":
+            self._refresh_nomad_nodes()
+
+    def _note_favorite_sighting(
+        self,
+        ident: str,
+        display_name: str,
+        when: datetime,
+        transport: str,
+        peer_label: str = "",
+    ) -> None:
+        """Record that ``ident`` was heard and update favorite "last seen".
+
+        Shared by the announce path *and* ordinary Watch traffic, so a callsign's
+        "last seen" reflects **anything we hear on the air** (broadcasts, traffic
+        to others, direct messages) - not only messages directed to us. The
+        favorites decision seam (case-insensitive match + back-online logic)
+        lives in core.favorites; here we just drive the ticker/alert/refresh.
+        """
+        if self.core is None or not ident:
+            return
+        sighting = self.core.favorites.note_sighting(
+            ident, display_name=display_name, when=when
+        )
+        if sighting is None:
+            return
+        ticker_label = sighting.favorite.display or peer_label or ident[:12]
+        # Deque dedupe: collapse consecutive sightings of the same favorite.
+        if self._fav_recent and self._fav_recent[-1][1] == ticker_label:
+            self._fav_recent[-1] = (when, ticker_label, transport)
+        else:
+            self._fav_recent.append((when, ticker_label, transport))
+        self._refresh_monitor_ticker()
+        if sighting.is_back_online:
+            self.bell()
+            self._log_system(
+                f"[b yellow]\u2605 favorite online:[/b yellow] "
+                f"{ticker_label} via {transport}"
+            )
+        # Keep the Favorites view's "last seen" column fresh while it's open.
+        if self.view == "favorites":
+            self._render_favorites()
+
+    def _record_traffic(self, msg: UnifiedMessage) -> None:
+        """Tally a traffic-heartbeat telemetry event for the status bar."""
+        transport = msg.transport or "?"
+        stats = self._traffic_stats.setdefault(
+            transport, {"count": 0, "last_ts": None, "last_event": ""}
+        )
+        stats["count"] += 1
+        stats["last_ts"] = msg.timestamp
+        stats["last_event"] = msg.metadata.get("event", "")
+
+    def _record_delivery(self, msg: UnifiedMessage) -> None:
+        """Record an outbound delivery receipt and reflect it in the UI.
+
+        Stores the status keyed by the original message id so the conversation
+        log can show a ✓ (delivered) / ✗ (failed) marker, re-renders the open
+        thread if it's the affected conversation, and logs a system line.
+        """
+        ref_id = msg.metadata.get("ref_msg_id")
+        status = msg.metadata.get("status", "")
+        if not ref_id or status not in ("delivered", "failed"):
+            return
+        self._delivery_status[ref_id] = status
+        # Persist the receipt so it survives restarts and is verifiable later
+        # (the store otherwise keeps the message as "sent" forever).
+        if self.core is not None:
+            persisted = (
+                DeliveryStatus.DELIVERED
+                if status == "delivered"
+                else DeliveryStatus.FAILED
+            )
+            try:
+                self.core.store.update_status(ref_id, persisted)
+            except Exception:  # noqa: BLE001 - never let a receipt crash the UI
+                pass
+        recipient = msg.metadata.get("recipient") or ""
+        if status == "delivered":
+            self._log_system(f"\u2713 delivered to {self._short(recipient)}")
+        else:
+            self._log_system(f"\u2717 delivery failed to {self._short(recipient)}")
+        # If the affected conversation is open, re-render so the inline marker
+        # next to the sent message updates.
+        if (
+            self.view == "active"
+            and self.current_target
+            and recipient
+            and self.current_target == recipient
+        ):
+            self._load_thread(self.current_target)
+
+    # -- actions --------------------------------------------------------------
+    def action_refresh(self) -> None:
+        self._refresh_threads()
+        self._update_status()
+
+    def action_copy_address(self, value: str = "") -> None:
+        """Copy a value (e.g. your Reticulum address) to the clipboard.
+
+        Triggered by clicking the underlined id in the status bar. Uses the
+        terminal clipboard (OSC 52), which also works over SSH when the terminal
+        supports it.
+        """
+        if not value:
+            return
+        try:
+            self.copy_to_clipboard(value)
+        except Exception:  # noqa: BLE001
+            self._log_system(f"copy unavailable here — address: {value}")
+            return
+        self._log_system(f"\U0001f4cb copied to clipboard: {value}")
+
+    def action_reply_to(self, ident: str = "", transport: str = "") -> None:
+        """Open a direct conversation with a sender (clicked username).
+
+        Triggered by clicking a sender's name in the message log. This is most
+        useful in a shared thread — e.g. a MeshCore channel or a JS8 @group —
+        where it lets you peel off and address that specific person directly
+        instead of the whole channel. Switches to the sender's transport when
+        known, opens (or starts) the 1:1 thread, and focuses the composer.
+        """
+        if self.core is None or not ident:
+            return
+        # Switch to the sender's mode when it's a different, configured
+        # transport. Done first because changing mode resets current_target.
+        if transport and transport != self.active_transport and transport in [
+            t.name for t in self.core.transports
+        ]:
+            self._select_mode(transport)
+        self.current_target = ident
+        self._refresh_threads()
+        self._load_thread(ident)
+        self._update_status()
+        try:
+            self.query_one("#composer", Input).focus()
+        except Exception:  # noqa: BLE001 - composer may not be mounted in tests
+            pass
+        self._log_system(
+            f"replying to {self._display_id(ident)} — type a message and press Enter"
+        )
+
+    def action_close_chat(self) -> None:
+        """Close (delete) the open conversation, removing it from the list."""
+        self._close_chat(self.current_target)
+
+    def _close_chat(self, thread_key: str | None) -> None:
+        """Delete a conversation's messages so it drops out of the thread list.
+
+        Threads are derived purely from stored messages, so closing a chat means
+        deleting its messages. If the closed thread is the open one, the
+        conversation pane is cleared. (Configured @groups keep their chip - you
+        are still subscribed - but their history is removed.)
+        """
+        if self.core is None:
+            return
+        if not thread_key:
+            self._log_system(
+                "Open a conversation first, then /close (or /close <id>)."
+            )
+            return
+        removed = self.core.store.delete_thread(thread_key)
+        label = self._display_id(thread_key)
+        # Forget it as an opened conversation so it doesn't reappear in the pane.
+        for opened in self._opened_threads.values():
+            if thread_key in opened:
+                opened.remove(thread_key)
+        if self.current_target == thread_key:
+            self.current_target = None
+            # Back to the mode's all-messages firehose (in the active chat view).
+            if self.view == "active" and self.active_transport:
+                self._show_all_messages()
+            else:
+                self.query_one("#messages", RichLog).clear()
+        self._refresh_threads()
+        self._update_status()
+        if removed:
+            self._log_system(
+                f"closed conversation with {label} ({removed} messages removed)."
+            )
+        else:
+            self._log_system(f"no stored messages to close for {label}.")
+
+    # -- Reticulum-specific tools ---------------------------------------------
+    def _reticulum_transport(self) -> Transport | None:
+        """The live ReticulumTransport instance, or None when not configured."""
+        if self.core is None:
+            return None
+        return next(
+            (t for t in self.core.transports if t.name == "reticulum"), None
+        )
+
+    def _meshcore_transport(self) -> Transport | None:
+        """The live MeshCoreTransport instance, or None when not configured."""
+        if self.core is None:
+            return None
+        return next(
+            (t for t in self.core.transports if t.name == "meshcore"), None
+        )
+
+    def _meshcore_channel_index(self, name: str) -> int | None:
+        """Map a MeshCore channel favorite (by name) to its channel index.
+
+        Names are matched case-insensitively against the transport's known
+        channels (config + device), ignoring a leading '#'. 'public' / '' maps
+        to the public channel (index 0). Returns None when the channel isn't
+        known to this device.
+        """
+        t = self._meshcore_transport()
+        if t is None or not hasattr(t, "channels"):
+            return None
+        target = (name or "").lstrip("#").strip().lower()
+        if target in ("", "public"):
+            return 0
+        for ch in t.channels():
+            cname = (ch.get("name") or "").lstrip("#").strip().lower()
+            if cname == target:
+                return ch["index"]
+        return None
+
+    def _meshcore_channel_name(self, index: int) -> str:
+        """Friendly name for a MeshCore channel index ('public' for 0), or ''."""
+        t = self._meshcore_transport()
+        if t is None or not hasattr(t, "channels"):
+            return ""
+        for ch in t.channels():
+            if ch["index"] == index:
+                return (ch.get("name") or "").lstrip("#").strip()
+        return ""
+
+    @work
+    async def _meshcore_announce(self, flood: bool = False) -> None:
+        """Broadcast a MeshCore advert (announce) from the Mesh panel.
+
+        Zero-hop by default (heard by immediate neighbours); ``flood=True``
+        propagates across the mesh. Runs as a worker because the companion
+        command is async.
+        """
+        t = self._meshcore_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("MeshCore is not running; cannot announce.")
+            return
+        ok = await t.send_advert(flood=flood)
+        kind = "flood advert" if flood else "advert"
+        self._log_system(
+            f"\U0001f4e3 sent MeshCore {kind}."
+            if ok
+            else f"MeshCore {kind} failed (see logs)."
+        )
+
+    async def _handle_channel_command(self, arg: str) -> None:
+        """Manage MeshCore channels from the panel: /channel list | add | rm.
+
+        ``/channel add <index> <#name> [secret]`` creates a channel on the
+        companion. A **hashtag channel** (``#name``) needs no secret — MeshCore
+        derives its key from the name, so anyone who knows ``#name`` can join.
+        The name is also saved to the config so it shows as ``#name`` and
+        persists across restarts. ``/channel rm <index>`` drops the saved name.
+        """
+        t = self._meshcore_transport()
+        if t is None or self.active_transport != "meshcore":
+            self._log_system(
+                "Switch to the MeshCore mode first (press F3) to manage channels."
+            )
+            return
+        parts = arg.split()
+        action = parts[0].lower() if parts else "list"
+
+        if action in ("", "list", "ls"):
+            self._log_system("MeshCore channels (open with /to @<index>):")
+            for c in t.channels():
+                name = c["name"] or ("public" if c["index"] == 0 else "")
+                shown = f"#{name}" if name else "(unnamed)"
+                self._log_system(f"  @{c['index']}  {shown}")
+            self._log_system(
+                "add one with: /channel add <index> <#name> [secret] "
+                "(a #name needs no secret)"
+            )
+            return
+
+        if action in ("rm", "remove", "del"):
+            if len(parts) < 2 or not parts[1].isdigit():
+                self._log_system("usage: /channel rm <index>")
+                return
+            index = int(parts[1])
+            t.name_channel(index, "")
+            self._persist_meshcore_channels(t)
+            self._refresh_threads()
+            self._log_system(f"removed saved name for channel @{index}.")
+            return
+
+        if action == "add":
+            rest = parts[1:]
+            if len(rest) < 2 or not rest[0].isdigit():
+                self._log_system(
+                    "usage: /channel add <index> <#name> [secret]  "
+                    "e.g. /channel add 2 #ops"
+                )
+                return
+            index = int(rest[0])
+            if not 0 <= index < getattr(t, "MAX_CHANNELS", 8):
+                self._log_system(
+                    f"channel index must be 0-{getattr(t, 'MAX_CHANNELS', 8) - 1}."
+                )
+                return
+            name = rest[1]
+            secret = rest[2] if len(rest) > 2 else None
+            # Save the display name (+ secret) and persist it to the single
+            # config file so the channel can be recreated after a restart.
+            t.name_channel(index, name, secret)
+            self._persist_meshcore_channels(t)
+            # Create it on the device when connected (hashtag channels need no
+            # secret; the firmware derives the key from the name).
+            applied = False
+            if t.running:
+                applied = await t.create_channel(index, name, secret)
+            # Reflect immediately: open the new channel.
+            self.current_target = f"@{index}"
+            self._refresh_threads()
+            self._load_thread(self.current_target)
+            self._update_status()
+            shown = f"#{name.lstrip('#')}"
+            if not t.running:
+                tail = "saved locally — connect the device to create it"
+            elif applied:
+                tail = "created on the device"
+            else:
+                tail = "device rejected it (see logs); saved locally"
+            self._log_system(f"channel @{index} {shown}: {tail}.")
+            return
+
+        self._log_system("usage: /channel list | add <index> <#name> [secret] | rm")
+
+    def _persist_meshcore_channels(self, transport: Transport) -> None:
+        """Write the MeshCore transport's named channels to the config file."""
+        if self.core is None:
+            return
+        transports = dict(self.core.config.transports)
+        mc = dict(transports.get("meshcore", {}))
+        mc["channels"] = transport.config_channels()
+        self.core.config.set("transports", "meshcore", mc)
+        try:
+            self.core.config.save()
+        except Exception as exc:  # noqa: BLE001 - never let persistence crash the UI
+            self._log_system(f"could not save channel to config: {exc}")
+
+    def action_identity(self) -> None:
+        """Show our own (anonymous) Reticulum address so it can be shared.
+
+        Reticulum identities are anonymous hashes, so peers can only reach us if
+        we hand them this address. It's printed into the conversation log where
+        it can be selected/copied from the terminal.
+        """
+        ret = self._reticulum_transport()
+        if ret is None:
+            self._log_system("Reticulum is not configured.")
+            return
+        addr = ret.local_identity() or "(unknown)"
+        name = getattr(ret, "local_display_name", lambda: "")() or "(anonymous)"
+        if not ret.running:
+            self._log_system("Reticulum is not running; address unavailable.")
+            return
+        self._log_system(f"\U0001f5dd your Reticulum address: {addr}")
+        self._log_system(f"   public display name: {name}")
+
+    def action_announce(self) -> None:
+        """Re-announce our identity so peers can find/reach us now.
+
+        Bound to the active mode: in MeshCore mode it broadcasts a node advert;
+        in Reticulum mode it re-announces our LXMF identity.
+        """
+        if self.active_transport == "meshcore":
+            self._meshcore_announce(flood=False)
+            return
+        ret = self._reticulum_transport()
+        if ret is None or not ret.running:
+            self._log_system("Reticulum is not running; cannot announce.")
+            return
+        ok = ret.announce_now()
+        self._log_system(
+            "\U0001f4e3 announced your Reticulum identity."
+            if ok
+            else "announce failed (see logs)."
+        )
+
+    def action_find_path(self) -> None:
+        """Request/store a network path to the open Reticulum contact.
+
+        Reticulum resolves and caches the path itself, so a subsequent message
+        to a known contact can be delivered even if they weren't heard recently.
+        """
+        ret = self._reticulum_transport()
+        if ret is None or not ret.running:
+            self._log_system("Reticulum is not running; cannot find a path.")
+            return
+        target = self.current_target
+        if not target or target.startswith("@"):
+            self._log_system("Open a direct Reticulum conversation first.")
+            return
+        if ret.has_path(target):
+            self._log_system(f"\u2714 path already known to {self._short(target)}.")
+            return
+        if ret.request_path(target):
+            self._log_system(
+                f"\U0001f50d requested a path to {self._short(target)}; "
+                "it will resolve as the network responds."
+            )
+        else:
+            self._log_system(f"could not request a path to {target} (invalid id?).")
+
+
+    def action_toggle_fav_only(self) -> None:
+        """Toggle the favorites-only filter for the current surface (F4).
+
+        Active on the Watch feed (filters the all-transport stream), in any chat
+        mode (restricts that mode's conversation list to favorites), and in the
+        NomadNet mode (restricts the node list to saved/favorite nodes). Hidden
+        and inert on read-only surfaces (see :meth:`check_action`).
+        """
+        if self.view == "monitor":
+            self._toggle_fav_only()
+        elif self.view in ("active", "nomadnet"):
+            self._toggle_active_fav_only()
+
+    def _toggle_active_fav_only(self) -> None:
+        self._active_fav_only = not self._active_fav_only
+        if self.view == "nomadnet":
+            self._refresh_nomad_nodes()
+            self._update_nomad_help()
+        else:
+            self._refresh_threads()
+            # The banner above the thread list already shows the filter state,
+            # so we don't also write a system line into the conversation.
+            self._update_active_banner()
+        self._update_status()
+
+    def _toggle_fav_only(self) -> None:
+        self._monitor_fav_only = not self._monitor_fav_only
+        self._rebuild_monitor()
+        self._update_monitor_help()
+        state = "ON" if self._monitor_fav_only else "OFF"
+        self._log_system(f"Monitor favorites-only filter: {state}")
+        self._update_status()
+
+    def action_choose_mode(self) -> None:
+        """Cycle to the next mode (no menu): each transport, then NomadNet."""
+        if self.core is None:
+            return
+        keys = self._mode_keys()
+        if not keys:
+            self._log_system("No modes available. Enable a transport in your config.")
+            return
+        current = self._current_mode_key()
+        if current in keys:
+            nxt = keys[(keys.index(current) + 1) % len(keys)]
+        else:
+            nxt = keys[0]
+        self._activate_mode_key(nxt)
+
+    def _mode_keys(self) -> list[str]:
+        """Ordered selectable operating modes, matching the selector chips."""
+        keys = [t.name for t in self.core.transports] if self.core else []
+        keys.append("nomadnet")
+        return keys
+
+    def _current_mode_key(self) -> str | None:
+        if self.view == "nomadnet":
+            return "nomadnet"
+        return self.active_transport
+
+    def _activate_mode_key(self, key: str) -> None:
+        if key == "nomadnet":
+            self._show_nomadnet()
+        else:
+            self._select_mode(key)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        """Mode selector clicks (touch or mouse): pick a mode / Watch / Health."""
+        self._note_input("pointer")
+        bid = event.button.id or ""
+        if bid == "mode-nomadnet":
+            self._show_nomadnet()
+        elif bid.startswith("mode-"):
+            self._select_mode(bid[len("mode-"):])
+        elif bid == "view-watch":
+            self._show_watch()
+        elif bid == "view-health":
+            self.action_health()
+        elif bid == "view-favorites":
+            self._show_favorites()
+        elif bid == "watch-pause":
+            self._toggle_watch_pause()
+        elif bid == "watch-sort":
+            self._toggle_watch_sort()
+        elif bid == "watch-clear":
+            self._clear_watch()
+        elif bid == "nomad-fav":
+            self.action_toggle_nomad_favorite()
+        elif bid == "mesh-fav":
+            self._favorite_current_conversation()
+        elif bid == "mesh-announce":
+            self._meshcore_announce(flood=False)
+        elif bid == "mesh-announce-flood":
+            self._meshcore_announce(flood=True)
+        elif bid.startswith("js8-band-"):
+            self._js8_switch_band(bid[len("js8-band-"):])
+        elif bid == "js8-freq-refresh":
+            self._js8_refresh_freq()
+        elif bid.startswith("js8-query-"):
+            self._js8_send_query(bid[len("js8-query-"):])
+        elif bid == "winlink-subject":
+            self._winlink_subject_prompt()
+        elif bid == "winlink-connect":
+            self._winlink_connect()
+        elif bid == "winlink-gateways":
+            self._winlink_list_gateways()
+        elif bid == "fav-remove":
+            self.action_remove_favorite()
+        elif bid == "fav-import-groups":
+            self._import_js8_groups()
+
+    def _select_mode(self, name: str) -> None:
+        """Switch the active operating mode to a transport and show its surface."""
+        if self.core is None:
+            return
+        self.active_transport = name
+        self._show_active()
+        self._apply_mode()
+        self.query_one("#composer", Input).focus()
+
+    def _show_active(self) -> None:
+        """Show the active (mode-bound chat) surface."""
+        self.view = "active"
+        self.query_one("#main", ContentSwitcher).current = "active-view"
+        self._enable_composer(True)
+        self._update_active_banner()
+        self._update_modebar()
+        self._update_status()
+
+    def _update_active_banner(self) -> None:
+        """Show a clear 'favorites only' banner above the chat thread list.
+
+        (Your Reticulum identity/display name lives in the bottom status bar's
+        ``id:`` section, not here.)
+        """
+        try:
+            banner = self.query_one("#active-banner", Static)
+        except Exception:  # noqa: BLE001
+            return
+        if self._active_fav_only:
+            mode = self.active_transport or "mode"
+            banner.update(
+                f"[b yellow]\u2605 showing FAVORITES only[/b yellow] in {mode} "
+                "[dim]— press F4 to show everyone[/dim]"
+            )
+            banner.display = True
+        else:
+            banner.update("")
+            banner.display = False
+
+    def _show_watch(self) -> None:
+        """Show the Watch (all-transport, read-only) surface."""
+        self.view = "monitor"
+        self.query_one("#main", ContentSwitcher).current = "monitor-view"
+        self._enable_composer(False)
+        self._refresh_monitor_ticker()
+        self._update_monitor_help()
+        self._update_modebar()
+        self._update_status()
+
+    def action_cycle_utility(self) -> None:
+        """Cycle the utility surfaces with F5: Watch -> Health -> Favorites.
+
+        From an operating (chat/NomadNet) mode, F5 jumps into the cycle at
+        Watch. Pressing it again advances Watch -> Health -> Favorites -> Watch.
+        """
+        order = ["monitor", "health", "favorites"]
+        if self.view in order:
+            nxt = order[(order.index(self.view) + 1) % len(order)]
+        else:
+            nxt = "monitor"
+        if nxt == "monitor":
+            self._show_watch()
+        elif nxt == "health":
+            self._show_health()
+        else:
+            self._show_favorites()
+
+    def action_health(self) -> None:
+        """Open the Health surface directly (used by the Health chip)."""
+        self._show_health()
+
+    def _show_health(self) -> None:
+        """Show the Health (reachability) surface."""
+        self.view = "health"
+        self.query_one("#main", ContentSwitcher).current = "health-view"
+        self._enable_composer(False)
+        self._render_health()
+        self._refresh_health()
+        self._update_modebar()
+        self._update_status()
+
+    def _render_health(self) -> None:
+        """Render the reachability board from the latest probe results.
+
+        For each reachable transport we also show a running traffic volume:
+        announces heard + traffic-heartbeat events + delivered messages, with
+        the time of the most recent event. This is the single 'is the network
+        actually flowing?' indicator (previously duplicated in the status bar).
+
+        For the Reticulum transport we additionally query rnsd over its RPC
+        socket (the same call ``rnstatus`` uses) and render per-interface
+        telemetry - including RNode RSSI/SNR/battery/frequency when an RNode
+        is attached to rnsd. That is the real "RNode is healthy" signal.
+        """
+        if self.core is None:
+            return
+        log = self.query_one("#health-log", RichLog)
+        log.clear()
+        log.write("[b]Transport reachability[/b] (passive endpoint probe)")
+        if not self.core.transports:
+            log.write("[dim]No transports configured. Enable one in your config.[/dim]")
+            return
+        for t in self.core.transports:
+            status = self._health.get(t.name)
+            dot = self._health_dot(t.name)
+            if status is ReachabilityStatus.OK:
+                word = "[green]reachable[/green]"
+            elif status is ReachabilityStatus.DOWN:
+                word = "[red]unreachable[/red]"
+            elif status is ReachabilityStatus.NOT_APPLICABLE:
+                word = "[dim]n/a[/dim]"
+            else:
+                word = "[dim]probing…[/dim]"
+            vol = (
+                self._format_traffic_volume(t.name)
+                if status is ReachabilityStatus.OK
+                else ""
+            )
+            log.write(f"  {dot} [b]{t.name}[/b]  {word}{vol}")
+            if (
+                t.name == "reticulum"
+                and status is ReachabilityStatus.OK
+                and hasattr(t, "interface_stats")
+            ):
+                self._render_rns_interfaces(log, t.interface_stats())
+            # Winlink: show each connection path's modem/endpoint status, so the
+            # operator can see (for example) that the varahf/Mercury modem is
+            # down even while Pat (telnet) is reachable.
+            if t.name == "winlink":
+                self._render_winlink_paths(log)
+            # MeshCore (and any transport exposing device_telemetry) shows its
+            # device health: battery + radio parameters.
+            if (
+                status is ReachabilityStatus.OK
+                and hasattr(t, "device_telemetry")
+            ):
+                self._render_device_telemetry(
+                    log, self._device_telemetry.get(t.name)
+                )
+        log.write("[dim]Press F5 to re-check now.[/dim]")
+
+    def _render_winlink_paths(self, log: RichLog) -> None:
+        """Render Winlink connection-path availability under its status line.
+
+        Each path (telnet → internet via Pat; varahf → Mercury/VARA modem;
+        ardop → ARDOP modem) gets an up/down dot from a passive port probe.
+        Paths that can't be probed (telnet, serial Pactor) show a neutral dot.
+        """
+        paths = self._winlink_paths
+        if not paths:
+            log.write("      [dim](connection paths not probed yet)[/dim]")
+            return
+        for p in paths:
+            reachable = p.get("reachable")
+            if reachable is True:
+                dot, word = "[green]\u25cf[/green]", "[green]up[/green]"
+            elif reachable is False:
+                dot, word = "[red]\u25cb[/red]", "[red]down[/red]"
+            else:
+                dot, word = "[dim]\u00b7[/dim]", "[dim]n/a[/dim]"
+            label = p.get("label", p.get("name", "?"))
+            detail = p.get("detail", "")
+            log.write(f"      {dot} {label}  {word}  [dim]{detail}[/dim]")
+
+    def _render_device_telemetry(self, log: RichLog, tel: dict | None) -> None:
+        """Render a MeshCore companion's device telemetry under its status line.
+
+        Surfaces the bits a field operator cares about: node name, battery, and
+        the LoRa radio parameters (frequency/bandwidth/spreading factor/coding
+        rate/TX power). ``tel`` is whatever ``device_telemetry()`` returned.
+        """
+        if not tel:
+            log.write(
+                "      [dim](no device telemetry — companion not responding)[/dim]"
+            )
+            return
+        name = tel.get("name") or "(unnamed)"
+        pk = (tel.get("public_key") or "")[:12]
+        head = f"      [b]{name}[/b]"
+        if pk:
+            head += f"  [dim]<{pk}>[/dim]"
+        batt = tel.get("battery")
+        if batt is not None:
+            head += f"   [dim]{self._format_mesh_battery(batt)}[/dim]"
+        log.write(head)
+        radio_bits: list[str] = []
+        freq = tel.get("radio_freq")
+        if freq:
+            radio_bits.append(f"{freq:.3f} MHz")
+        bw = tel.get("radio_bw")
+        if bw:
+            radio_bits.append(f"BW {bw:.0f} kHz")
+        sf = tel.get("radio_sf")
+        if sf:
+            radio_bits.append(f"SF{sf}")
+        cr = tel.get("radio_cr")
+        if cr:
+            radio_bits.append(f"CR{cr}")
+        txp = tel.get("tx_power")
+        if txp is not None:
+            radio_bits.append(f"{txp} dBm")
+        if radio_bits:
+            log.write(f"         [dim]{'  ·  '.join(radio_bits)}[/dim]")
+
+    @staticmethod
+    def _format_mesh_battery(level: object) -> str:
+        """Format a MeshCore battery reading.
+
+        The companion reports either a percentage (<=100) or a millivolt reading
+        (>100); for mV we add a rough Li-ion percentage estimate.
+        """
+        try:
+            lvl = int(level)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return ""
+        if lvl > 100:  # millivolts
+            pct = max(0, min(100, round((lvl - 3000) / (4200 - 3000) * 100)))
+            return f"batt {lvl} mV (~{pct}%)"
+        return f"batt {lvl}%"
+
+    def _render_rns_interfaces(self, log: RichLog, stats: dict | None) -> None:
+        """Render per-interface RNS telemetry under the reticulum status line.
+
+        ``stats`` is whatever ``ReticulumTransport.interface_stats()`` returned
+        (the same shape as ``RNS.Reticulum.get_interface_stats()``). We surface
+        the bits a field operator cares about: link state, throughput, and -
+        when present - RNode-specific health (RSSI, SNR, battery, frequency).
+        """
+        if not stats:
+            log.write("      [dim](no rnsd RPC reply - is rnsd running?)[/dim]")
+            return
+        ifs = stats.get("interfaces") or []
+        if not ifs:
+            log.write("      [dim](no RNS interfaces reported)[/dim]")
+            return
+        uptime = stats.get("transport_uptime")
+        if uptime:
+            log.write(
+                f"      [dim]rnsd uptime: {self._format_duration(uptime)}  "
+                f"rx {self._format_bytes(stats.get('rxb', 0))} / "
+                f"tx {self._format_bytes(stats.get('txb', 0))}[/dim]"
+            )
+        for ifs_row in ifs:
+            name = ifs_row.get("short_name") or ifs_row.get("name") or "?"
+            online = bool(ifs_row.get("status"))
+            up_dot = "[green]\u25cf[/green]" if online else "[red]\u25cb[/red]"
+            br = ifs_row.get("bitrate")
+            rxb = ifs_row.get("rxb", 0)
+            txb = ifs_row.get("txb", 0)
+            line = (
+                f"      {up_dot} [b]{name}[/b]  "
+                f"{self._format_bitrate(br)}  "
+                f"rx {self._format_bytes(rxb)} / tx {self._format_bytes(txb)}"
+            )
+            log.write(line)
+            # RNode-specific extras (only present on RNode interfaces).
+            extras: list[str] = []
+            if "noise_floor" in ifs_row and ifs_row["noise_floor"] is not None:
+                extras.append(f"noise {ifs_row['noise_floor']} dBm")
+            if "battery_state" in ifs_row:
+                pct = ifs_row.get("battery_percent")
+                pct_s = f" {pct}%" if pct is not None else ""
+                extras.append(f"batt {ifs_row['battery_state']}{pct_s}")
+            if "airtime_short" in ifs_row:
+                extras.append(f"airtime {ifs_row['airtime_short']}%/15s")
+            if "channel_load_short" in ifs_row:
+                extras.append(f"chload {ifs_row['channel_load_short']}%/15s")
+            if "peers" in ifs_row and ifs_row["peers"] is not None:
+                extras.append(f"peers {ifs_row['peers']}")
+            if "clients" in ifs_row and ifs_row["clients"] is not None:
+                extras.append(f"clients {ifs_row['clients']}")
+            if extras:
+                log.write(f"         [dim]{'  ·  '.join(extras)}[/dim]")
+
+    @staticmethod
+    def _format_bytes(n: int | float | None) -> str:
+        if not n:
+            return "0 B"
+        n = float(n)
+        for unit in ("B", "KiB", "MiB", "GiB", "TiB"):
+            if n < 1024 or unit == "TiB":
+                return f"{n:.1f} {unit}" if unit != "B" else f"{int(n)} B"
+            n /= 1024
+        return f"{n:.1f} TiB"
+
+    @staticmethod
+    def _format_bitrate(bps: int | float | None) -> str:
+        if not bps:
+            return "[dim]--[/dim]"
+        bps = float(bps)
+        for unit, div in (("Mbps", 1_000_000), ("kbps", 1_000), ("bps", 1)):
+            if bps >= div:
+                return f"{bps / div:.1f} {unit}"
+        return f"{bps:.0f} bps"
+
+    @staticmethod
+    def _format_duration(seconds: float) -> str:
+        s = int(seconds)
+        if s < 60:
+            return f"{s}s"
+        m, s = divmod(s, 60)
+        if m < 60:
+            return f"{m}m{s:02d}s"
+        h, m = divmod(m, 60)
+        if h < 24:
+            return f"{h}h{m:02d}m"
+        d, h = divmod(h, 24)
+        return f"{d}d{h:02d}h"
+
+    def _format_traffic_volume(self, transport: str) -> str:
+        """Compact running tally of inbound activity for one transport.
+
+        Aggregates the three counters we already collect: RNS/HF announces,
+        per-transport traffic heartbeats, and delivered messages stored to
+        threads. Returns the empty string when nothing has been heard yet.
+        """
+        ann = self._announce_stats.get(transport, {})
+        traf = self._traffic_stats.get(transport, {})
+        msgs = self._msg_counts.get(transport, 0)
+        ann_n = ann.get("count", 0)
+        traf_n = traf.get("count", 0)
+        total = ann_n + traf_n + msgs
+        if total == 0:
+            return "   [dim](no traffic yet)[/dim]"
+        last_ts = max(
+            (ts for ts in (ann.get("last_ts"), traf.get("last_ts")) if ts),
+            default=None,
+        )
+        last = last_ts.strftime("%H:%M:%S") if last_ts else "-"
+        parts: list[str] = []
+        if ann_n:
+            parts.append(f"ann {ann_n}")
+        if traf_n:
+            parts.append(f"rx {traf_n}")
+        if msgs:
+            parts.append(f"msg {msgs}")
+        return f"   [dim]traffic: {' · '.join(parts)}  (last {last})[/dim]"
+
+
+    # -- NomadNet mode --------------------------------------------------------
+    def _show_nomadnet(self) -> None:
+        """Show the NomadNet (read-only page browsing) surface.
+
+        Reuses the global composer at the bottom as the address bar so the
+        typing target stays in the same screen position when switching modes
+        (no jumpy in-view input box). Submission is routed to the browser by
+        ``view`` in :meth:`on_input_submitted`.
+        """
+        self.view = "nomadnet"
+        self.query_one("#main", ContentSwitcher).current = "nomadnet-view"
+        # Keep the bottom composer enabled, just retitle it as an address bar.
+        self._enable_composer(True)
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = "<node hash>[:/page/x.mu]  ·  Enter to browse"
+        self._refresh_nomad_nodes()
+        self._update_nomad_help()
+        self._update_modebar()
+        self._update_status()
+        composer.focus()
+
+    def _update_nomad_help(self) -> None:
+        """Header for the NomadNet surface: what it is + current filter state."""
+        try:
+            help_line = self.query_one("#nomad-help", Static)
+        except Exception:  # noqa: BLE001
+            return
+        title = (
+            "NomadNet pages [dim](read-only)[/dim] — "
+            "Enter/tap a node to browse, or type an address below"
+        )
+        if self._active_fav_only:
+            fav = "filter: [b yellow]\u2605 saved nodes only[/b yellow]"
+        else:
+            fav = "filter: [dim]off (all heard nodes)[/dim]"
+        help_line.update(
+            f"{title}    {fav}    [f] save/unsave \u00b7 [F4] toggle"
+        )
+
+    def _refresh_nomad_nodes(self) -> None:
+        """List discovered NomadNet nodes for one-tap browsing.
+
+        Saved (favorited) nodes that haven't re-announced yet are listed first
+        and marked offline, so a bookmark is always recallable even before the
+        node beacons again. Currently-heard nodes follow, with a leading star
+        when they are favorites. Selecting any row opens the page browser.
+        """
+        if self.core is None:
+            return
+        lst = self.query_one("#nomad-nodes", ListView)
+        lst.clear()
+        self._nomad_nodes = []
+        ret = next(
+            (t for t in self.core.transports if t.name == "reticulum"), None
+        )
+        live = {
+            n["dest"]: n
+            for n in (ret.known_nodes() if ret is not None and ret.running else [])
+        }
+        favs = self.core.favorites
+        # Treat a favorite as a NomadNet bookmark when its id looks like a full
+        # 32-hex destination hash (the only form _open_nomad can dial) AND it is
+        # not a known LXMF peer - peers are messageable, not browsable, so they
+        # must not masquerade as sites here.
+        saved = [
+            f for f in favs.all()
+            if len(f.id) == 32
+            and all(c in "0123456789abcdef" for c in f.id.lower())
+            and not self._is_known_peer(f.id)
+        ]
+        # Saved-but-currently-silent bookmarks first (so they're always recall-
+        # able even before the node re-announces).
+        for f in saved:
+            if f.id.lower() in live:
+                continue
+            name = f.label or "(saved)"
+            lst.append(ListItem(Label(
+                f"\u2605 \U0001f5ce {name}  <{f.id[:16]}>  [dim](offline)[/dim]"
+            )))
+            self._nomad_nodes.append({"dest": f.id, "name": name})
+        # Then live nodes, marking the ones we've saved. With the favorites-only
+        # filter on (F4), non-favorite live nodes are hidden so only saved nodes
+        # remain.
+        for n in list(live.values())[:50]:
+            is_fav = favs.is_favorite(n["dest"])
+            if self._active_fav_only and not is_fav:
+                continue
+            name = n.get("name") or "(unnamed)"
+            star = "\u2605 " if is_fav else "  "
+            lst.append(ListItem(Label(
+                f"{star}\U0001f5ce {name}  <{n['dest'][:16]}>"
+            )))
+            self._nomad_nodes.append(n)
+        if not self._nomad_nodes:
+            empty = (
+                "[dim](no favorite nodes saved — press F4 to show all, or save "
+                "one with 'f')[/dim]"
+                if self._active_fav_only
+                else "[dim](no nodes heard yet — they announce over time)[/dim]"
+            )
+            lst.append(ListItem(Label(empty)))
+            self._nomad_nodes.append({})
+
+    def _open_nomad(
+        self, dest: str, path: str = "/page/index.mu", fields: dict | None = None
+    ) -> None:
+        if self.core is None or not getattr(self.core, "browser", None):
+            self._log_system("NomadNet browser unavailable (Reticulum not running).")
+            return
+        if not self.core.browser.available:
+            self._log_system("Reticulum is not running; cannot browse NomadNet.")
+            return
+        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields or {}))
+
+    def action_toggle_nomad_favorite(self) -> None:
+        """Bookmark / un-bookmark the highlighted NomadNet node (key 'f').
+
+        Saved nodes persist to the single config file via core.favorites and
+        are recallable from the node list even when offline. No-op outside the
+        NomadNet surface so the 'f' key stays free elsewhere.
+        """
+        if self.core is None or self.view != "nomadnet":
+            return
+        try:
+            lst = self.query_one("#nomad-nodes", ListView)
+        except Exception:  # noqa: BLE001
+            return
+        idx = lst.index
+        if idx is None or idx >= len(self._nomad_nodes):
+            return
+        node = self._nomad_nodes[idx]
+        dest = node.get("dest")
+        if not dest:
+            return
+        favs = self.core.favorites
+        if favs.is_favorite(dest):
+            favs.remove(dest)
+            self._log_system(f"node un-favorited: {dest[:12]}")
+        else:
+            label = node.get("name") or ""
+            fav = favs.add(
+                dest, label if label and label != "(unnamed)" else "", kind="node"
+            )
+            self._log_system(f"node favorited: {fav.display}")
+        try:
+            favs.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not save favorites: {exc}")
+        self._refresh_nomad_nodes()
+
+    # -- Watch pause / clear --------------------------------------------------
+    def _toggle_watch_pause(self) -> None:
+        self._watch_paused = not self._watch_paused
+        state = "PAUSED" if self._watch_paused else "live"
+        try:
+            self.query_one("#watch-pause", Button).label = (
+                "\u25b6 Resume" if self._watch_paused else "\u23f8 Pause"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        if not self._watch_paused:
+            # Catch the list up to anything buffered while paused.
+            self._rebuild_monitor()
+        self._log_system(f"Watch: {state}")
+
+    def _clear_watch(self) -> None:
+        self._monitor_msgs.clear()
+        self._monitor_entries.clear()
+        try:
+            self.query_one("#monitor", ListView).clear()
+        except Exception:  # noqa: BLE001
+            pass
+
+    # -- Favorites surface ----------------------------------------------------
+    def action_favorites_view(self) -> None:
+        """Open the Favorites page (F6)."""
+        self._show_favorites()
+
+    def _show_favorites(self) -> None:
+        """Show the Favorites surface: saved nodes, callsigns and hashes.
+
+        The bottom composer is enabled here as an *add* bar so the operator can
+        save a callsign or hash **without it being online first** - typing
+        ``<id> [label]`` and pressing Enter persists it immediately. Slash
+        commands still work (routed by view in :meth:`on_input_submitted`).
+        """
+        self.view = "favorites"
+        self.query_one("#main", ContentSwitcher).current = "favorites-view"
+        self._enable_composer(True)
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = "Add favorite: <callsign|hash> [label] · Enter to add"
+        self._render_favorites()
+        self._update_modebar()
+        self._update_status()
+        composer.focus()
+
+    def _favorite_kind(self, fav: Favorite) -> str:
+        """Classify a favorite as 'node' (NomadNet server), 'hash' or 'callsign'."""
+        return self._favorite_kind_by_id(fav.id)
+
+    def _favorite_kind_by_id(self, fid: str) -> str:
+        # A leading '@' is a JS8Call group, by convention (e.g. @TTP) - this is
+        # syntactic so it wins over any stored kind.
+        if (fid or "").strip().startswith("@"):
+            return "group"
+        # An explicitly stored kind wins (so a node saved while offline still
+        # opens the page browser and groups under "NomadNet servers").
+        if self.core is not None:
+            fav = self.core.favorites.match(fid)
+            if fav is not None and fav.kind:
+                if fav.kind == "node":
+                    return "node"
+                if fav.kind == "callsign":
+                    return "callsign"
+                if fav.kind == "group":
+                    return "group"
+                if fav.kind == "peer":
+                    return "hash"
+                # MeshCore favorites: a channel (by name) or a contact/user
+                # (by public-key prefix). Both open in the MeshCore mode.
+                if fav.kind == "mc_channel":
+                    return "mc_channel"
+                if fav.kind == "mc_peer":
+                    return "mc_peer"
+        fid_l = (fid or "").strip().lower()
+        is_hex = len(fid_l) >= 8 and all(c in "0123456789abcdef" for c in fid_l)
+        if not is_hex:
+            return "callsign"
+        # A bare hash is ambiguous; resolve it from heard announce aspects when
+        # possible (node = NomadNet site, peer = LXMF identity). Unknown hashes
+        # fall back to "hash" (treated as a messageable peer).
+        ret = self._reticulum_transport()
+        if ret is not None and ret.running:
+            try:
+                cls = ret.classify_dest(fid_l)
+            except Exception:  # noqa: BLE001
+                cls = ""
+            if cls == "node":
+                return "node"
+            if cls == "peer":
+                return "hash"
+        return "hash"
+
+
+    def _is_known_peer(self, fid: str) -> bool:
+        """True when ``fid`` is known to be an LXMF peer (not a NomadNet site).
+
+        Uses an explicit saved ``peer`` kind or the heard announce aspect, so we
+        can exclude messageable peers from the NomadNet (page-browser) node list.
+        """
+        if self.core is None or not fid:
+            return False
+        fav = self.core.favorites.match(fid)
+        if fav is not None and fav.kind == "peer":
+            return True
+        ret = self._reticulum_transport()
+        if ret is not None and ret.running:
+            try:
+                return ret.classify_dest(fid) == "peer"
+            except Exception:  # noqa: BLE001
+                return False
+        return False
+
+    def _render_favorites(self) -> None:
+        """Render saved favorites, grouped by kind (servers, callsigns, groups,
+        hashes)."""
+        if self.core is None:
+            return
+        lst = self.query_one("#favorites-list", ListView)
+        lst.clear()
+        self._fav_keys = []
+        favs = self.core.favorites.all()
+        if not favs:
+            lst.append(ListItem(Label(
+                "[dim](no favorites yet — type '<callsign|@group|hash> [label]' "
+                "below to add one)[/dim]"
+            )))
+            self._fav_keys.append("")
+            return
+        nodes, calls, groups, hashes = [], [], [], []
+        mc_channels, mc_peers = [], []
+        for f in favs:
+            kind = self._favorite_kind(f)
+            if kind == "node":
+                nodes.append(f)
+            elif kind == "group":
+                groups.append(f)
+            elif kind == "callsign":
+                calls.append(f)
+            elif kind == "mc_channel":
+                mc_channels.append(f)
+            elif kind == "mc_peer":
+                mc_peers.append(f)
+            else:
+                hashes.append(f)
+        sections = (
+            ("NomadNet servers", nodes, "\U0001f5ce"),  # 🗎
+            ("Callsigns", calls, "\U0001f4fb"),          # 📻
+            ("JS8Call groups", groups, "\U0001f4e2"),    # 📢
+            ("MeshCore channels", mc_channels, "\U0001f4e1"),  # 📡
+            ("MeshCore contacts", mc_peers, "\U0001f9d1"),     # 🧑
+            ("Hashes / peers", hashes, "\U0001f517"),    # 🔗
+        )
+        now = datetime.now(UTC)
+        for title, items, glyph in sections:
+            if not items:
+                continue
+            lst.append(ListItem(Label(f"[b]{title}[/b]  [dim]({len(items)})[/dim]")))
+            self._fav_keys.append("")  # header row: not a target
+            for f in items:
+                ago = (
+                    self._format_ago(now - f.last_seen)
+                    if f.last_seen
+                    else "never"
+                )
+                name = f.label or "(no label)"
+                # Show full id for callsigns/groups/channels; truncate long hex.
+                shown_id = (
+                    f.id
+                    if glyph in ("\U0001f4fb", "\U0001f4e2", "\U0001f4e1")
+                    else f.id[:16]
+                )
+                lst.append(ListItem(Label(
+                    f"  {glyph} {name}  [dim]<{shown_id}>  last seen: {ago}[/dim]"
+                )))
+                self._fav_keys.append(f.id)
+
+    def _open_favorite(self, fid: str) -> None:
+        """Act on a chosen favorite: browse a node, or open a conversation."""
+        if self.core is None:
+            return
+        kind = self._favorite_kind_by_id(fid)
+        if kind == "node":
+            self._open_nomad(fid)
+            return
+        names = [t.name for t in self.core.transports]
+        if kind in ("mc_channel", "mc_peer"):
+            if "meshcore" not in names:
+                self._log_system(
+                    "MeshCore is not configured; can't open this favorite."
+                )
+                return
+            if kind == "mc_channel":
+                idx = self._meshcore_channel_index(fid)
+                if idx is None:
+                    self._log_system(
+                        f"channel '#{fid.lstrip('#')}' is not known to this "
+                        "device yet — add it with /channel add."
+                    )
+                    return
+                target = f"@{idx}"
+            else:  # mc_peer: a contact addressed by its pubkey prefix
+                target = fid
+            self._select_mode("meshcore")
+            self.current_target = target
+            self._refresh_threads()
+            self._load_thread(target)
+            self._update_status()
+            return
+        if kind == "hash":
+            mode = "reticulum" if "reticulum" in names else None
+            target = fid
+        elif kind == "group":
+            # JS8Call @groups: open the group thread in the js8call mode.
+            mode = "js8call" if "js8call" in names else next(
+                (n for n in names if n != "reticulum"), None
+            )
+            target = "@" + fid.lstrip("@").upper()
+        else:  # callsign
+            mode = "js8call" if "js8call" in names else next(
+                (n for n in names if n != "reticulum"), None
+            )
+            target = fid.upper()
+        if mode is None:
+            self._log_system(f"no transport available to open favorite {fid[:16]}")
+            return
+        self._select_mode(mode)
+        self.current_target = target
+        self._refresh_threads()
+        self._load_thread(target)
+        self._update_status()
+
+    def action_remove_favorite(self) -> None:
+        """Remove the selected favorite (Del / Remove button, Favorites view)."""
+        if self.core is None or self.view != "favorites":
+            return
+        try:
+            lst = self.query_one("#favorites-list", ListView)
+        except Exception:  # noqa: BLE001
+            return
+        idx = lst.index
+        if idx is None or idx >= len(self._fav_keys):
+            self._log_system(
+                "select a favorite row first (arrow keys), or use /fav rm <id>"
+            )
+            return
+        fid = self._fav_keys[idx]
+        if not fid:
+            self._log_system(
+                "that row is a section header — pick a favorite, or /fav rm <id>"
+            )
+            return
+        if self.core.favorites.remove(fid):
+            try:
+                self.core.favorites.save(self.core.config)
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"could not save favorites: {exc}")
+            self._log_system(f"removed favorite: {fid[:16]}")
+            self._refresh_monitor_ticker()
+            self._rebuild_monitor()
+        self._render_favorites()
+
+    def _add_favorite_from_input(self, raw: str) -> None:
+        """Add a favorite typed into the Favorites add-bar (offline-friendly).
+
+        Syntax: ``[type] <id> [label]`` where an optional leading *type* keyword
+        pins how the favorite opens/groups (important when the peer/node isn't
+        online to auto-classify):
+
+        * ``node`` / ``server`` / ``nomadnet`` -> NomadNet server (page browser)
+        * ``peer`` -> messageable LXMF/Reticulum hash
+        * ``call`` / ``callsign`` -> HF callsign
+        * ``group`` / ``grp`` -> JS8Call group (or just prefix the id with '@')
+        * ``channel`` / ``chan`` -> MeshCore channel (by #name)
+        * ``contact`` / ``mc`` / ``meshcore`` -> MeshCore contact (pubkey prefix)
+
+        With no type keyword the kind is inferred: a leading ``@`` -> JS8Call
+        group, hex -> peer, else callsign.
+        """
+        if self.core is None:
+            return
+        kind = ""
+        rest = raw.strip()
+        first = rest.split(maxsplit=1)[0].lower().rstrip(":") if rest else ""
+        if first in ("node", "server", "nomadnet"):
+            kind = "node"
+        elif first in ("peer",):
+            kind = "peer"
+        elif first in ("call", "callsign"):
+            kind = "callsign"
+        elif first in ("group", "grp"):
+            kind = "group"
+        elif first in ("channel", "chan"):
+            kind = "mc_channel"
+        elif first in ("contact", "mc", "meshcore"):
+            kind = "mc_peer"
+        if kind:
+            rest = rest.split(maxsplit=1)[1] if " " in rest else ""
+        parts = rest.split(maxsplit=1)
+        if not parts or not parts[0]:
+            self._log_system(
+                "usage: [node|peer|call|group|channel|contact] <id> [label]  "
+                "(or @GROUP)"
+            )
+            return
+        ident = parts[0]
+        # A leading '@' always means a JS8Call group.
+        if ident.startswith("@"):
+            kind = "group"
+        # MeshCore channels are stored by name; drop a decorative leading '#'.
+        if kind == "mc_channel":
+            ident = ident.lstrip("#") or "public"
+        label = parts[1].strip() if len(parts) > 1 else ""
+        fav = self.core.favorites.add(ident, label, kind=kind)
+        try:
+            self.core.favorites.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not save favorites: {exc}")
+        tag = f" [{kind}]" if kind else ""
+        self._log_system(f"favorite added{tag}: {fav.display}")
+        self._refresh_monitor_ticker()
+        self._rebuild_monitor()
+        self._render_favorites()
+
+    def _favorite_current_conversation(self, label: str = "") -> None:
+        """Favorite the open conversation (★ Favorite / '/fav here').
+
+        Tailored to MeshCore: a channel is saved by its ``#name`` (kind
+        ``mc_channel``) and a contact by its public-key prefix (kind
+        ``mc_peer``), so each reopens straight into the Mesh panel. In other
+        modes the target is saved as-is (a ``@group`` or a callsign/hash),
+        letting the usual classification group it.
+        """
+        if self.core is None:
+            return
+        target = self.current_target
+        if not target:
+            self._log_system("open a conversation first, then \u2605 Favorite it.")
+            return
+        kind = ""
+        ident = target
+        if self.active_transport == "meshcore":
+            if target.startswith("@") and target[1:].isdigit():
+                idx = int(target[1:])
+                name = self._meshcore_channel_name(idx)
+                ident = name or ("public" if idx == 0 else f"channel{idx}")
+                kind = "mc_channel"
+                if not label and name:
+                    label = f"#{name}"
+            else:
+                # A direct MeshCore conversation: the target is a pubkey prefix.
+                kind = "mc_peer"
+                if not label:
+                    label = self._friendly_name(target)
+        fav = self.core.favorites.add(ident, label, kind=kind)
+        try:
+            self.core.favorites.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not save favorites: {exc}")
+        self._refresh_monitor_ticker()
+        self._rebuild_monitor()
+        if self.view == "favorites":
+            self._render_favorites()
+        label_part = f" ({fav.label})" if fav.label else ""
+        self._log_system(f"\u2605 favorited: {fav.id}{label_part}")
+
+    @work(thread=True)
+    def _import_js8_groups(self) -> None:
+        """Fetch the operator's JS8Call @groups and add them as favorites.
+
+        Runs the blocking TCP/JSON query in a worker thread so the UI never
+        stalls; results are applied back on the main thread.
+        """
+        if self.core is None:
+            return
+        js8 = self.core.config.transports.get("js8call", {})
+        if not js8.get("enabled", False):
+            self.call_from_thread(
+                self._log_system, "JS8Call is not enabled in your config."
+            )
+            return
+        from ..core.js8call_query import query_groups
+
+        host = js8.get("host", "127.0.0.1")
+        port = int(js8.get("port", 2442))
+        self.call_from_thread(
+            self._log_system, f"Querying JS8Call for groups at {host}:{port}…"
+        )
+        groups = query_groups(host, port)
+        self.call_from_thread(self._apply_imported_groups, groups)
+
+    def _apply_imported_groups(self, groups: list[str]) -> None:
+        """Add fetched @groups as favorites (called on the main thread)."""
+        if self.core is None:
+            return
+        if not groups:
+            self._log_system(
+                "No JS8Call groups found (is JS8Call running with the TCP API "
+                "enabled, and have you joined any groups?)."
+            )
+            return
+        added = 0
+        for name in groups:
+            ident = f"@{name}"
+            if not self.core.favorites.is_favorite(ident):
+                added += 1
+            self.core.favorites.add(ident, kind="group")
+        try:
+            self.core.favorites.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not save favorites: {exc}")
+        joined = ", ".join(f"@{g}" for g in groups)
+        self._log_system(
+            f"Imported {len(groups)} JS8Call group(s); {added} new: {joined}"
+        )
+        self._refresh_monitor_ticker()
+        if self.view == "favorites":
+            self._render_favorites()
+
+    # -- mode application -----------------------------------------------------
+    def _active_transport_obj(self) -> Transport | None:
+        if self.core is None or self.active_transport is None:
+            return None
+        return next(
+            (t for t in self.core.transports if t.name == self.active_transport),
+            None,
+        )
+
+    def _apply_mode(self) -> None:
+        # Switching mode resets the open conversation (sending is mode-bound).
+        # Channel-based transports (MeshCore) default to their primary channel
+        # (the public channel 0) so the panel is ready to send straight away.
+        self.current_target = self._default_channel_target()
+        self.query_one("#messages", RichLog).clear()
+        self._refresh_threads()
+        self._update_active_banner()
+        self._update_modebar()
+        self._update_status()
+        if self.current_target:
+            self._load_thread(self.current_target)
+            self._log_system(
+                f"Active mode: {self.active_transport} — "
+                f"{self._display_id(self.current_target)}"
+            )
+        elif self.active_transport:
+            # No conversation selected: show every message for this mode so the
+            # window isn't empty (e.g. the JS8Call firehose).
+            self._show_all_messages()
+
+    def _default_channel_target(self) -> str | None:
+        """Default conversation for the active mode, or None.
+
+        Transports exposing channels (MeshCore) open on the public channel
+        (index 0 when present) so the operator can chat immediately without
+        first picking a channel. Channel tags are '@<index>'.
+        """
+        t = self._active_transport_obj()
+        if t is None or not hasattr(t, "channels"):
+            return None
+        channels = t.channels()
+        if not channels:
+            return None
+        indices = [c["index"] for c in channels]
+        idx = 0 if 0 in indices else indices[0]
+        return f"@{idx}"
+
+    def _update_modebar(self) -> None:
+        """Refresh the persistent mode selector: active highlight + health dots.
+
+        Exactly one chip carries the ``-active`` class - the one whose surface
+        is currently on screen. We derive that from :meth:`_current_mode_key`
+        (which already encodes "nomadnet wins when view=='nomadnet'") instead
+        of comparing chips against ``self.active_transport`` directly, because
+        ``active_transport`` is intentionally NOT cleared when switching to
+        NomadNet/Watch/Health (so returning to ``active`` view restores the
+        last transport). Without that single source of truth, two chips
+        (e.g. js8call AND nomadnet) would both highlight at once.
+        """
+        try:
+            bar = self.query_one("#modebar", Horizontal)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        current = self._current_mode_key()
+        for btn in bar.query(Button):
+            bid = btn.id or ""
+            if bid == "mode-nomadnet":
+                btn.label = f"{self._health_dot('nomadnet')} nomadnet"
+                btn.set_class(current == "nomadnet", "-active")
+            elif bid.startswith("mode-"):
+                name = bid[len("mode-"):]
+                btn.label = f"{self._health_dot(name)} {name}"
+                btn.set_class(
+                    self.view == "active" and current == name,
+                    "-active",
+                )
+            elif bid == "view-watch":
+                btn.set_class(self.view == "monitor", "-active")
+            elif bid == "view-health":
+                btn.set_class(self.view == "health", "-active")
+            elif bid == "view-favorites":
+                btn.set_class(self.view == "favorites", "-active")
+        self._update_input_indicator()
+        self._update_mesh_bar()
+        self._update_js8_bar()
+        self._update_winlink_bar()
+        # View changed -> re-evaluate context bindings (e.g. F4 only on Watch)
+        # so the footer shows/hides them correctly.
+        self.refresh_bindings()
+
+    def _update_mesh_bar(self) -> None:
+        """Show the MeshCore action bar (Announce/Flood) only in Mesh mode."""
+        try:
+            bar = self.query_one("#mesh-bar", Horizontal)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        bar.display = (
+            self.view == "active" and self.active_transport == "meshcore"
+        )
+
+    def _winlink_transport(self) -> Transport | None:
+        """The live WinlinkTransport instance, or None when not configured."""
+        if self.core is None:
+            return None
+        return next(
+            (t for t in self.core.transports if t.name == "winlink"), None
+        )
+
+    def _update_winlink_bar(self) -> None:
+        """Show the Winlink action bar (Subject/Connect/Gateways) in winlink mode.
+
+        The label summarises the configured connection method + gateway and any
+        pending subject, so the operator can see at a glance how the next send
+        will be delivered.
+        """
+        try:
+            bar = self.query_one("#winlink-bar", Horizontal)
+            label = self.query_one("#winlink-bar-label", Static)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        show = self.view == "active" and self.active_transport == "winlink"
+        bar.display = show
+        if not show:
+            return
+        t = self._winlink_transport()
+        if t is not None and hasattr(t, "connect_summary"):
+            scheme = t.connect_summary()
+        else:
+            method = getattr(t, "_method", None)
+            scheme = method.scheme if method is not None else "telnet"
+        gateway = ""
+        if t is not None:
+            gateway = str(t.config.get("gateway", "")).strip()
+        gw_text = gateway or ("CMS" if scheme == "telnet" else "\u2014")
+        parts = [f"[b]Winlink[/b] [dim]via[/dim] {scheme}", f"[dim]gw:[/dim]{gw_text}"]
+        if self._winlink_subject:
+            subj = self._winlink_subject
+            if len(subj) > 24:
+                subj = subj[:21] + "..."
+            parts.append(f"[dim]subj:[/dim]\u201c{subj}\u201d")
+        label.update("  ".join(parts))
+
+    def _winlink_subject_prompt(self) -> None:
+        """Pre-fill the composer with ``/subject `` so the operator can type one."""
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        composer.value = "/subject "
+        composer.cursor_position = len(composer.value)
+        composer.focus()
+
+    def _set_winlink_subject(self, text: str) -> None:
+        """Set (or clear) the pending subject for the next Winlink message."""
+        self._winlink_subject = text.strip()
+        self._update_winlink_bar()
+        if self._winlink_subject:
+            self._log_system(
+                f"Winlink subject set: \u201c{self._winlink_subject}\u201d"
+            )
+        else:
+            self._log_system("Winlink subject cleared.")
+
+    def _set_winlink_gateway(self, gateway: str) -> None:
+        """Set the RMS gateway (or CMS target) for subsequent Winlink sessions."""
+        t = self._winlink_transport()
+        if t is None:
+            self._log_system("Winlink is not enabled.")
+            return
+        t.config["gateway"] = gateway.strip()
+        self._update_winlink_bar()
+        if gateway.strip():
+            self._log_system(f"Winlink gateway set: {gateway.strip()}")
+        else:
+            self._log_system("Winlink gateway cleared (telnet uses default CMS).")
+
+    @work(exclusive=True)
+    async def _winlink_connect(self, gateway: str | None = None) -> None:
+        """Trigger a Pat session to deliver the outbox and receive new mail."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "connect_now"):
+            self._log_system("Winlink is not enabled.")
+            return
+        url = None
+        if gateway:
+            scheme = getattr(t, "_method", None)
+            scheme = scheme.scheme if scheme is not None else "telnet"
+            url = f"{scheme}://{gateway}"
+        target = url or (
+            t.connect_summary() if hasattr(t, "connect_summary")
+            else t.build_connect_url()
+        )
+        self._log_system(f"Winlink: connecting via {target} \u2026")
+        try:
+            received = await t.connect_now(url)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink connect failed: {exc}")
+            return
+        self._log_system(
+            f"Winlink session done \u2014 {received} message(s) received."
+        )
+        self._refresh_active_pane()
+
+    @work(exclusive=True)
+    async def _winlink_list_gateways(self) -> None:
+        """List nearby RMS gateways from Pat (``/api/rmslist``)."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "list_gateways"):
+            self._log_system("Winlink is not enabled.")
+            return
+        self._log_system("Winlink: fetching RMS gateway list \u2026")
+        try:
+            gateways = await t.list_gateways()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink gateway list failed: {exc}")
+            return
+        if not gateways:
+            self._log_system(
+                "No gateways returned (telnet mode, or none in range/cached)."
+            )
+            return
+        self._log_system(f"Nearby RMS gateways ({len(gateways)} shown):")
+        for gw in gateways[:15]:
+            call = gw.get("callsign") or gw.get("Callsign") or "?"
+            mode = gw.get("mode") or gw.get("Mode") or ""
+            dist = gw.get("distance") or gw.get("Distance") or ""
+            extra = " ".join(str(x) for x in (mode, dist) if x)
+            self._log_system(f"  {call}  [dim]{extra}[/dim]")
+        self._log_system(
+            "Use [b]/gateway <CALL>[/b] then [b]Connect[/b] (or /connect <CALL>)."
+        )
+
+    def _js8_transport(self) -> Transport | None:
+        """The live JS8CallTransport instance, or None when not configured."""
+        if self.core is None:
+            return None
+        return next(
+            (t for t in self.core.transports if t.name == "js8call"), None
+        )
+
+    def _update_js8_bar(self) -> None:
+        """Show the JS8 band bar (current freq/band + band switches) in JS8 mode.
+
+        The dial frequency is whatever the transport last learned from JS8Call's
+        RIG.FREQ events; the Health probe timer keeps it warm by re-querying.
+        """
+        try:
+            bar = self.query_one("#js8-bar", Horizontal)
+            label = self.query_one("#js8-bar-label", Static)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        show = self.view == "active" and self.active_transport == "js8call"
+        bar.display = show
+        # The bottom one-click query bar (SNR?/HEARING?/STATUS?/INFO?) tracks the
+        # band bar's visibility - both belong to the JS8 chat panel.
+        try:
+            self.query_one("#js8-query-bar", Horizontal).display = show
+        except Exception:  # noqa: BLE001 - not mounted yet
+            pass
+        if not show:
+            return
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            label.update("JS8Call [dim]— not running[/dim]")
+            return
+        hz = getattr(t, "dial_freq", None)
+        if hz:
+            band = t.current_band() or "?"
+            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band})[/dim]")
+        else:
+            label.update("JS8Call  [dim]freq unknown — \u21bb to query[/dim]")
+
+    @work
+    async def _js8_refresh_freq(self) -> None:
+        """Re-query JS8Call for the current dial frequency and refresh the bar."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        await t.request_dial_freq()
+        # Give JS8Call a beat to reply (its RIG.FREQ event updates the cache).
+        await asyncio.sleep(0.4)
+        self._update_js8_bar()
+
+    def _js8_switch_band(self, band: str) -> None:
+        """Switch JS8Call to a named band's standard dial frequency."""
+        hz = dial_for_band(band)
+        if hz is None:
+            self._log_system(f"unknown band '{band}'.")
+            return
+        self._js8_set_freq(hz)
+
+    def _js8_send_query(self, name: str) -> None:
+        """Send a one-click JS8 directed query (e.g. ``SNR?``) to the open chat.
+
+        The query goes to whatever conversation is open — a callsign for a direct
+        query, or an ``@GROUP`` to ask the whole group — using the same path as
+        typing it, so the target prefix is added automatically.
+        """
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        if not self.current_target:
+            self._log_system(
+                "Open a conversation first (/to <callsign|@GROUP>)."
+            )
+            return
+        self._send(f"{name}?")
+
+    @work
+    async def _js8_set_freq(self, hz: int) -> None:
+        """Move the radio's dial via JS8Call (requires CAT/rig control there)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running; cannot change frequency.")
+            return
+        ok = await t.set_dial_freq(hz)
+        band = band_for_freq(hz) or "?"
+        if ok:
+            self._log_system(
+                f"JS8Call \u2192 {hz / 1e6:.3f} MHz ({band}). "
+                "[dim](needs CAT/rig control enabled in JS8Call)[/dim]"
+            )
+            await t.request_dial_freq()
+            await asyncio.sleep(0.4)
+            self._update_js8_bar()
+        else:
+            self._log_system("JS8Call frequency change failed (see logs).")
+
+    def _handle_freq_command(self, arg: str) -> None:
+        """``/freq`` shows the current dial freq; ``/freq <MHz|Hz>`` sets it."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        if not arg:
+            self._js8_refresh_freq()
+            return
+        hz = _parse_freq_to_hz(arg)
+        if hz is None:
+            self._log_system("usage: /freq <MHz e.g. 14.078 | Hz e.g. 14078000>")
+            return
+        self._js8_set_freq(hz)
+
+    def _handle_band_command(self, arg: str) -> None:
+        """``/band`` lists bands; ``/band <name>`` switches (e.g. /band 20m)."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        if not arg:
+            self._log_system(
+                "Bands: " + ", ".join(JS8_BAND_DIAL_HZ) + "  — /band <name>"
+            )
+            return
+        self._js8_switch_band(arg.strip())
+
+    def _build_mode_selector(self) -> None:
+        """Create one button per transport (mode) plus Watch/Health controls."""
+        if self.core is None:
+            return
+        bar = self.query_one("#modebar", Horizontal)
+        # One chip per configured transport = one operating mode.
+        for t in self.core.transports:
+            bar.mount(Button(t.name, id=f"mode-{t.name}", classes="modebtn"))
+        # NomadNet is a virtual mode (read-only page browsing over Reticulum).
+        bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+        bar.mount(Static("", id="modebar-spacer"))
+        bar.mount(Button("\u25f7 Watch", id="view-watch", classes="modebtn"))
+        bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
+        bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
+        bar.mount(Static("\u2328", id="input-ind"))
+
+    def _health_dot(self, name: str) -> str:
+        """Glyph for a transport's last reachability probe result."""
+        status = self._health.get(name)
+        if status is ReachabilityStatus.OK:
+            return "[green]\u25cf[/green]"      # ● up
+        if status is ReachabilityStatus.DOWN:
+            return "[red]\u25cb[/red]"          # ○ down
+        if status is ReachabilityStatus.NOT_APPLICABLE:
+            return "[dim]\u00b7[/dim]"          # · n/a
+        return "[dim]\u25cc[/dim]"              # ◌ unknown/not probed yet
+
+    @work(exclusive=True)
+    async def _refresh_health(self) -> None:
+        """Passively probe each transport's endpoint (no transmission)."""
+        if self.core is None:
+            return
+        for t in self.core.transports:
+            try:
+                self._health[t.name] = await t.check_reachable()
+            except Exception:  # noqa: BLE001 - a probe must never crash the UI
+                self._health[t.name] = ReachabilityStatus.DOWN
+            # Transports that expose richer device telemetry (e.g. MeshCore
+            # battery + radio params) get a passive snapshot for the Health
+            # board. Only worth fetching when the endpoint is reachable.
+            if (
+                hasattr(t, "device_telemetry")
+                and self._health.get(t.name) is ReachabilityStatus.OK
+            ):
+                try:
+                    self._device_telemetry[t.name] = await t.device_telemetry()
+                except Exception:  # noqa: BLE001 - telemetry must never crash UI
+                    self._device_telemetry[t.name] = {}
+            # Keep the JS8 dial-frequency cache warm so the band bar stays
+            # current (the reply arrives asynchronously as a RIG.FREQ event).
+            if (
+                t.name == "js8call"
+                and self._health.get(t.name) is ReachabilityStatus.OK
+                and hasattr(t, "request_dial_freq")
+            ):
+                try:
+                    await t.request_dial_freq()
+                except Exception:  # noqa: BLE001 - never crash the probe timer
+                    pass
+            # Winlink: probe each connection path's endpoint (telnet via Pat,
+            # varahf/Mercury @8300, ardop @8515) so the Health board can show
+            # which modems are up — even when they're expected to be down.
+            if t.name == "winlink" and hasattr(t, "path_status"):
+                try:
+                    self._winlink_paths = await t.path_status()
+                except Exception:  # noqa: BLE001 - never crash the probe timer
+                    self._winlink_paths = []
+        # NomadNet is a virtual mode riding Reticulum: it inherits Reticulum's
+        # reachability, or is N/A when Reticulum is not configured at all.
+        if "reticulum" in self._health:
+            self._health["nomadnet"] = self._health["reticulum"]
+        else:
+            self._health["nomadnet"] = ReachabilityStatus.NOT_APPLICABLE
+        self._update_modebar()
+        if self.view == "health":
+            self._render_health()
+
+    # -- input-mode detection -------------------------------------------------
+    def _note_input(self, mode: str) -> None:
+        if mode != self._input_mode:
+            self._input_mode = mode
+            self._update_input_indicator()
+
+    def _update_input_indicator(self) -> None:
+        try:
+            ind = self.query_one("#input-ind", Static)
+        except Exception:  # noqa: BLE001
+            return
+        glyph = "\u2328" if self._input_mode == "key" else "\u261e"
+        touch = " touch" if self._touch_layout else ""
+        ind.update(f"{glyph}{touch}")
+
+    def on_key(self, event) -> None:  # noqa: ANN001 - Textual event
+        self._note_input("key")
+
+    def on_click(self, event) -> None:  # noqa: ANN001 - Textual event
+        self._note_input("pointer")
+        # Tapping the input-mode glyph toggles the touch-friendly (larger) layout.
+        widget = getattr(event, "widget", None)
+        if widget is not None and getattr(widget, "id", None) == "input-ind":
+            self._toggle_touch_layout()
+
+    def _toggle_touch_layout(self) -> None:
+        self._touch_layout = not self._touch_layout
+        self.set_class(self._touch_layout, "-touch")
+        self._update_input_indicator()
+
+    @staticmethod
+    def _short(s: str) -> str:
+        return s if len(s) <= 12 else s[:12] + "..."
+
+    @staticmethod
+    def _looks_like_hash(s: str) -> bool:
+        """True for a long hex string (an RNS/LXMF destination hash)."""
+        return len(s) >= 16 and all(c in "0123456789abcdefABCDEF" for c in s)
+
+    def _friendly_name(self, key: str) -> str:
+        """A saved friendly name (favorite label) for an id, or '' if none."""
+        if self.core is None or not key:
+            return ""
+        fav = self.core.favorites.match(key)
+        return fav.label if fav is not None else ""
+
+    def _normalize_target(self, target: str) -> str:
+        """Normalize a typed conversation target for the active transport.
+
+        Amateur callsigns (JS8Call/Mercury) are case-insensitive and shown
+        upper-case, so we upper them. MeshCore contacts (names + hex pubkey
+        prefixes) and Reticulum hashes are case-sensitive, so they are kept
+        verbatim. ``@groups``/channels are always kept as typed.
+        """
+        target = target.strip()
+        if target.startswith("@"):
+            return target
+        if self.active_transport in ("js8call", "mercury"):
+            return target.upper()
+        return target
+
+    def _display_id(self, key: str) -> str:
+        """Readable form of a conversation id for display.
+
+        A saved friendly name replaces the raw id entirely; otherwise a long hex
+        hash is truncated so it stays readable. Callsigns and @groups are shown
+        unchanged.
+        """
+        if not key:
+            return key
+        name = self._friendly_name(key)
+        if name:
+            return name
+        # MeshCore-style channel tags ('@<index>') render as a friendly '#name'
+        # when the active transport names the channel.
+        channel = self._channel_display(key)
+        if channel:
+            return channel
+        if self._looks_like_hash(key):
+            return key[:10] + "\u2026"
+        return key
+
+    def _channel_display(self, key: str) -> str:
+        """Friendly label for a group-channel tag of the active transport.
+
+        Returns e.g. ``#ops (ch 1)`` for '@1' when the active mode is a
+        channel-capable transport (MeshCore) that knows that channel, or '' when
+        the key is not a channel tag / the mode has no channels.
+        """
+        if self.core is None or not key.startswith("@") or not key[1:].isdigit():
+            return ""
+        active = self._active_transport_obj()
+        if active is None or not hasattr(active, "channels"):
+            return ""
+        idx = int(key[1:])
+        for ch in active.channels():
+            if ch["index"] == idx:
+                name = ch.get("name") or ("public" if idx == 0 else f"channel {idx}")
+                return f"#{name} [dim](ch {idx})[/dim]"
+        return ""
+
+    # -- thread list (scoped to active mode) ----------------------------------
+    def _refresh_threads(self) -> None:
+        if self.core is None:
+            return
+        view = self.query_one("#threads", ListView)
+        keys: list[str] = []
+        active_group_tags: set[str] = set()
+        # Conversations we've actually exchanged messages with (stored), so the
+        # pane can rank them above contacts we've only opened/saved.
+        dialog_keys: set[str] = set()
+        if self.active_transport is not None:
+            for k, _, _ in self.core.store.threads():
+                if self.core.store.thread_transport(k) == self.active_transport:
+                    keys.append(k)
+                    dialog_keys.add(k)
+            for group in self.core.groups.all():
+                if self.active_transport in group.transports:
+                    active_group_tags.add(group.tag)
+                    if group.tag not in keys:
+                        keys.append(group.tag)
+            # MeshCore (and any transport that exposes channels) lists its group
+            # channels as conversations up front, so the operator can drop into a
+            # channel before any traffic has arrived. Channel tags are '@<index>'
+            # to match the group/channel addressing used on send & receive.
+            active = self._active_transport_obj()
+            if active is not None and hasattr(active, "channels"):
+                for ch in active.channels():
+                    tag = f"@{ch['index']}"
+                    if tag not in keys:
+                        keys.append(tag)
+            # Group favorites (e.g. JS8Call @groups saved in Favorites) ALWAYS
+            # belong in the left pane for group-capable, non-channel transports,
+            # so every group you track is visible whether or not you've exchanged
+            # any traffic with it. (MeshCore's groups are numeric channels handled
+            # above, so it is excluded via the channels() check.)
+            caps = active.capabilities() if active is not None else None
+            if caps is not None and caps.supports_groups and not hasattr(
+                active, "channels"
+            ):
+                for fav in self.core.favorites.all():
+                    if fav.kind != "group" and not fav.id.startswith("@"):
+                        continue
+                    tag = fav.id if fav.id.startswith("@") else f"@{fav.id}"
+                    active_group_tags.add(tag)
+                    if tag not in keys:
+                        keys.append(tag)
+            # Remember the open conversation, then restore every conversation
+            # opened in this mode so the left pane persists across mode switches
+            # (conversations with no stored messages would otherwise vanish).
+            self._remember_thread(self.current_target)
+            for key in self._opened_threads.get(self.active_transport, []):
+                if key not in keys:
+                    keys.append(key)
+            if self.current_target and self.current_target not in keys:
+                keys.append(self.current_target)
+        # Sort the pane into three tiers, alphabetical within each:
+        #   0) groups (@-prefixed) — always at the top,
+        #   1) contacts you've had a dialog with (stored messages),
+        #   2) everyone else (opened/saved but no traffic yet).
+        def _tier(k: str) -> int:
+            if k.startswith("@"):
+                return 0
+            return 1 if k in dialog_keys else 2
+
+        keys.sort(key=lambda k: (_tier(k), k.lower()))
+        # Per-mode favorites-only filter: keep favorite peers, the open
+        # conversation (so the filter never blanks out what you're reading), and
+        # ALL of this mode's groups — your @groups are always worth seeing, even
+        # before you've exchanged any messages with them.
+        if self._active_fav_only:
+            keys = [
+                k
+                for k in keys
+                if k == self.current_target
+                or k in active_group_tags
+                or self.core.favorites.is_favorite(k)
+            ]
+        view.clear()
+        self._thread_keys = keys
+        for key in keys:
+            view.append(ListItem(Label(self._display_id(key))))
+
+    def _remember_thread(self, key: str | None) -> None:
+        """Record a conversation as 'opened' in the active mode (de-duplicated).
+
+        Lets :meth:`_refresh_threads` keep it in the left pane after switching
+        modes, even when it has no stored messages yet.
+        """
+        if not key or self.active_transport is None:
+            return
+        opened = self._opened_threads.setdefault(self.active_transport, [])
+        if key not in opened:
+            opened.append(key)
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        list_id = event.list_view.id
+        idx = event.list_view.index
+        if idx is None:
+            return
+        if list_id == "threads":
+            if idx >= len(self._thread_keys):
+                return
+            self.current_target = self._thread_keys[idx]
+            self._load_thread(self.current_target)
+            self._update_status()
+        elif list_id == "monitor":
+            self._open_from_monitor(idx)
+        elif list_id == "nomad-nodes":
+            if idx < len(self._nomad_nodes):
+                node = self._nomad_nodes[idx]
+                if node.get("dest"):
+                    self._open_nomad(node["dest"])
+        elif list_id == "favorites-list":
+            if idx < len(self._fav_keys) and self._fav_keys[idx]:
+                self._open_favorite(self._fav_keys[idx])
+
+    def _load_thread(self, thread_key: str) -> None:
+        if self.core is None:
+            return
+        log = self.query_one("#messages", RichLog)
+        log.clear()
+        log.write(f"[bold]-- {self._display_id(thread_key)} --[/bold]")
+        for msg in self.core.store.read_thread(thread_key):
+            self._render_message(msg)
+
+    def _show_all_messages(self) -> None:
+        """Firehose view: every message for the active mode (no conversation).
+
+        Shown when a chat mode has no specific callsign/@group/contact selected,
+        so the operator can watch all of that mode's traffic at once (e.g. the
+        JS8Call window with nothing focused). Each row keeps its sender and
+        group tag, and inbound senders stay clickable to start a reply.
+        """
+        if self.core is None or not self.active_transport:
+            return
+        log = self.query_one("#messages", RichLog)
+        log.clear()
+        log.write(
+            f"[bold]-- all {self.active_transport} messages —[/bold] "
+            "[dim]no conversation selected; type /to <callsign|@GROUP> to "
+            "focus one, or click a name to reply[/dim]"
+        )
+        msgs = self.core.store.read_transport(self.active_transport)
+        if not msgs:
+            log.write(
+                "[dim italic]  (nothing heard yet on this mode)[/dim italic]"
+            )
+            return
+        for msg in msgs:
+            self._render_message(msg)
+
+    def _refresh_active_pane(self) -> None:
+        """Re-render the message pane for the active mode's current state.
+
+        Loads the open conversation when one is selected, otherwise shows the
+        all-messages firehose for the mode.
+        """
+        if self.current_target:
+            self._load_thread(self.current_target)
+        else:
+            self._show_all_messages()
+
+    # -- monitor --------------------------------------------------------------
+    def _append_monitor(self, msg: UnifiedMessage) -> None:
+        # Keep the full history so the favorites-only filter can rebuild.
+        self._monitor_msgs.append(msg)
+        # When Watch is paused, buffer (kept above) but don't render live.
+        if self._watch_paused:
+            return
+        # Sorting by mode groups rows by transport, so a new arrival can't just
+        # be appended at the end — rebuild to keep the grouping correct.
+        if self._watch_sort_by_mode:
+            self._rebuild_monitor()
+            return
+        if self._monitor_fav_only and not self._msg_is_favorite(msg):
+            return
+        self._render_monitor_row(msg)
+
+    # Per-mode colour for the Watch feed's transport tag, so it's obvious at a
+    # glance which mode each line came from.
+    _MODE_COLORS = {
+        "reticulum": "cyan",
+        "js8call": "yellow",
+        "meshcore": "green",
+        "mercury": "magenta",
+        "nomadnet": "blue",
+    }
+
+    def _mode_color(self, transport: str) -> str:
+        return self._MODE_COLORS.get(transport, "white")
+
+    def _render_monitor_row(self, msg: UnifiedMessage) -> None:
+        mlist = self.query_one("#monitor", ListView)
+        ts = msg.timestamp.strftime("%H:%M:%S")
+        sec = "ENC" if msg.metadata.get("encrypted") else "---"
+        tgt = f"@{msg.group}" if msg.group else (msg.recipient or "")
+        star = "\u2605 " if self._msg_is_favorite(msg) else ""
+        # Outbound messages (your own sends, any transport) are echoed into the
+        # Watch feed too, so a watched conversation shows BOTH sides. They carry
+        # a non-RECEIVED status, which is how we tell them apart from inbound.
+        is_out = msg.status is not DeliveryStatus.RECEIVED
+        who = "[cyan]you[/cyan]" if is_out else msg.sender
+        # Colour-coded, fixed-width mode tag so the source mode is obvious and
+        # the columns line up (helpful when sorted by mode).
+        name = msg.transport or "?"
+        color = self._mode_color(name)
+        mode_tag = f"[{color}]{name:<9}[/{color}]"
+        line = f"{ts} {mode_tag} {sec} {star}{who} -> {tgt}: {msg.content}"
+        mlist.append(ListItem(Label(line)))
+        self._monitor_entries.append((msg.thread_key, msg.transport))
+        mlist.scroll_end(animate=False)
+
+    def _msg_is_favorite(self, msg: UnifiedMessage) -> bool:
+        if self.core is None:
+            return False
+        # You are always "favorite": your own outbound messages (echoed into
+        # the Watch feed as "you") survive the favorites-only filter so a
+        # watched conversation still shows both sides.
+        if msg.status is not DeliveryStatus.RECEIVED:
+            return True
+        favs = self.core.favorites
+        for candidate in (
+            msg.sender,
+            msg.recipient or "",
+            msg.metadata.get("rns_dest", ""),
+            msg.metadata.get("display_name", ""),
+        ):
+            if candidate and favs.is_favorite(candidate):
+                return True
+        return False
+
+    def _rebuild_monitor(self) -> None:
+        """Re-render the Monitor list honouring the favorites filter + sort mode."""
+        mlist = self.query_one("#monitor", ListView)
+        mlist.clear()
+        self._monitor_entries.clear()
+        msgs = self._monitor_msgs
+        if self._watch_sort_by_mode:
+            # Group by transport (mode), then chronologically within each mode.
+            msgs = sorted(
+                msgs, key=lambda m: (m.transport or "~", m.timestamp)
+            )
+        for msg in msgs:
+            if self._monitor_fav_only and not self._msg_is_favorite(msg):
+                continue
+            self._render_monitor_row(msg)
+
+    def _toggle_watch_sort(self) -> None:
+        """Toggle the Watch feed between time order and grouped-by-mode order."""
+        self._watch_sort_by_mode = not self._watch_sort_by_mode
+        self._rebuild_monitor()
+        try:
+            btn = self.query_one("#watch-sort", Button)
+            btn.label = (
+                "\u21c5 By time" if self._watch_sort_by_mode else "\u21c5 By mode"
+            )
+        except Exception:  # noqa: BLE001 - button may not be mounted in tests
+            pass
+        self._log_system(
+            "Watch sorted by mode." if self._watch_sort_by_mode
+            else "Watch sorted by time."
+        )
+
+    def _update_monitor_help(self) -> None:
+        """Reflect the Monitor scope and favorites-filter state in the header.
+
+        The transport scope ("all transports") and the favorites-only filter are
+        shown as two independent segments, so the filter state never overwrites
+        the scope label.
+        """
+        try:
+            help_line = self.query_one("#monitor-help", Static)
+        except Exception:  # noqa: BLE001 - widget may not be mounted yet
+            return
+        scope = "Monitor - [b]all transports[/b] (read-only)"
+        if self._monitor_fav_only:
+            fav = "filter: [b yellow]\u2605 favorites only[/b yellow]"
+        else:
+            fav = "filter: [dim]off (all senders)[/dim]"
+        help_line.update(
+            f"{scope}    {fav}    Enter opens an item \u00b7 [F4] toggle favorites"
+        )
+
+    def _refresh_monitor_ticker(self) -> None:
+        """Update the 'Favorites' line at the top of the Monitor view."""
+        try:
+            ticker = self.query_one("#monitor-ticker", Static)
+        except Exception:  # noqa: BLE001 - widget may not be mounted yet
+            return
+        if self.core is None or not self.core.favorites.all():
+            ticker.update(
+                "Favorites: (none added — '/fav add <id>' to track)"
+            )
+            return
+        if not self._fav_recent:
+            count = len(self.core.favorites.all())
+            ticker.update(
+                f"Favorites: {count} tracked — waiting for any to come online..."
+            )
+            return
+        now = datetime.now(UTC)
+        parts = []
+        # Newest favorite first.
+        for ts, peer, transport in reversed(self._fav_recent):
+            ago = self._format_ago(now - ts)
+            parts.append(f"[b]\u2605 {peer}[/b] [{transport}] {ago}")
+        ticker.update("Favorites online: " + "  ·  ".join(parts))
+
+    @staticmethod
+    def _format_ago(delta: timedelta) -> str:
+        secs = int(max(0, delta.total_seconds()))
+        if secs < 60:
+            return f"{secs}s"
+        mins, secs = divmod(secs, 60)
+        if mins < 60:
+            return f"{mins}m{secs:02d}s"
+        hrs, mins = divmod(mins, 60)
+        return f"{hrs}h{mins:02d}m"
+
+    def _set_friendly_name(self, arg: str) -> None:
+        """Assign (or clear) a friendly name for the open conversation.
+
+        The name is stored as the conversation id's favorite label, so it shows
+        in the left pane and the conversation header instead of the raw hash.
+        Usage: ``/name <friendly name>`` to set, ``/name -`` to clear, ``/name``
+        to show the current name.
+        """
+        if self.core is None:
+            return
+        target = self.current_target
+        if not target:
+            self._log_system(
+                "Open a conversation first, then '/name <friendly name>'."
+            )
+            return
+        if target.startswith("@"):
+            self._log_system("Groups already have a name.")
+            return
+        if not arg:
+            current = self._friendly_name(target)
+            self._log_system(
+                f"name for {self._short(target)}: {current or '(none)'}  "
+                "\u2014 set with '/name <friendly name>', clear with '/name -'."
+            )
+            return
+        favs = self.core.favorites
+        new_label = "" if arg.strip() == "-" else arg.strip()
+        favs.set_label(target, new_label)
+        try:
+            favs.save(self.core.config)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"could not save name: {exc}")
+            return
+        # Reflect the new name in the left pane and the open conversation now.
+        self._refresh_threads()
+        if self.view == "active" and self.current_target == target:
+            self._load_thread(target)
+        self._update_status()
+        if new_label:
+            self._log_system(
+                f"named {self._short(target)} \u2192 {new_label} "
+                "(also saved as a contact)."
+            )
+        else:
+            self._log_system(f"cleared the name for {self._short(target)}.")
+
+    def _handle_fav_command(self, arg: str) -> None:
+        """In-TUI favorites: /fav list | add <id> [label] | rm <id> | only."""
+        if self.core is None:
+            return
+        parts = arg.split(maxsplit=2)
+        action = parts[0].lower() if parts else "list"
+        favs = self.core.favorites
+        if action in ("", "list", "ls"):
+            items = favs.all()
+            if not items:
+                self._log_system(
+                    "favorites: (none) - '/fav add <callsign|hash> [label]'"
+                )
+                return
+            for f in items:
+                ago = (
+                    self._format_ago(datetime.now(UTC) - f.last_seen)
+                    if f.last_seen
+                    else "never"
+                )
+                label = f" ({f.label})" if f.label else ""
+                self._log_system(f"  \u2605 {f.id}{label}   last seen: {ago}")
+            return
+        if action in ("only", "filter"):
+            self._toggle_fav_only()
+            return
+        if action in ("here", "this", "current"):
+            # Favorite the open conversation (MeshCore channel/contact aware).
+            label = arg.split(maxsplit=1)[1].strip() if " " in arg else ""
+            self._favorite_current_conversation(label)
+            return
+        if action in ("groups", "import", "import-groups"):
+            self._import_js8_groups()
+            return
+        if action in ("add",):
+            if len(parts) < 2:
+                self._log_system(
+                    "usage: /fav add [node|peer|call|group|channel|contact] "
+                    "<id> [label]"
+                )
+                return
+            # Delegate to the shared parser so type keywords (node/peer/call/
+            # group/channel/contact) and '@group' all work here too.
+            rest = arg.split(maxsplit=1)[1] if " " in arg else ""
+            self._add_favorite_from_input(rest)
+            return
+        if action in ("rm", "remove", "del"):
+            if len(parts) < 2:
+                self._log_system("usage: /fav rm <callsign|rns-hash>")
+                return
+            ident = parts[1]
+            ok = favs.remove(ident)
+            try:
+                favs.save(self.core.config)
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"could not save favorites: {exc}")
+            # Drop any cached recents whose label matches.
+            kept = [
+                (ts, peer, t)
+                for ts, peer, t in self._fav_recent
+                if peer.lower() != ident.lower()
+            ]
+            self._fav_recent = deque(kept, maxlen=self._fav_recent.maxlen)
+            self._refresh_monitor_ticker()
+            self._rebuild_monitor()
+            if self.view == "favorites":
+                self._render_favorites()
+            self._log_system("removed" if ok else "no matching favorite")
+            return
+        self._log_system(
+            "usage: /fav list | add <id> [label] | here [label] | "
+            "rm <id> | only | groups"
+        )
+
+    def _handle_browse_command(self, arg: str) -> None:
+        """Open the NomadNet page viewer: /browse <hash>[:/page/x.mu]."""
+        if self.core is None:
+            return
+        if not getattr(self.core, "browser", None) or not self.core.browser.available:
+            self._log_system(
+                "Reticulum is not running; the NomadNet browser is unavailable."
+            )
+            return
+        if not arg:
+            self._log_system("usage: /browse <hash>[:/page/x.mu]  (see /nodes)")
+            return
+        dest, path, fields = parse_address(arg)
+        if not dest:
+            self._log_system("usage: /browse <hash>[:/page/x.mu]")
+            return
+        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields))
+
+    def _handle_nodes_command(self) -> None:
+        """List discovered NomadNet nodes in the message log."""
+        if self.core is None:
+            return
+        ret = next(
+            (t for t in self.core.transports if t.name == "reticulum"), None
+        )
+        if ret is None or not ret.running:
+            self._log_system("Reticulum is not running; no nodes to list.")
+            return
+        nodes = ret.known_nodes()
+        if not nodes:
+            self._log_system("No NomadNet nodes heard yet (waiting for announces).")
+            return
+        self._log_system("NomadNet nodes (use /browse <hash>):")
+        for n in nodes[:20]:
+            name = n["name"] or "(unnamed)"
+            self._log_system(f"  {n['dest']}  {name}")
+
+    def _handle_peers_command(self) -> None:
+        """List discovered LXMF peers (messageable identities) in the log."""
+        if self.core is None:
+            return
+        ret = next(
+            (t for t in self.core.transports if t.name == "reticulum"), None
+        )
+        if ret is None or not ret.running:
+            self._log_system("Reticulum is not running; no peers to list.")
+            return
+        peers = ret.known_peers()
+        if not peers:
+            self._log_system("No LXMF peers heard yet (waiting for announces).")
+            return
+        self._log_system("LXMF peers (messageable identities):")
+        for p in peers[:20]:
+            name = p["name"] or "(anonymous)"
+            self._log_system(f"  {p['dest']}  {name}")
+
+    def _open_from_monitor(self, idx: int) -> None:
+        if idx >= len(self._monitor_entries):
+            return
+        thread_key, transport = self._monitor_entries[idx]
+        # Entering a conversation switches the active mode to its transport.
+        if transport and transport != self.active_transport:
+            self.active_transport = transport
+            self._update_modebar()
+        self.current_target = thread_key
+        self.view = "active"
+        self.query_one("#main", ContentSwitcher).current = "active-view"
+        self._enable_composer(True)
+        self._refresh_threads()
+        self._load_thread(thread_key)
+        self._update_status()
+        self.query_one("#composer", Input).focus()
+
+    # -- composer -------------------------------------------------------------
+    def _enable_composer(self, enabled: bool) -> None:
+        composer = self.query_one("#composer", Input)
+        composer.disabled = not enabled
+        composer.placeholder = (
+            "Type a message or /help ..."
+            if enabled
+            else "Read-only view - tap the Watch tab, or pick a mode"
+        )
+
+    async def on_input_submitted(self, event: Input.Submitted) -> None:
+        # In NomadNet the bottom composer is repurposed as an address bar so the
+        # input position stays put across modes - route by view, not widget id.
+        # Slash-commands (/fav, /help, /quit, ...) must still work there, so we
+        # only treat *non-command* input as a page address.
+        if self.view == "nomadnet" and not event.value.lstrip().startswith("/"):
+            addr = event.value.strip()
+            event.input.value = ""
+            if not addr:
+                return
+            dest, path, fields = parse_address(addr)
+            if not dest:
+                self._log_system("usage: <node hash>[:/page/x.mu]")
+                return
+            self._open_nomad(dest, path, fields)
+            return
+        # In Favorites the bottom composer is an "add favorite" bar; non-command
+        # input adds the typed id (works offline - peer need not be online).
+        if self.view == "favorites" and not event.value.lstrip().startswith("/"):
+            raw = event.value.strip()
+            event.input.value = ""
+            if raw:
+                self._add_favorite_from_input(raw)
+            return
+        text = event.value.strip()
+        event.input.value = ""
+        if not text:
+            return
+        if text.startswith("/"):
+            await self._handle_command(text)
+            return
+        self._send(text)
+
+    async def _handle_command(self, text: str) -> None:
+        parts = text.split(maxsplit=1)
+        cmd = parts[0].lower()
+        arg = parts[1].strip() if len(parts) > 1 else ""
+        if cmd in ("/quit", "/q", "/exit"):
+            await self.action_quit()
+        elif cmd == "/help":
+            self._log_system(
+                "Commands: /to <callsign|@GROUP> [message], /monitor (toggle), "
+                "/favorites (F6), /mode (cycle, like F3), "
+                "/fav add|rm|list|only [<id> [label]], "
+                "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
+                "/channel list|add <index> <#name> [secret], "
+                "/freq [<MHz|Hz>], /band [<name>], "
+                "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
+                "/name <friendly name>, /close [<id>], "
+                "/whoami, /announce, /path [<id>], /quit"
+            )
+        elif cmd == "/to":
+            if not self.active_transport:
+                self._log_system("Pick a mode first (press F3).")
+                return
+            if not arg:
+                self._log_system("usage: /to <callsign|@GROUP> [message]")
+                return
+            # Accept an optional trailing message: "/to @TTP SNR?" switches to the
+            # @TTP conversation AND sends "SNR?". Only the first token is the
+            # target; the remainder (if any) is sent as a message.
+            target, _, trailing = arg.partition(" ")
+            self.current_target = self._normalize_target(target)
+            self._refresh_threads()
+            self._load_thread(self.current_target)
+            self._update_status()
+            trailing = trailing.strip()
+            if trailing:
+                self._send(trailing)
+        elif cmd == "/monitor":
+            self._show_watch()
+        elif cmd in ("/favorites", "/favs"):
+            self._show_favorites()
+        elif cmd == "/mode":
+            # Typed convenience: cycle modes just like the F3 key.
+            self.action_choose_mode()
+        elif cmd == "/refresh":
+            self.action_refresh()
+        elif cmd == "/fav":
+            self._handle_fav_command(arg)
+        elif cmd == "/browse":
+            self._handle_browse_command(arg)
+        elif cmd == "/nodes":
+            self._handle_nodes_command()
+        elif cmd == "/peers":
+            self._handle_peers_command()
+        elif cmd in ("/whoami", "/id"):
+            self.action_identity()
+        elif cmd == "/announce":
+            self.action_announce()
+        elif cmd in ("/channel", "/chan"):
+            await self._handle_channel_command(arg)
+        elif cmd in ("/freq", "/frequency"):
+            self._handle_freq_command(arg)
+        elif cmd == "/band":
+            self._handle_band_command(arg)
+        elif cmd in ("/name", "/rename"):
+            self._set_friendly_name(arg)
+        elif cmd in ("/close", "/delete"):
+            # Close the named conversation, or the open one when no id is given.
+            self._close_chat(arg or self.current_target)
+        elif cmd == "/path":
+            # Optional explicit id; otherwise act on the open conversation.
+            if arg:
+                self.current_target = arg
+            self.action_find_path()
+        elif cmd == "/subject":
+            self._set_winlink_subject(arg)
+        elif cmd == "/connect":
+            self._winlink_connect(arg or None)
+        elif cmd in ("/gateway", "/gw"):
+            self._set_winlink_gateway(arg)
+        elif cmd == "/gateways":
+            self._winlink_list_gateways()
+        else:
+            self._log_system(f"unknown command: {cmd}")
+
+    @work
+    async def _send(self, text: str) -> None:
+        if self.core is None:
+            return
+        if not self.active_transport:
+            self._log_system("Pick a mode first (press F3).")
+            return
+        if not self.current_target:
+            self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
+            return
+        me = self.core.config.display_name
+        t = self._active_transport_obj()
+        caps = t.capabilities() if t else None
+        if self.current_target.startswith("@"):
+            if not (caps and caps.supports_groups):
+                self._log_system(
+                    f"groups are not available on '{self.active_transport}'."
+                )
+                return
+            msg = UnifiedMessage.to_group(me, self.current_target, text)
+        else:
+            msg = UnifiedMessage.direct(me, self.current_target, text)
+        # Winlink is email-style: attach the pending subject (set via the Subject
+        # button or /subject) and consume it so it doesn't bleed into the next.
+        if self.active_transport == "winlink" and self._winlink_subject:
+            msg.metadata["subject"] = self._winlink_subject
+            self._winlink_subject = ""
+            self._update_winlink_bar()
+        # Send over the ACTIVE mode only (no auto-selection / fallback).
+        ok = await self.core.router.send(msg, force_transport=self.active_transport)
+        self._render_message(msg, outgoing=True, ok=ok)
+        # Echo into the all-transport Watch feed so a watched conversation
+        # (e.g. a MeshCore channel) shows both the messages you receive AND the
+        # ones you send, not just inbound traffic.
+        self._append_monitor(msg)
+        self._refresh_threads()
+
+    # -- rendering (identical everywhere) -------------------------------------
+    def _sender_is_replyable(self, msg: UnifiedMessage) -> bool:
+        """True when a message's sender is a real, addressable identity.
+
+        Anonymous channel traffic (a MeshCore channel message with no embedded
+        sender name) carries a synthetic ``chanN`` placeholder that is not a
+        person you can DM — so its name must not be turned into a reply link.
+        """
+        sender = (msg.sender or "").strip()
+        if not sender:
+            return False
+        if msg.metadata.get("mc_anon"):
+            return False
+        # Synthetic channel placeholder like 'chan0' (defensive: also covers
+        # any persisted message that predates the mc_anon marker).
+        if sender.startswith("chan") and sender[4:].isdigit():
+            return False
+        return True
+
+    def _render_message(
+        self, msg: UnifiedMessage, outgoing: bool = False, ok: bool = True
+    ) -> None:
+        log = self.query_one("#messages", RichLog)
+        ts = msg.timestamp.strftime("%H:%M")
+        # Treat a message as outbound when the caller says so (live send) OR when
+        # its persisted status is anything but RECEIVED - so messages reloaded
+        # from the store (e.g. after a restart) still render as "you" and keep
+        # their delivery indicator.
+        is_out = outgoing or msg.status is not DeliveryStatus.RECEIVED
+        via = msg.transport or ("..." if is_out else "?")
+        if is_out:
+            who = "[bold cyan]you[/bold cyan]"
+        else:
+            # Inbound senders are clickable: clicking opens a direct reply to
+            # that person (handy in a MeshCore channel / JS8 @group where one
+            # thread carries many senders). Strip quotes so the value can't
+            # break out of the @click action's argument string.
+            name = self._display_id(msg.sender)
+            ident = (msg.sender or "").replace("'", "").replace("\\", "")
+            via_t = (msg.transport or "").replace("'", "").replace("\\", "")
+            if ident and self._sender_is_replyable(msg):
+                who = (
+                    f"[bold][@click=app.reply_to('{ident}', '{via_t}')]"
+                    f"{name}[/][/bold]"
+                )
+            else:
+                who = f"[bold]{name}[/bold]"
+        lock = " [enc]" if msg.metadata.get("encrypted") else ""
+        status = "" if ok else " [red](unsent)[/red]"
+        # Outbound delivery indicator (LXMF receipts): show ✓ delivered / ✗ failed
+        # from either the live receipt map or the persisted status.
+        if is_out and ok:
+            dlv = self._delivery_status.get(msg.msg_id)
+            if dlv == "delivered" or msg.status is DeliveryStatus.DELIVERED:
+                status = " [green]\u2713[/green]"
+            elif dlv == "failed" or msg.status is DeliveryStatus.FAILED:
+                status = " [red]\u2717 (failed)[/red]"
+        tag = ""
+        if msg.address_type is AddressType.GROUP and msg.group:
+            tag = f" [magenta]@{msg.group}[/magenta]"
+        log.write(
+            f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag} {who}: "
+            f"{msg.content}{lock}{status}"
+        )
+
+    def _log_system(self, text: str) -> None:
+        self.query_one("#messages", RichLog).write(f"[dim italic]{text}[/dim italic]")
+
+    def _ident_markup(self) -> str:
+        """Build the status-bar ``id:`` fragment for the active transport.
+
+        For anonymous transports (Reticulum) it shows your public display name
+        plus your address; the address is wrapped in a ``@click`` action so a
+        click copies the FULL value to the clipboard. Identity-carrying
+        transports (HF) show the callsign. Returns '' when no active transport.
+        """
+        if self.core is None:
+            return ""
+        t = self._active_transport_obj()
+        if t is None:
+            return ""
+        return f"    id: {self._transport_ident(t)}"
+
+    def _all_idents_markup(self) -> str:
+        """Build an ``id:`` fragment listing *every* transport's identity.
+
+        Used by the Watch panel, which spans all transports, so the operator can
+        see all of their identities at once (callsign on HF, anonymous hash +
+        display name on Reticulum, node name on MeshCore). Each address stays
+        click-to-copy. Falls back to '' when no transports are configured.
+        """
+        if self.core is None:
+            return ""
+        parts = [
+            f"{t.name} {self._transport_ident(t)}" for t in self.core.transports
+        ]
+        if not parts:
+            return ""
+        return "    id: " + "  |  ".join(parts)
+
+    def _transport_ident(self, t: Transport) -> str:
+        """Render one transport's identity as ``name label (sec)`` markup.
+
+        The address/callsign is wrapped in a ``@click`` action so clicking it
+        copies the FULL value to the clipboard.
+        """
+        c = t.capabilities()
+        name = ""
+        if c.carries_operator_identity:
+            full = (self.core.station.callsign or "") if self.core else ""
+            label = full or "(no callsign)"
+        else:
+            full = t.local_identity() or ""
+            # local_identity() returns 'rns:anonymous' before RNS is up.
+            if not full or full.startswith("rns:"):
+                full = ""
+            label = self._short(full) if full else "anonymous"
+            try:
+                name = t.local_display_name()
+            except AttributeError:
+                name = ""
+        sec = "enc" if c.supports_encryption else "plain"
+        if full:
+            # Clickable: copies the full address/callsign to the clipboard.
+            shown = f"[@click=app.copy_address('{full}')][u]{label}[/u][/]"
+        else:
+            shown = label
+        who = f"{name} {shown}" if name else shown
+        return f"{who} ({sec})"
+
+    def _update_status(self) -> None:
+        if self.core is None:
+            return
+        up = ", ".join(self.core.running_transports) or "none up"
+        target = (
+            self._display_id(self.current_target)
+            if self.current_target
+            else "(none)"
+        )
+        mode = self.active_transport or "(none)"
+        # The Watch panel spans every transport, so show all of your
+        # identities there; other views show just the active one.
+        ident_part = (
+            self._all_idents_markup()
+            if self.view == "monitor"
+            else self._ident_markup()
+        )
+        # Announce/traffic tallies intentionally omitted from the status bar:
+        # the same "is the transport hearing the network?" signal lives in the
+        # Health view, which is the single source of truth for reachability.
+        # Favorites-only indicator reflects whichever filter applies to the
+        # current surface (Watch stream vs. the active mode's thread list).
+        fav_on = (
+            (self.view == "monitor" and self._monitor_fav_only)
+            or (self.view in ("active", "nomadnet") and self._active_fav_only)
+        )
+        filt = "    [fav-only]" if fav_on else ""
+        self.query_one("#statusbar", Static).update(
+            f" view: {self.view}    mode: {mode}{ident_part}    target: {target}    "
+            f"up: {up}{filt}"
+        )
+
+def run(config_path: str | None = None) -> None:
+    """Entry point used by the CLI ``radioapp tui`` command."""
+    RadioTUI(config_path).run()

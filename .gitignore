@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.eggs/
+
+# Virtual environments
+.venv/
+venv/
+
+# Test / tooling caches
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# App data
+*.db
+conversations.db
+radio_app.log
+*.log
+
+# IDE
+.idea/
+
+# Local user config (the single source of truth lives outside the repo)
+config.toml
+
+# Stray literal "~" dir (accidental ~/.reticulum holding private identity keys)
+/~/
+
+# Vendored reference clones (symlinked external tools reviewed locally, not part
+# of this repo). No trailing slash so the symlinks themselves are ignored too.
+mercury-src
+pat
+

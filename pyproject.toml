@@ -1,0 +1,73 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "radio-app"
+version = "0.1.0"
+description = "Unified multi-transport messaging over radio, internet and LoRa (Reticulum, JS8Call, MeshCore, Mercury)."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Radio_App contributors" }]
+keywords = ["reticulum", "js8call", "meshcore", "mercury", "lora", "ham-radio", "messaging"]
+
+# Hard dependencies are intentionally minimal. The core + CLI run on the
+# standard library alone; only the Reticulum transport needs third-party code.
+dependencies = [
+    "tomli-w>=1.0",  # write the single TOML config file (tomllib reads, stdlib)
+]
+
+[project.optional-dependencies]
+# Reticulum transport (internet / LoRa / serial) + store-and-forward messaging.
+reticulum = [
+    "rns>=0.7",
+    "lxmf>=0.5",
+]
+# Rich terminal UI (live chat, page browsing).
+tui = [
+    "textual>=0.60",
+]
+# MeshCore transport (license-free ISM LoRa mesh) via a USB-serial or TCP
+# companion device. The 'meshcore' package implements the companion protocol and
+# brings its own serial/BLE backends.
+meshcore = [
+    "meshcore>=2.3,<3",
+]
+# NomadNet page viewing is built-in (read-only micron renderer over Reticulum);
+# it needs no extra packages beyond the 'reticulum' extra. No 'nomadnet'
+# dependency is required to read pages.
+# Developer tooling.
+dev = [
+    "pytest>=8.0",
+    "ruff>=0.4",
+    "mypy>=1.10",
+]
+# Everything.
+all = [
+    "radio-app[reticulum,tui,meshcore]",
+]
+
+[project.scripts]
+radioapp = "radio_app.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/Radio_App"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.ruff]
+line-length = 88
+target-version = "py311"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP", "B"]
+# str+Enum is intentional: members serialize directly to their string value.
+ignore = ["UP042"]
+
+[tool.mypy]
+python_version = "3.11"
+warn_unused_ignores = true
+ignore_missing_imports = true
+
