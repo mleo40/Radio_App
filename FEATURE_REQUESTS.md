@@ -2,6 +2,25 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Interactive Winlink form composer (CLI/TUI)
+
+**Requested:** 2026-06-26
+**Status:** Queued
+**Area:** `cli.py`, `ui/tui.py`, `transports/winlink_transport.py`
+
+The Winlink-forms building blocks exist and are tested — `list_forms()`,
+`update_forms()`, `get_form_template()` and `compose_form()` (which drives Pat's
+browserless build → outbox flow) — but `compose_form()` has **no user entry
+point**: a user can list and update forms but cannot actually fill in and send
+one. Only `winlink forms` / `winlink forms-update` are wired.
+
+**Sketch of work:**
+1. CLI `radioapp winlink compose-form <template> [--field k=v ...] [--to ...]`
+   (or read a JSON/TOML responses file) → calls `compose_form()` and queues it.
+2. TUI: a forms picker + a generated field form (templates expose their fields via
+   `get_form_template()` / the catalog) → submit calls `compose_form()`.
+3. Surface the built `{to, subject, body}` for review before it hits the outbox.
+
 ## Offline NomadNet page cache + "sync favorites now"
 
 **Requested:** 2026-06-26

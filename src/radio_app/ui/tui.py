@@ -187,12 +187,6 @@ class ConfirmEncryptScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "c-yes")
 
 
-class ModeScreen(ModalScreen[str | None]):
-    """Deprecated: the mode menu was replaced by the persistent selector + F3
-    cycling. Kept as a thin stub only to avoid breaking any external imports;
-    no longer used by the app. Safe to delete once nothing references it.
-    """
-
 
 class BrowseScreen(ModalScreen[None]):
     """Read-only NomadNet page viewer with link navigation + history."""

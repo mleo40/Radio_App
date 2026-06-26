@@ -269,10 +269,12 @@ lists RMS gateways, and `winlink connect [CALL]` runs a session.
 
 **Winlink forms.** Standard Winlink forms/templates (ICS-213, check-in, position,
 weather, …) are supported through Pat: `winlink forms-update` downloads the latest
-standard-forms set, `winlink forms` lists the installed templates, and the
-transport's `compose_form()` drives Pat's browserless build flow — it generates
-the `RMS_Express_Form` XML attachment and queues the completed form in the outbox
-for the next session.
+standard-forms set and `winlink forms` lists the installed templates. Filling in
+and sending a form is currently a **programmatic** step — the transport's
+`compose_form()` drives Pat's browserless build flow (it generates the
+`RMS_Express_Form` XML attachment and queues the completed form in the outbox for
+the next session) — but there is **no interactive form composer in the CLI/TUI
+yet** (queued; see [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md)).
 
 Notes:
 - Outbound messages are posted to Pat's **outbox**; with `auto_connect = false`
