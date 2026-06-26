@@ -525,6 +525,8 @@ The router, message model, selection, filtering, persistence and UI are untouche
 - **Desktop GUI** + visual config editor over the same single config file.
 - App-level ACK/retry and message chunking for small-MTU transports.
 
+See [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md) for the queued feature backlog.
+
 ## NomadNet pages (read-only viewing)
 
 View NomadNet pages over your existing Reticulum stack — no extra packages
