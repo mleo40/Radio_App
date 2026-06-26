@@ -47,6 +47,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    Markdown,
     RichLog,
     Static,
 )
@@ -63,6 +64,7 @@ from ..transports.js8call_transport import (
     band_for_freq,
     dial_for_band,
 )
+from .about import ABOUT_MD
 
 
 def _parse_freq_to_hz(text: str) -> int | None:
@@ -316,6 +318,38 @@ class BrowseScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class AboutScreen(ModalScreen[None]):
+    """Hidden "about" easter egg: a scrollable technical overview of the app.
+
+    Undocumented: opened by the Ctrl+G chord (suppressed from the footer) or by
+    typing the magic word ``xyzzy`` into the composer. 73!
+    """
+
+    CSS = """
+    AboutScreen { align: center middle; }
+    #about-box {
+        width: 86%; height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #about-body { height: 1fr; }
+    #about-hint { height: 1; color: $text-muted; text-align: center; }
+    """
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+        ("enter", "close", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="about-box"):
+            with VerticalScroll(id="about-body"):
+                yield Markdown(ABOUT_MD)
+            yield Static("Esc / q to close · 73", id="about-hint")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class RadioTUI(App):
     """The Textual application."""
 
@@ -411,6 +445,9 @@ class RadioTUI(App):
         ("delete", "remove_favorite", "Remove fav"),
         Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
         ("ctrl+r", "refresh", "Refresh"),
+        # Hidden easter egg: technical "about" overview. show=False keeps it out
+        # of the footer; priority lets it fire even while the composer is focused.
+        Binding("ctrl+g", "about", "About", show=False, priority=True),
     ]
 
     def check_action(
@@ -979,6 +1016,16 @@ class RadioTUI(App):
     def action_refresh(self) -> None:
         self._refresh_threads()
         self._update_status()
+
+    def action_about(self) -> None:
+        """Hidden easter egg: show the technical 'about' overview.
+
+        Reachable via the undocumented Ctrl+G chord or the ``xyzzy`` magic word.
+        Guarded so a second press while it's open doesn't stack screens.
+        """
+        if isinstance(self.screen, AboutScreen):
+            return
+        self.push_screen(AboutScreen())
 
     def action_copy_address(self, value: str = "") -> None:
         """Copy a value (e.g. your Reticulum address) to the clipboard.
@@ -3757,6 +3804,11 @@ class RadioTUI(App):
         text = event.value.strip()
         event.input.value = ""
         if not text:
+            return
+        # Hidden easter egg: the classic adventure magic word opens the About
+        # screen instead of sending. (Undocumented; see also the Ctrl+G chord.)
+        if text.lower() == "xyzzy":
+            self.action_about()
             return
         if text.startswith("/"):
             await self._handle_command(text)
