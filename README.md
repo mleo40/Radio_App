@@ -638,6 +638,159 @@ commands `/nodes` and `/browse <hash>` still work from any mode. Inside the
 viewer: type a link number to follow it, enter a new address, `Ctrl+B` back,
 `Ctrl+R` reload, `Esc` to close.
 
+## External app tips
+
+> Radio_App connects to these programs over their existing APIs — it does not
+> install, update, or manage them. These are field tips for common setups, not
+> official documentation.
+
+### Pat (Winlink) — start the HTTP API
+
+Radio_App talks to Pat over its built-in HTTP API. Start Pat in HTTP-server
+mode before launching the app:
+
+```bash
+pat http
+```
+
+By default this listens on `localhost:8080`. To bind to all interfaces (useful
+when Pat runs on a Pi and the app runs on another machine on the same LAN):
+
+```bash
+pat http -a 0.0.0.0:8080
+```
+
+Then set `pat_url` in your config to point at the remote host:
+
+```toml
+[transports.winlink]
+pat_url = "http://192.168.1.x:8080"
+```
+
+Pat's config file lives at `~/.config/pat/config.json` (Linux) or
+`~/Library/Application Support/pat/config.json` (macOS). See
+`pat --help` for full options.
+
+---
+
+### Reticulum — config file location
+
+Reticulum stores its config (interfaces, bandwidth settings, etc.) at:
+
+```
+~/.reticulum/config
+```
+
+This is an INI-style file. `radioapp reticulum setup-rnode` appends an RNode
+interface block to it automatically, but you can also edit it directly to add
+TCP, UDP, or I2P interfaces. The Reticulum daemon is started with:
+
+```bash
+rnsd
+```
+
+Radio_App never starts its own `rnsd` — it attaches to a running shared
+instance over the local socket. If `rnsd` isn't running when the app starts,
+the transport retries in the background and connects the moment it appears.
+
+Full Reticulum documentation: <https://reticulum.network/manual/>
+
+---
+
+### JS8Call — connecting from a remote machine
+
+JS8Call exposes a TCP/JSON API on port 2442 (loopback only by default). If
+JS8Call is running on a different machine (e.g. a Pi connected to the radio),
+you have two options:
+
+**Option 1 — SSH tunnel (recommended, no firewall changes needed):**
+
+```bash
+ssh -L 2442:localhost:2442 user@radio-pi
+```
+
+Leave the tunnel open, then set Radio_App's config to the default
+`127.0.0.1:2442` — traffic goes through the tunnel transparently.
+
+**Option 2 — bind JS8Call's API to the LAN interface:**
+
+In JS8Call: *File → Settings → Reporting → Enable TCP Server* and set the
+bind address to `0.0.0.0` (or the Pi's LAN IP). Then point Radio_App at it:
+
+```toml
+[transports.js8call]
+host = "192.168.1.x"
+port = 2442
+```
+
+The SSH tunnel approach is generally safer — it avoids exposing the
+unauthenticated JS8Call API on the network.
+
+---
+
+## Troubleshooting
+
+### `radioapp: command not found` after `pip install`
+
+pip installs scripts to `~/.local/bin`, which is not on PATH by default on some
+Ubuntu/Debian systems. Add it to your shell profile:
+
+```bash
+echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.bashrc
+source ~/.bashrc
+```
+
+For `zsh` replace `~/.bashrc` with `~/.zshrc`.
+
+---
+
+### `ImportError: cannot import name '_psutil_linux'`
+
+Full error looks like:
+
+```
+ImportError: cannot import name '_psutil_linux' from partially initialized module 'psutil'
+```
+
+This happens when pip resolves the system-installed psutil (built for the
+system Python, e.g. 3.10) but you are running a different Python (e.g. 3.11).
+The C extension `.so` is version-specific and silently mismatches.
+
+**Fix** — force a fresh build for your Python version:
+
+```bash
+pip install --no-binary psutil "psutil>=5.9.1" --user
+```
+
+The version bump (`>=5.9.1`) prevents pip from treating the system package as
+already-satisfied. `--no-binary` compiles from source against your Python
+headers. If the build fails, install the matching dev headers first:
+
+```bash
+# Replace 3.11 with your actual Python version
+sudo apt install python3.11-dev
+```
+
+---
+
+### pip resolves the wrong Python / wrong site-packages
+
+Confirm pip and python3 agree on the same interpreter:
+
+```bash
+python3 --version
+pip --version   # should show the same version and path
+```
+
+If they diverge (e.g. python3 is 3.11 but pip shows 3.10), invoke pip through
+the interpreter explicitly:
+
+```bash
+python3 -m pip install radio-app[all]
+```
+
+---
+
 ## License
 
 This project is licensed under the **MIT License** — see [`LICENSE`](LICENSE).
