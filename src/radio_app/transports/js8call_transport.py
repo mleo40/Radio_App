@@ -384,6 +384,7 @@ class JS8CallTransport(Transport):
             supports_encryption=False,    # prohibited on amateur bands
             supports_delivery_confirmation=False,
             supports_chunking=True,       # router splits long messages into frames
+            supports_position=True,       # STATION.SET_GRID broadcasts Maidenhead locator
             is_realtime=False,            # slow turn-taking
             typical_latency_s=30.0,
             needs_internet=False,
@@ -631,6 +632,18 @@ class JS8CallTransport(Transport):
             log.warning("JS8Call SMS not sent: %s", exc)
             return False
         return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
+
+    async def send_position_beacon(self, position) -> bool:
+        """Update the station grid square in JS8Call via the STATION.SET_GRID API.
+
+        JS8Call includes the grid square in its normal transmissions once set.
+        ``position`` should be a ``core.position.Position`` instance (or any
+        object with a ``.grid`` attribute).
+        """
+        grid = getattr(position, "grid", None)
+        if not grid or not self._running:
+            return False
+        return await self._send_api({"type": "STATION.SET_GRID", "value": grid})
 
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:

@@ -247,4 +247,92 @@ def test_fts_index_built_for_existing_rows(seeded):
         s.close()
 
 
+# -- metadata filter tests (status, snr_min, --date) --------------------------
+
+
+@pytest.fixture()
+def seeded_with_meta(tmp_path, monkeypatch):
+    """A seeded DB where some messages have SNR metadata and different statuses."""
+    db = tmp_path / "meta.db"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[storage]\ndatabase = "{db}"\n')
+    monkeypatch.setenv("RADIO_APP_CONFIG", str(cfg))
+
+    store = MessageStore(db)
+    base = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    msgs = [
+        UnifiedMessage(
+            sender="W1AW", content="good signal",
+            transport="js8call", status=DeliveryStatus.RECEIVED,
+            timestamp=base, metadata={"snr": 5.0},
+        ),
+        UnifiedMessage(
+            sender="KE0XYZ", content="weak signal",
+            transport="js8call", status=DeliveryStatus.RECEIVED,
+            timestamp=base + timedelta(hours=1), metadata={"snr": -8.0},
+        ),
+        UnifiedMessage(
+            sender="N0CALL", content="sent msg",
+            transport="reticulum", status=DeliveryStatus.SENT,
+            timestamp=base + timedelta(hours=2), metadata={},
+        ),
+    ]
+    for m in msgs:
+        store.save(m)
+    store.close()
+    return cfg
+
+
+def test_query_status_filter(seeded_with_meta):
+    s = _store(seeded_with_meta)
+    try:
+        received = s.query(status="received")
+        assert len(received) == 2
+        sent = s.query(status="sent")
+        assert len(sent) == 1 and sent[0].sender == "N0CALL"
+    finally:
+        s.close()
+
+
+def test_query_snr_min_filter(seeded_with_meta):
+    s = _store(seeded_with_meta)
+    try:
+        high = s.query(snr_min=0.0)
+        assert len(high) == 1 and high[0].sender == "W1AW"
+        any_ = s.query(snr_min=-10.0)
+        assert len(any_) == 2
+    finally:
+        s.close()
+
+
+def test_cli_history_status_filter(seeded_with_meta, capsys):
+    assert main(["history", "--status", "sent"]) == 0
+    out = capsys.readouterr().out
+    assert "sent msg" in out
+    assert "good signal" not in out
+
+
+def test_cli_history_snr_min_filter(seeded_with_meta, capsys):
+    assert main(["history", "--snr-min", "0"]) == 0
+    out = capsys.readouterr().out
+    assert "good signal" in out
+    assert "weak signal" not in out
+
+
+def test_cli_history_date_filter(seeded_with_meta, capsys):
+    assert main(["history", "--date", "2026-06-20"]) == 0
+    out = capsys.readouterr().out
+    # All three messages are on 2026-06-20 (different hours)
+    assert "good signal" in out
+
+
+def test_cli_history_bad_date_via_date_flag(seeded_with_meta, capsys):
+    assert main(["history", "--date", "not-a-date"]) == 2
+    assert "YYYY-MM-DD" in capsys.readouterr().err
+
+
+def test_cli_search_status_filter(seeded_with_meta, capsys):
+    assert main(["search", "signal", "--status", "received"]) == 0
+    out = capsys.readouterr().out
+    assert "good signal" in out or "weak signal" in out
 

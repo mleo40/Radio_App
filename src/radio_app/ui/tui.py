@@ -87,7 +87,8 @@ _UNIVERSAL_COMMAND_HELP = (
     "/favorites (F6), /fav add|rm|list|only [<id> [label]], "
     "/mode (cycle, F3), /refresh, /logs, "
     "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
-    "/chats, /name <friendly name>, /close [<id>], /help, /quit"
+    "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
+    "/roster [Nh], /name <friendly name>, /close [<id>], /help, /quit"
 )
 
 # Mode-specific commands, keyed by transport name. /help shows only the active
@@ -956,6 +957,13 @@ class RadioTUI(App):
         # battery + radio params), shown on the Health board. Updated by the
         # same passive probe timer as the reachability dots.
         self._device_telemetry: dict[str, dict] = {}
+        # Time-consensus state: best reading from GPS → local NTP → internet NTP → system.
+        # Updated in _refresh_health (run in a thread); read by _render_system_health.
+        self._time_reading = None  # TimeReading | None
+        self._time_queried: bool = False
+        self._last_time_check: float = -999.0
+        # Cached GPS/config position for the Health board display.
+        self._position = None
         # Last input method seen ("key" or "pointer"), shown as a glyph and used
         # to offer a touch-friendly (larger) layout.
         self._input_mode = "key"
@@ -1204,6 +1212,7 @@ class RadioTUI(App):
         # Passively probe each transport's reachability for the health dots.
         self.set_interval(5.0, self._refresh_health)
         self.call_after_refresh(self._refresh_health)
+        self.set_interval(30.0, self._check_scheduled)
         # Keep the live Logs feed flowing and the status-bar WARN/ERR badge
         # current even when the operator is on another surface.
         self.set_interval(1.0, self._refresh_logs)
@@ -2546,6 +2555,40 @@ class RadioTUI(App):
         health = collect(str(db_path))
         log.write("")
         log.write("[b]System[/b] (host resources)")
+
+        # UTC clock + time-source consensus (GPS → local NTP → internet NTP → system).
+        from datetime import UTC, datetime as _dt
+        ts = _dt.now(UTC).strftime("%H:%M:%S UTC")
+        tr = self._time_reading
+        if tr is not None and tr.offset_ms is not None:
+            off = tr.offset_ms
+            colour = "red" if abs(off) > 1000 else "yellow" if abs(off) > 100 else "green"
+            src_label = {
+                "gps": "GPS",
+                "local_ntp": "local NTP",
+                "ntp": "NTP",
+                "system": "system",
+            }.get(tr.source.value, tr.source.value)
+            sync = f"  [{colour}]{off:+.0f} ms[/{colour}]  [dim]({src_label})[/dim]"
+        elif tr is not None and tr.error:
+            sync = f"  [dim]({tr.error})[/dim]"
+        elif self._time_queried:
+            sync = "  [dim](all time sources unavailable)[/dim]"
+        else:
+            sync = "  [dim](checking…)[/dim]"
+        log.write(f"  time  : {ts}{sync}")
+
+        # Position display — from config [position] or a cached GPS reading.
+        pos = self._position
+        if pos is None and self.core is not None:
+            from ..core.position import position_from_config
+            pos = position_from_config(self.core.config)
+        if pos is not None:
+            source_tag = f"[dim]({pos.source})[/dim]"
+            log.write(
+                f"  pos   : {pos.lat:+.4f}°  {pos.lon:+.4f}°  "
+                f"grid [b]{pos.grid}[/b]  {source_tag}"
+            )
 
         cpu_bits: list[str] = []
         if health.cpu_percent is not None:
@@ -4477,9 +4520,71 @@ class RadioTUI(App):
             self._health["nomadnet"] = self._health["reticulum"]
         else:
             self._health["nomadnet"] = ReachabilityStatus.NOT_APPLICABLE
+
+        # Time consensus check — GPS → local NTP → internet NTP → system.
+        # At most every 60 s; run in a thread to avoid blocking the event loop.
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        now_mono = loop.time()
+        if now_mono - self._last_time_check >= 60.0:
+            self._last_time_check = now_mono
+            try:
+                from ..core.timesource import TimeConsensus
+                pos_cfg = self.core.config.data.get("position", {}) if self.core else {}
+                tc = TimeConsensus(
+                    gpsd_host=pos_cfg.get("gpsd_host", "127.0.0.1"),
+                    gpsd_port=int(pos_cfg.get("gpsd_port", 2947)),
+                    timeout=1.5,
+                )
+                self._time_reading = await _asyncio.wait_for(
+                    loop.run_in_executor(None, tc.best_reading),
+                    timeout=5.0,
+                )
+                self._time_queried = True
+            except Exception:  # noqa: BLE001 - never crash the health probe
+                self._time_reading = None
+                self._time_queried = True
+
+        # GPS position refresh — only when gpsd is explicitly enabled in config.
+        if (
+            self.core is not None
+            and self.core.config.data.get("position", {}).get("gpsd_enabled", False)
+        ):
+            try:
+                from ..core.position import GPSReader
+                gpsd_host = self.core.config.position.get("gpsd_host", "127.0.0.1")
+                gpsd_port = int(self.core.config.position.get("gpsd_port", 2947))
+                reader = GPSReader(host=gpsd_host, port=gpsd_port, timeout=3.0)
+                self._position = await _asyncio.wait_for(
+                    loop.run_in_executor(None, reader.read),
+                    timeout=4.0,
+                )
+            except Exception:  # noqa: BLE001 - GPS failure must never crash health probe
+                pass
+
         self._update_modebar()
         if self.view == "health":
             self._render_health()
+
+    @work(exclusive=True)
+    async def _check_scheduled(self) -> None:
+        """Fire any messages whose scheduled send time has arrived."""
+        if self.core is None:
+            return
+        from datetime import UTC, datetime
+        now = datetime.now(UTC)
+        try:
+            pending = self.core.store.schedule_pending(up_to=now)
+        except Exception:  # noqa: BLE001
+            return
+        for entry in pending:
+            ok = await self.core.router.send(
+                entry.message, force_transport=entry.transport
+            )
+            self.core.store.schedule_mark_sent(entry.id, success=ok)
+            status_str = "sent" if ok else "[red]FAILED[/red]"
+            preview = entry.message.content[:40]
+            self._log_system(f"Scheduled message {status_str}: {preview!r}")
 
     # -- input-mode detection -------------------------------------------------
     def _note_input(self, mode: str) -> None:
@@ -5112,6 +5217,156 @@ class RadioTUI(App):
             "rm <id> | only | groups"
         )
 
+    def _handle_tmpl_command(self, arg: str) -> None:
+        """List templates or load one into the composer for review before sending."""
+        if self.core is None:
+            return
+        from ..core.templates import Templates
+        tmpls = Templates.from_config(self.core.config)
+        if not arg or arg.strip().lower() == "list":
+            names = tmpls.names()
+            if not names:
+                self._log_system(
+                    "No templates. Add [templates] to config.toml, e.g.:\n"
+                    '  welfare = "Welfare check — all OK"'
+                )
+            else:
+                self._log_system("Templates: " + "  ".join(f"[b]{n}[/b]" for n in names))
+            return
+        text = tmpls.get(arg.strip())
+        if text is None:
+            names = tmpls.names()
+            hint = ", ".join(names) if names else "(none configured)"
+            self._log_system(f"Template '{arg}' not found. Available: {hint}")
+            return
+        try:
+            from textual.widgets import Input
+            composer = self.query_one("#composer", Input)
+            composer.value = text
+            composer.focus()
+        except Exception:  # noqa: BLE001 - not fatal if composer unavailable
+            self._log_system(f"Template text: {text}")
+
+    def _handle_bands_command(self, arg: str) -> None:
+        """Show the offline band-plan / EmComm frequency reference."""
+        from ..core.bandplan import format_mhz, lookup
+        band = arg.strip().lower() or None
+        entries = lookup(band=band, region="US")
+        if not entries:
+            self._log_system(
+                f"No band-plan entries{f' for {band}' if band else ''}."
+            )
+            return
+        lines = [f"[b]Band plan{f' — {band}' if band else ''}:[/b]"]
+        current_band = None
+        for e in entries:
+            if e.band != current_band:
+                lines.append(f"  [b]{e.band}[/b]")
+                current_band = e.band
+            freq = format_mhz(e.freq_khz)
+            tp = f" [{e.transport}]" if e.transport else ""
+            lines.append(f"    {freq:<14} {e.mode:<6}{tp}  {e.notes}")
+        self._log_system("\n".join(lines))
+
+    def _handle_sched_command(self, arg: str) -> None:
+        """Schedule current composer text (or given text) for a future send.
+
+        Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
+        """
+        from datetime import UTC, datetime, timedelta
+        from ..core.message import UnifiedMessage
+
+        parts = arg.strip().split(None, 1)
+        if not parts:
+            self._log_system("Usage: /sched +30m | HH:MM [text]")
+            return
+        time_spec = parts[0]
+        text_override = parts[1] if len(parts) > 1 else None
+
+        now = datetime.now(UTC)
+        try:
+            if time_spec.startswith("+"):
+                raw = time_spec[1:].lower()
+                if "h" in raw and "m" in raw:
+                    h_part, rest = raw.split("h")
+                    mins = int(h_part) * 60 + int(rest.rstrip("m"))
+                elif "h" in raw:
+                    mins = int(raw.rstrip("h")) * 60
+                else:
+                    mins = int(raw.rstrip("m"))
+                fire_at = now + timedelta(minutes=mins)
+            else:
+                hh, mm = time_spec.split(":")
+                fire_at = now.replace(
+                    hour=int(hh), minute=int(mm), second=0, microsecond=0
+                )
+                if fire_at <= now:
+                    fire_at += timedelta(days=1)
+        except (ValueError, AttributeError):
+            self._log_system("Invalid time. Use: /sched +30m  or  /sched 19:00")
+            return
+
+        if text_override:
+            content = text_override
+        else:
+            try:
+                from textual.widgets import Input as _Input
+                composer = self.query_one("#composer", _Input)
+                content = composer.value.strip()
+            except Exception:  # noqa: BLE001
+                content = ""
+        if not content:
+            self._log_system(
+                "/sched: no message text. Type a message or use /sched 19:00 text"
+            )
+            return
+
+        if self.core is None:
+            return
+
+        thread = getattr(self, "_active_thread", None) or getattr(self, "_watch_thread", None)
+        name = (self.core.station.callsign if self.core.station else None) or "unknown"
+        if thread and thread.startswith("@"):
+            msg = UnifiedMessage.to_group(name, thread[1:], content)
+        elif thread:
+            msg = UnifiedMessage.direct(name, thread, content)
+        else:
+            self._log_system(
+                "/sched: no active thread — navigate to a conversation first"
+            )
+            return
+
+        self.core.store.schedule_add(msg, fire_at)
+        ts = fire_at.strftime("%H:%M UTC")
+        self._log_system(f"Message scheduled for {ts}: {content[:40]!r}")
+
+    def _handle_roster_command(self, arg: str) -> None:
+        """Show the presence roster (recently-heard callsigns)."""
+        from datetime import UTC, datetime, timedelta
+        from ..core.roster import get_roster
+
+        if self.core is None:
+            return
+
+        raw = arg.strip().lower().rstrip("h") if arg.strip() else "24"
+        try:
+            hours = int(raw)
+        except ValueError:
+            hours = 24
+        since = datetime.now(UTC) - timedelta(hours=hours)
+        entries = get_roster(self.core.store, since=since, limit=30)
+        if not entries:
+            self._log_system(f"Roster: no stations heard in the last {hours}h.")
+            return
+        lines = [f"[b]Roster — last {hours}h:[/b]  {len(entries)} station(s)"]
+        for e in entries:
+            ts = e.last_seen.strftime("%m-%d %H:%M")
+            snr = f" SNR {e.last_snr:+.0f}" if e.last_snr is not None else ""
+            lines.append(
+                f"  [b]{e.callsign}[/b]  {e.transport}  {ts}{snr}  ×{e.message_count}"
+            )
+        self._log_system("\n".join(lines))
+
     def _handle_browse_command(self, arg: str) -> None:
         """Open the NomadNet page viewer: /browse <hash>[:/page/x.mu]."""
         if self.core is None:
@@ -5582,6 +5837,14 @@ class RadioTUI(App):
             self._set_winlink_gateway(arg)
         elif cmd == "/gateways":
             self._winlink_list_gateways()
+        elif cmd in ("/tmpl", "/template"):
+            self._handle_tmpl_command(arg)
+        elif cmd == "/bands":
+            self._handle_bands_command(arg)
+        elif cmd == "/sched":
+            self._handle_sched_command(arg)
+        elif cmd == "/roster":
+            self._handle_roster_command(arg)
         else:
             self._log_system(f"unknown command: {cmd}")
 

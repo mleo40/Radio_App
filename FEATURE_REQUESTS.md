@@ -2,6 +2,151 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Presence roster — recently-heard callsigns across all transports
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/roster.py`, `cli.py`, `ui/tui.py`
+
+A unified "who's been heard recently" board derived from the message store — no
+extra state, no new persistent table. Each entry groups by (callsign, transport)
+pair and shows last-seen time, last SNR, message count, and a content preview.
+
+**Delivered:**
+1. ✅ **`core/roster.py`** — `PresenceEntry` dataclass + `get_roster(store, since, transport, limit)` implemented as a single SQL aggregation query (correlated subqueries pull last SNR and last content per pair). Defaults to a 24-hour lookback.
+2. ✅ **CLI** — `radioapp roster [--transport js8call] [--since 48h] [--limit N]` prints a formatted table (callsign / transport / last seen / SNR / count / preview).
+3. ✅ **TUI** — `/roster [Nh]` dumps the roster to the log pane with Rich formatting.
+
+---
+
+## Scheduled / windowed message send
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/store.py`, `cli.py`, `ui/tui.py`
+
+Queue messages to fire at a specific time or after a delay — useful for net
+windows, propagation forecasts, and low-power deferred sends. Backed by a new
+`scheduled_messages` SQLite table so schedules survive app restarts.
+
+**Delivered:**
+1. ✅ **`scheduled_messages` table** in `store.py` — `ScheduledEntry` dataclass; `schedule_add`, `schedule_pending`, `schedule_cancel`, `schedule_mark_sent` methods.
+2. ✅ **CLI** — `radioapp schedule add --delay 30m|1h --to CALL|--group TTP "text"` and `--at HH:MM|ISO`. `radioapp schedule list` / `radioapp schedule cancel <id>`.
+3. ✅ **TUI** — `_check_scheduled` worker fires every 30 seconds via `set_interval`; `/sched +30m [text]` or `/sched HH:MM [text]` schedules from the composer or inline text.
+
+---
+
+## Offline band-plan / EmComm frequency reference
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/bandplan.py`, `cli.py`, `ui/tui.py`
+
+An offline, no-dependency frequency reference covering JS8Call calling
+frequencies (11 bands), common US EmComm/ARES/RACES simplex and net frequencies,
+and select Winlink P2P/RMS spot frequencies.
+
+**Delivered:**
+1. ✅ **`core/bandplan.py`** — `FrequencyEntry` frozen dataclass + `ALL_ENTRIES` static table + `lookup(band, mode, region, transport)` with AND-combined filters + `format_mhz()` helper.
+2. ✅ **CLI** — `radioapp bands [--band 40m] [--mode JS8] [--region US|INTL] [--transport winlink]`.
+3. ✅ **TUI** — `/bands [band]` prints a formatted table to the log pane.
+
+---
+
+## Host battery / power awareness
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/power.py`, `ui/tui.py`, `config.py`
+
+Surface host battery state on the Health board — critical for field/portable
+operation on a laptop or Pi with a UPS HAT.
+
+**Delivered:**
+1. ✅ **`core/power.py`** — `BatteryReading` dataclass + `read_battery()` reading `/sys/class/power_supply/` sysfs (no `psutil` dep). Reads `capacity`, `status`, `energy_now/power_now` (with `charge_now/current_now` fallback for drivers that report charge instead of energy). Fails gracefully when no battery is present.
+2. ✅ **Health board** — battery percent + charging state + estimated runtime shown with threshold colouring (`warn_threshold` from `[power]` config, default 20%).
+
+---
+
+## Time consensus — multi-source UTC clock (GPS/chrony/NTP)
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/timesource.py`, `ui/tui.py`, `cli.py`
+
+Accurate UTC is critical for HF digital modes (JS8Call uses strict 15-second
+framing windows). Instead of a single internet-NTP check, the app now tries
+time sources in priority order and reports the best available offset.
+
+**Priority chain:** GPS (gpsd) → local chrony/ntpd daemon → internet NTP → system clock.
+
+Radio_App **never starts or manages** gpsd or chrony — it only polls daemons
+already running on the host.
+
+**Delivered:**
+1. ✅ **`query_gpsd_time(host, port, timeout)`** — connects to an already-running gpsd instance, reads the first TPV object with mode ≥ 2, extracts the GPS-disciplined `time` field (±100 ns from atomic clock), and returns the local clock offset in ms.
+2. ✅ **`query_chronyc(timeout)`** — runs `chronyc tracking` as a subprocess (≈20 ms), parses the `System time: X seconds fast/slow` line. Works grid-down if chrony was previously GPS-disciplined and is in holdover.
+3. ✅ **`query_ntpd(timeout)`** — runs `ntpq -c rv`, parses the `offset=` field (ms). Fallback when chronyc is not installed.
+4. ✅ **`TimeConsensus` class** — `best_reading() -> TimeReading` tries sources in order, returns immediately on first success. `skip_gps/skip_local_ntp/skip_internet_ntp` flags for testing and explicit overrides. `TimeSourceKind` extended with `GPS` and `LOCAL_NTP` variants.
+5. ✅ **Health board** — time line now shows source label: `GPS`, `local NTP`, `NTP`, or `system`; colour-coded offset (green < 100 ms / yellow < 1 s / red ≥ 1 s). Refreshed every 60 s inside `_refresh_health`.
+6. ✅ **`radioapp time`** — prints best available offset and which source was used.
+
+---
+
+## Position beacon + GPS (Maidenhead grid)
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/position.py`, `transports/base.py`, `transports/js8call_transport.py`, `cli.py`, `ui/tui.py`, `config.py`
+
+Situational awareness: show the station's position and grid square; send grid
+beacons on supporting transports. JS8Call includes the grid square in its
+transmissions once set; this wires that up automatically.
+
+**Delivered:**
+1. ✅ **`core/position.py`** — `Position` dataclass (auto-computes Maidenhead grid), `lat_lon_to_grid(lat, lon, precision=4|6)` pure WGS-84 converter, `GPSReader` (gpsd JSON socket API, returns `Position` with mode ≥ 2), `position_from_config(cfg)`.
+2. ✅ **`TransportCapabilities.supports_position`** — new flag; JS8Call sets it `True`.
+3. ✅ **JS8Call `send_position_beacon(position)`** — calls `STATION.SET_GRID` via the TCP/JSON API.
+4. ✅ **Health board** — shows lat/lon/grid when position is known (config or GPS cache).
+5. ✅ **CLI** — `radioapp position [--gps] [--beacon]`.
+
+---
+
+## Canned / template messages
+
+**Requested:** 2026-06-27
+**Status:** Done
+**Area:** `core/templates.py`, `cli.py`, `ui/tui.py`, `config.py`
+
+Quick-send pre-canned phrases without retyping them. Configured in `[templates]`
+in `config.toml` as `name = "text"` pairs.
+
+**Delivered:**
+1. ✅ **`core/templates.py`** — `Templates` class loading from `[templates]` config section.
+2. ✅ **CLI** — `radioapp templates` (list) / `radioapp templates send <name> --to CALL|--group TTP`.
+3. ✅ **TUI** — `/tmpl [<name>]` lists templates or loads one into the composer for review before sending.
+
+---
+
+## Message export
+
+**Requested:** 2026-06-26
+**Status:** Done
+**Area:** `cli.py`, `core/store.py`
+
+Export conversation history to standard formats for archiving, handoff, or
+post-incident review.
+
+**Delivered:**
+1. ✅ **`radioapp export --thread <key>|--all --format txt|json|md|maildir [--out path]`**
+   - `txt` — one line per message with timestamp, sender, content; `--all` annotates thread
+   - `json` — JSON array of `to_dict()` objects
+   - `md` — `# thread` heading, `## YYYY-MM-DD` date groups, bold sender
+   - `maildir` — RFC-2822 messages in `new/cur/tmp/` with `X-RadioApp-Transport/Thread/Status` headers; `--out` required
+2. ✅ **Richer `store.query()` filters** — `status: str | None` (exact match) and `snr_min: float | None` (JSON metadata extract); surfaced as `--status`, `--snr-min`, `--date` on both `history` and `search`.
+
+---
+
 ## Cross-mode group aggregation (incoming) — operator-declared membership
 
 **Requested:** 2026-06-26
@@ -211,10 +356,8 @@ read/query feature, not a data-model change.
    snippet, Enter opens the conversation (switching to its mode), Esc restores
    the prior surface. The cross-mode "All chats" archive view + lazy scroll-back
    remain a later polish item.
-4. **Richer filters** — query by captured `metadata` (SNR, hops, frequency,
-   delivery status), date-bucketed "jump to date", per-contact stats.
-5. **Export/backup** — `radioapp export --thread <key> --format {json,txt,md,
-   maildir}` and a global `export --all`.
+4. ✅ **Richer filters** — `--status`, `--snr-min`, `--date` on `history` and `search`; `store.query()` accepts `status` and `snr_min` params with SQL JSON extract for SNR.
+5. ✅ **Export** — `radioapp export --thread <key>|--all --format txt|json|md|maildir [--out path]`.
 6. **Retention/housekeeping** — optional age/size-based pruning, per-thread
    "keep forever" pins, and VACUUM so history doesn't bloat small devices.
 

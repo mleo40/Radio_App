@@ -81,6 +81,9 @@ class TransportCapabilities:
     #: (Winlink multipart email; Reticulum LXMF file fields). Drives whether the
     #: TUI offers its ``/attach`` affordance for the active mode.
     supports_attachments: bool = False
+    #: Whether this transport can send position/grid-square beacons (JS8Call
+    #: supports STATION.SET_GRID to broadcast the operator's Maidenhead locator).
+    supports_position: bool = False
     is_realtime: bool = False            # suitable for live keyboard chat?
     typical_latency_s: float = 30.0
     needs_internet: bool = False         # excluded when off-grid

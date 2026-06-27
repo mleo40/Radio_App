@@ -7,12 +7,16 @@ so to the user it doesn't matter whether a message travelled via **Reticulum**
 (license-free ISM LoRa mesh), **Winlink** (store-and-forward email over radio,
 via Pat), or the **Mercury** HF modem.
 
-> Status: **working core + transports**. The core (unified message model, router,
-> best-transport selection, group handling, inbound filtering, SQLite persistence,
-> config, CLI, Textual TUI) is implemented and tested. The **Reticulum**,
-> **JS8Call**, **MeshCore** and **Winlink** transports are functional; the
-> **Mercury** adapter still has its wire-level translation marked `TODO`. The app
-> runs and the whole suite is testable without any radio hardware.
+> Status: **working core + transports + field utilities**. The core (unified
+> message model, router, best-transport selection, group handling, inbound
+> filtering, SQLite persistence with FTS5, config, CLI, Textual TUI) is
+> implemented and tested. The **Reticulum**, **JS8Call**, **MeshCore** and
+> **Winlink** transports are functional; the **Mercury** adapter still has its
+> wire-level translation marked `TODO`. A full suite of **field/EmComm utilities**
+> is now built in: message export, canned templates, UTC time widget with
+> multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
+> awareness, offline band-plan, scheduled sends, and a presence roster. 659 tests
+> pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 
@@ -89,7 +93,13 @@ src/radio_app/
 │   ├── router.py          # outbound selection/fallback, inbound dedup/filter/store
 │   ├── groups.py          # Group + GroupRegistry (@TTP, subscriptions)
 │   ├── filters.py         # inbound filter rule engine
-│   └── store.py           # SQLite persistence
+│   ├── store.py           # SQLite persistence + FTS5 search + scheduled messages
+│   ├── templates.py       # canned message templates ([templates] config section)
+│   ├── timesource.py      # UTC clock + time consensus (GPS/chrony/NTP priority chain)
+│   ├── position.py        # GPS position, Maidenhead grid, GPSReader (gpsd)
+│   ├── power.py           # host battery state (Linux sysfs)
+│   ├── bandplan.py        # offline band-plan + EmComm frequency reference
+│   └── roster.py          # presence roster (recently-heard callsigns, SQL-derived)
 ├── ui/                    # Textual TUI (single pane of glass)
 └── transports/
     ├── base.py            # Transport ABC + TransportCapabilities + auto-registry
@@ -370,6 +380,36 @@ radioapp js8 inbox                # list JS8Call's store-and-forward inbox
 radioapp js8 cmd W1AW SNR?        # send a directed command to a station
 radioapp js8 relay W1AW "qsy 40m" # leave a store-and-forward message for W1AW
 radioapp send --to N0CALL --mode secure --encrypt "x"  # guarded on HF
+
+# Message history & export
+radioapp history [--thread @TTP] [--mode js8call] [--status received] [--snr-min 5] [--date 2026-06-27]
+radioapp search "checking in" [--status received] [--snr-min 0]
+radioapp export --thread @TTP --format md --out history.md
+radioapp export --all --format maildir --out ~/radio_archive
+
+# Templates
+radioapp templates                        # list canned templates
+radioapp templates send welfare --to W1AW # send a named template
+
+# Time & position
+radioapp time                             # UTC + best available clock offset (GPS/chrony/NTP)
+radioapp position                         # show position from config
+radioapp position --gps                   # query gpsd for a live fix
+radioapp position --gps --beacon          # send grid beacon on all supporting transports
+
+# Field reference
+radioapp bands --band 40m                 # EmComm + JS8Call freqs for 40m
+radioapp bands --mode JS8                 # all JS8Call calling frequencies
+
+# Scheduled sends
+radioapp schedule add --delay 30m --to W1AW "Net check-in"
+radioapp schedule add --at 19:00 --group TTP "Net starting now"
+radioapp schedule list
+radioapp schedule cancel <id>
+
+# Presence roster
+radioapp roster                           # who's been heard in the last 24h
+radioapp roster --transport js8call --since 48h
 ```
 
 Run via the installed `radioapp` script or `python -m radio_app`.
@@ -441,7 +481,10 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   **● up · ○ down · · n/a · ◌ unknown**. For **Reticulum** the board adds
   per-interface RNS/RNode telemetry; for **MeshCore** it adds the companion's
   **battery** and **LoRa radio parameters** (frequency / bandwidth / SF / CR /
-  TX power).
+  TX power). The **System** section additionally shows: UTC time with
+  clock-offset from the best available source (GPS via gpsd → local
+  chrony/ntpd daemon → internet NTP), the station's Maidenhead grid position,
+  and host battery level with estimated runtime.
 - **Favorites (recall):** press **F5** to cycle into it (Watch → Health →
   Favorites) for a saved list of **NomadNet servers, callsigns, JS8Call groups,
   MeshCore channels, MeshCore contacts and hashes**, grouped by type. Add entries
@@ -496,6 +539,10 @@ In-composer commands:
 | `/fav add [type] <id> [label]` | add a favorite (`type` = `node\|peer\|call\|group\|channel\|contact`) |
 | `/fav here [label]` | favorite the **open conversation** (MeshCore channel by `#name`, contact by pubkey) |
 | `/fav list` / `/fav rm <id>` / `/fav only` | list favorites / remove one / toggle the favorites-only filter |
+| `/tmpl [<name>]` | list canned templates or load one into the composer |
+| `/sched +30m\|HH:MM [text]` | schedule composer content (or inline text) for later send |
+| `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
+| `/bands [band]` | show offline band-plan / EmComm frequencies |
 | `/freq` / `/freq <MHz\|Hz>` | (JS8Call) show / set the radio dial frequency |
 | `/band` / `/band <name>` | (JS8Call) list bands / switch band (e.g. `/band 20m`) |
 | `/subject <text>` | (Winlink) set the subject for the next message |
@@ -561,6 +608,9 @@ The router, message model, selection, filtering, persistence and UI are untouche
 - **Desktop GUI** + visual config editor over the same single config file.
   See [`docs/gui_mockup.svg`](docs/gui_mockup.svg) for an early concept mockup
   (illustrative only — not yet implemented).
+
+Field/EmComm utilities now built in — see *CLI usage* above for `export`,
+`templates`, `time`, `position`, `bands`, `schedule`, and `roster`.
 
 See [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md) for the queued feature backlog.
 

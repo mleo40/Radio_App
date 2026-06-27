@@ -15,6 +15,19 @@ from pathlib import Path
 
 from .message import DeliveryStatus, UnifiedMessage
 
+_SCHEDULED_SCHEMA = """
+CREATE TABLE IF NOT EXISTS scheduled_messages (
+    id          TEXT PRIMARY KEY,
+    fire_at     TEXT NOT NULL,
+    msg_json    TEXT NOT NULL,
+    transport   TEXT,
+    status      TEXT NOT NULL DEFAULT 'pending',
+    created_at  TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_sched_fire_at ON scheduled_messages(fire_at)
+    WHERE status = 'pending';
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     msg_id        TEXT PRIMARY KEY,
@@ -67,6 +80,16 @@ SNIPPET_OPEN = "\x01"
 SNIPPET_CLOSE = "\x02"
 
 
+@dataclass
+class ScheduledEntry:
+    """A message queued for future transmission."""
+
+    id: str
+    fire_at: datetime
+    message: UnifiedMessage
+    transport: str | None
+
+
 @dataclass(frozen=True)
 class SearchHit:
     """A ranked search result: the message, a highlighted snippet, its thread."""
@@ -98,6 +121,7 @@ class MessageStore:
         self._conn = sqlite3.connect(self.path, detect_types=0)
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
+        self._conn.executescript(_SCHEDULED_SCHEMA)
         self._conn.commit()
         self._init_fts()
 
@@ -316,6 +340,8 @@ class MessageStore:
         text: str | None = None,
         since: datetime | None = None,
         until: datetime | None = None,
+        status: str | None = None,
+        snr_min: float | None = None,
         limit: int = 200,
         newest_first: bool = True,
     ) -> list[UnifiedMessage]:
@@ -326,6 +352,10 @@ class MessageStore:
         ``@``). ``since``/``until`` bound the message timestamp (inclusive) — the
         stored ISO-8601 UTC strings sort chronologically, so plain comparison is
         correct.
+
+        ``status`` filters by delivery status string (e.g. "received", "sent").
+        ``snr_min`` filters by SNR value stored in metadata (JS8Call-style),
+        keeping only messages where ``metadata.snr >= snr_min``.
 
         ``limit`` always bounds the *most recent* matches (newest N); pass
         ``newest_first=False`` to return those N oldest-first for a
@@ -354,6 +384,12 @@ class MessageStore:
         if until is not None:
             clauses.append("timestamp <= ?")
             params.append(until.isoformat())
+        if status:
+            clauses.append("status = ?")
+            params.append(status)
+        if snr_min is not None:
+            clauses.append("CAST(json_extract(metadata, '$.snr') AS REAL) >= ?")
+            params.append(snr_min)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, limit))
         rows = self._conn.execute(
@@ -601,3 +637,68 @@ class MessageStore:
                 "timestamp": row["timestamp"],
             }
         )
+
+    # -- scheduled messages ---------------------------------------------------
+
+    def schedule_add(
+        self,
+        msg: UnifiedMessage,
+        fire_at: datetime,
+        transport: str | None = None,
+    ) -> str:
+        """Persist a scheduled message; return its id."""
+        self._conn.execute(
+            "INSERT INTO scheduled_messages (id, fire_at, msg_json, transport, created_at) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (
+                msg.msg_id,
+                fire_at.isoformat(),
+                json.dumps(msg.to_dict()),
+                transport,
+                datetime.now(UTC).isoformat(),
+            ),
+        )
+        self._conn.commit()
+        return msg.msg_id
+
+    def schedule_pending(self, up_to: datetime | None = None) -> list[ScheduledEntry]:
+        """Return pending scheduled messages, optionally only those due by ``up_to``."""
+        clause = "status = 'pending'"
+        params: list = []
+        if up_to is not None:
+            clause += " AND fire_at <= ?"
+            params.append(up_to.isoformat())
+        rows = self._conn.execute(
+            f"SELECT id, fire_at, msg_json, transport FROM scheduled_messages "
+            f"WHERE {clause} ORDER BY fire_at",
+            params,
+        ).fetchall()
+        result = []
+        for row in rows:
+            msg = UnifiedMessage.from_dict(json.loads(row[2]))
+            result.append(ScheduledEntry(
+                id=row[0],
+                fire_at=datetime.fromisoformat(row[1]),
+                message=msg,
+                transport=row[3],
+            ))
+        return result
+
+    def schedule_cancel(self, entry_id: str) -> bool:
+        """Mark a pending scheduled message as cancelled. Returns True if found."""
+        cur = self._conn.execute(
+            "UPDATE scheduled_messages SET status='cancelled' "
+            "WHERE id=? AND status='pending'",
+            (entry_id,),
+        )
+        self._conn.commit()
+        return cur.rowcount > 0
+
+    def schedule_mark_sent(self, entry_id: str, *, success: bool) -> None:
+        """Update a scheduled message's status after a send attempt."""
+        status = "sent" if success else "failed"
+        self._conn.execute(
+            "UPDATE scheduled_messages SET status=? WHERE id=?",
+            (status, entry_id),
+        )
+        self._conn.commit()

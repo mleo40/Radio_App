@@ -68,6 +68,11 @@ _DEFAULTS: dict[str, Any] = {
     "groups": {},
     "subscriptions": {"groups": [], "show_unsubscribed": False},
     "filters": [],
+    "templates": {},
+    "position": {},
+    "power": {
+        "warn_threshold": 20,  # percent; show red below this level
+    },
     "ui": {
         # Textual theme/palette selected from the command palette, persisted here.
         "theme": "",
@@ -164,6 +169,15 @@ class Config:
     @property
     def ui(self) -> dict[str, Any]:
         return self._data.get("ui", {})
+
+    @property
+    def templates(self) -> dict[str, str]:
+        raw = self._data.get("templates", {})
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    @property
+    def position(self) -> dict:
+        return self._data.get("position", {})
 
     @property
     def display_name(self) -> str:

@@ -95,6 +95,23 @@ def _build_parser() -> argparse.ArgumentParser:
         "--limit", type=int, default=200, help="max messages (most recent)"
     )
     p_history.add_argument(
+        "--status",
+        choices=["pending", "sent", "delivered", "failed", "received"],
+        help="only messages with this delivery status",
+    )
+    p_history.add_argument(
+        "--snr-min",
+        type=float,
+        dest="snr_min",
+        metavar="N",
+        help="only messages with SNR >= N (JS8Call metadata)",
+    )
+    p_history.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        help="shorthand for --since/--until covering one whole day",
+    )
+    p_history.add_argument(
         "--format", choices=["text", "json"], default="text"
     )
     p_history.set_defaults(func=_cmd_history)
@@ -112,9 +129,61 @@ def _build_parser() -> argparse.ArgumentParser:
     p_search.add_argument("--until", help="on/before this date (YYYY-MM-DD or ISO)")
     p_search.add_argument("--limit", type=int, default=100)
     p_search.add_argument(
+        "--status",
+        choices=["pending", "sent", "delivered", "failed", "received"],
+        help="only messages with this delivery status",
+    )
+    p_search.add_argument(
+        "--snr-min",
+        type=float,
+        dest="snr_min",
+        metavar="N",
+        help="only messages with SNR >= N (JS8Call metadata)",
+    )
+    p_search.add_argument(
+        "--date",
+        metavar="YYYY-MM-DD",
+        help="shorthand for --since/--until covering one whole day",
+    )
+    p_search.add_argument(
         "--format", choices=["text", "json"], default="text"
     )
     p_search.set_defaults(func=_cmd_search)
+
+    p_export = sub.add_parser(
+        "export", help="export conversation history to json, txt, md or maildir"
+    )
+    export_target = p_export.add_mutually_exclusive_group(required=True)
+    export_target.add_argument(
+        "--thread", help="export a single thread, e.g. @TTP or a callsign"
+    )
+    export_target.add_argument(
+        "--all", action="store_true", help="export every stored thread"
+    )
+    p_export.add_argument(
+        "--format",
+        choices=["json", "txt", "md", "maildir"],
+        default="txt",
+        help="output format (default: txt)",
+    )
+    p_export.add_argument(
+        "--out",
+        help="output file path (json/txt/md) or directory (maildir); "
+        "default: stdout for text formats",
+    )
+    p_export.set_defaults(func=_cmd_export)
+
+    p_tmpl = sub.add_parser("templates", help="list or send canned message templates")
+    p_tmpl.add_argument(
+        "action", choices=["list", "send"], nargs="?", default="list",
+        help="list: show all templates; send: transmit a named template",
+    )
+    p_tmpl.add_argument("name", nargs="?", help="template name for 'send'")
+    tmpl_target = p_tmpl.add_mutually_exclusive_group()
+    tmpl_target.add_argument("--to", help="recipient identity/callsign")
+    tmpl_target.add_argument("--group", help="group name, e.g. TTP")
+    p_tmpl.add_argument("--transport", help="force a specific transport")
+    p_tmpl.set_defaults(func=_cmd_templates)
 
     p_listen = sub.add_parser("listen", help="stream incoming messages to stdout")
     p_listen.add_argument("--group", help="only show this group")
@@ -370,6 +439,64 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_nomad.set_defaults(func=_cmd_nomad)
 
+    p_pos = sub.add_parser("position", help="show current position (GPS or config)")
+    p_pos.add_argument(
+        "--gps",
+        action="store_true",
+        help="query gpsd for a live fix (requires gpsd running)",
+    )
+    p_pos.add_argument(
+        "--beacon",
+        action="store_true",
+        help="send a position beacon on all supporting transports",
+    )
+    p_pos.set_defaults(func=_cmd_position)
+
+    p_time = sub.add_parser("time", help="show current UTC and NTP clock offset")
+    p_time.set_defaults(func=_cmd_time)
+
+    p_bands = sub.add_parser("bands", help="offline band-plan and EmComm frequency reference")
+    p_bands.add_argument("--band", metavar="BAND", help="filter by band, e.g. 40m")
+    p_bands.add_argument("--mode", metavar="MODE", help="filter by mode: JS8, SSB, WINLINK, FM, CW")
+    p_bands.add_argument("--region", metavar="REGION", default="US",
+                         help="US (default) or INTL")
+    p_bands.add_argument("--transport", metavar="TRANSPORT",
+                         help="filter by transport: js8call, winlink")
+    p_bands.set_defaults(func=_cmd_bands)
+
+    p_sched = sub.add_parser("schedule", help="manage scheduled / windowed message sends")
+    sched_sub = p_sched.add_subparsers(dest="sched_action")
+
+    p_sched_add = sched_sub.add_parser("add", help="schedule a message for later")
+    p_sched_add.add_argument("message", help="message text to send")
+    sched_target = p_sched_add.add_mutually_exclusive_group(required=True)
+    sched_target.add_argument("--to", help="recipient callsign/identity")
+    sched_target.add_argument("--group", help="group name, e.g. TTP")
+    p_sched_add.add_argument(
+        "--at", metavar="HH:MM|YYYY-MM-DDTHH:MM",
+        help="fire at this UTC time today (HH:MM) or a full ISO datetime",
+    )
+    p_sched_add.add_argument(
+        "--delay", metavar="NmNh",
+        help="fire after this delay, e.g. 30m, 1h, 90m",
+    )
+    p_sched_add.add_argument("--transport", dest="force_transport",
+                             help="force a specific transport")
+
+    sched_sub.add_parser("list", help="show pending scheduled messages")
+    p_sched_cancel = sched_sub.add_parser("cancel", help="cancel a scheduled message")
+    p_sched_cancel.add_argument("id", help="message id (from schedule list)")
+
+    p_sched.set_defaults(func=_cmd_schedule)
+
+    p_roster = sub.add_parser("roster", help="show recently-heard callsigns across all transports")
+    p_roster.add_argument("--transport", help="filter to a specific transport")
+    p_roster.add_argument(
+        "--since", metavar="Nh", default="24h",
+        help="look back N hours (default: 24h)",
+    )
+    p_roster.add_argument("--limit", type=int, default=50, help="max entries (default 50)")
+    p_roster.set_defaults(func=_cmd_roster)
 
     return parser
 
@@ -479,6 +606,17 @@ def _parse_when(value: str, *, end: bool) -> datetime:
     return dt
 
 
+def _format_message_line(m, *, show_thread: bool = False) -> str:
+    ts = m.timestamp.strftime("%Y-%m-%d %H:%M")
+    via = f"[{m.transport or '?'}]"
+    tgt = f"@{m.group}" if m.group else (m.recipient or "")
+    arrow = f" -> {tgt}" if tgt else ""
+    where = f" {{{m.thread_key}}}" if show_thread else ""
+    groups = m.groups
+    gtag = f" ({', '.join('@' + g for g in groups)})" if groups else ""
+    return f"{ts} {via} {m.sender}{arrow}{where}{gtag}: {m.content}"
+
+
 def _render_messages(msgs, fmt: str, *, show_thread: bool = False) -> None:
     """Print a list of UnifiedMessages as text lines or a JSON array."""
     import json
@@ -490,14 +628,7 @@ def _render_messages(msgs, fmt: str, *, show_thread: bool = False) -> None:
         print("(no matching messages)")
         return
     for m in msgs:
-        ts = m.timestamp.strftime("%Y-%m-%d %H:%M")
-        via = f"[{m.transport or '?'}]"
-        tgt = f"@{m.group}" if m.group else (m.recipient or "")
-        arrow = f" -> {tgt}" if tgt else ""
-        where = f" {{{m.thread_key}}}" if show_thread else ""
-        groups = m.groups
-        gtag = f" ({', '.join('@' + g for g in groups)})" if groups else ""
-        print(f"{ts} {via} {m.sender}{arrow}{where}{gtag}: {m.content}")
+        print(_format_message_line(m, show_thread=show_thread))
 
 
 def _history_window(args) -> tuple[datetime | None, datetime | None] | None:
@@ -518,10 +649,18 @@ def _cmd_history(args: argparse.Namespace) -> int:
     """Browse stored history with optional filters (offline, no transports)."""
     from .core.store import MessageStore
 
-    window = _history_window(args)
-    if window is None:
-        return 2
-    since, until = window
+    if getattr(args, "date", None):
+        try:
+            since = _parse_when(args.date, end=False)
+            until = _parse_when(args.date, end=True)
+        except ValueError:
+            print("error: --date must be YYYY-MM-DD", file=sys.stderr)
+            return 2
+    else:
+        window = _history_window(args)
+        if window is None:
+            return 2
+        since, until = window
     thread = args.thread or args.to
     store = MessageStore(Config.load(args.config).database_path())
     try:
@@ -532,6 +671,8 @@ def _cmd_history(args: argparse.Namespace) -> int:
             group=args.group,
             since=since,
             until=until,
+            status=getattr(args, "status", None),
+            snr_min=getattr(args, "snr_min", None),
             limit=args.limit,
             newest_first=False,  # read like a conversation (oldest-first)
         )
@@ -547,10 +688,18 @@ def _cmd_search(args: argparse.Namespace) -> int:
     """Search stored message bodies with optional filters (offline)."""
     from .core.store import MessageStore
 
-    window = _history_window(args)
-    if window is None:
-        return 2
-    since, until = window
+    if getattr(args, "date", None):
+        try:
+            since = _parse_when(args.date, end=False)
+            until = _parse_when(args.date, end=True)
+        except ValueError:
+            print("error: --date must be YYYY-MM-DD", file=sys.stderr)
+            return 2
+    else:
+        window = _history_window(args)
+        if window is None:
+            return 2
+        since, until = window
     store = MessageStore(Config.load(args.config).database_path())
     try:
         msgs = store.query(
@@ -560,12 +709,424 @@ def _cmd_search(args: argparse.Namespace) -> int:
             group=args.group,
             since=since,
             until=until,
+            status=getattr(args, "status", None),
+            snr_min=getattr(args, "snr_min", None),
             limit=args.limit,
             newest_first=True,  # most relevant = most recent first
         )
         _render_messages(msgs, args.format, show_thread=True)
     finally:
         store.close()
+    return 0
+
+
+def _cmd_export(args: argparse.Namespace) -> int:
+    """Export conversation history (offline, read-only) to json/txt/md/maildir."""
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+    try:
+        thread = args.thread
+        fmt = args.format
+        out_path = Path(args.out) if args.out else None
+
+        if thread:
+            msgs_by_thread = [
+                (thread, store.query(thread=thread, limit=100_000, newest_first=False))
+            ]
+        else:
+            keys = [k for k, _, _ in store.threads()]
+            msgs_by_thread = [
+                (k, store.query(thread=k, limit=100_000, newest_first=False))
+                for k in keys
+            ]
+
+        all_msgs = [m for _, ms in msgs_by_thread for m in ms]
+        all_msgs.sort(key=lambda m: m.timestamp)
+
+        if fmt == "maildir":
+            if not out_path:
+                print(
+                    "error: --out <dir> is required for maildir format",
+                    file=sys.stderr,
+                )
+                return 2
+            _export_as_maildir(all_msgs, out_path)
+            print(f"exported {len(all_msgs)} message(s) to maildir: {out_path}")
+        elif fmt == "json":
+            _export_write(
+                json.dumps([m.to_dict() for m in all_msgs], indent=2), out_path
+            )
+            if out_path:
+                print(f"exported {len(all_msgs)} message(s) to {out_path}")
+        elif fmt == "txt":
+            show_thread = not thread
+            lines = [_format_message_line(m, show_thread=show_thread) for m in all_msgs]
+            _export_write("\n".join(lines) + ("\n" if lines else ""), out_path)
+            if out_path:
+                print(f"exported {len(all_msgs)} message(s) to {out_path}")
+        else:  # md
+            _export_write(_export_as_md(msgs_by_thread), out_path)
+            if out_path:
+                print(f"exported {len(all_msgs)} message(s) to {out_path}")
+    finally:
+        store.close()
+    return 0
+
+
+def _export_write(text: str, out_path: Path | None) -> None:
+    if out_path:
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        out_path.write_text(text, encoding="utf-8")
+    else:
+        print(text, end="")
+
+
+def _export_as_md(msgs_by_thread: list[tuple[str, list]]) -> str:
+    import io
+
+    buf = io.StringIO()
+    for thread_key, msgs in msgs_by_thread:
+        buf.write(f"# {thread_key}\n\n")
+        if not msgs:
+            buf.write("_(no messages)_\n\n")
+            buf.write("---\n\n")
+            continue
+        current_date: str | None = None
+        for m in msgs:
+            date_str = m.timestamp.strftime("%Y-%m-%d")
+            if date_str != current_date:
+                current_date = date_str
+                buf.write(f"## {date_str}\n\n")
+            ts = m.timestamp.strftime("%H:%M UTC")
+            via = m.transport or "?"
+            tgt = f"@{m.group}" if m.group else (m.recipient or "")
+            addr = f" -> {tgt}" if tgt else ""
+            buf.write(f"**{m.sender}**{addr} [{via}] {ts}\n\n")
+            buf.write(f"{m.content}\n\n")
+        buf.write("---\n\n")
+    return buf.getvalue()
+
+
+def _export_as_maildir(msgs: list, out_path: Path) -> None:
+    import email.utils
+
+    for sub in ("new", "cur", "tmp"):
+        (out_path / sub).mkdir(parents=True, exist_ok=True)
+    for m in msgs:
+        ts_int = int(m.timestamp.timestamp())
+        fname = f"{ts_int}.{m.msg_id[:16]}.radioapp"
+        tgt = f"@{m.group}" if m.group else (m.recipient or "(broadcast)")
+        subject_src = m.metadata.get("subject") or m.content
+        subject = subject_src[:72].replace("\n", " ").replace("\r", "")
+        date_str = email.utils.format_datetime(m.timestamp)
+        text = (
+            f"From: {m.sender}\n"
+            f"To: {tgt}\n"
+            f"Date: {date_str}\n"
+            f"Subject: {subject}\n"
+            f"Message-ID: <{m.msg_id}@radioapp>\n"
+            f"X-RadioApp-Transport: {m.transport or ''}\n"
+            f"X-RadioApp-Thread: {m.thread_key}\n"
+            f"X-RadioApp-Status: {m.status.value}\n"
+            f"\n"
+            f"{m.content}\n"
+        )
+        (out_path / "new" / fname).write_text(text, encoding="utf-8")
+
+
+def _cmd_templates(args: argparse.Namespace) -> int:
+    """List or send canned message templates from [templates] in config."""
+    from .core.templates import Templates
+
+    cfg = Config.load(args.config)
+    tmpls = Templates.from_config(cfg)
+
+    if args.action == "list" or not args.name:
+        items = tmpls.all()
+        if not items:
+            print(
+                "(no templates configured — add [templates] to your config.toml)"
+            )
+            return 0
+        for name, text in sorted(items.items()):
+            print(f"  {name:<16} {text}")
+        return 0
+
+    text = tmpls.get(args.name)
+    if text is None:
+        names = tmpls.names()
+        hint = ", ".join(names) if names else "(none configured)"
+        print(f"error: template '{args.name}' not found. Available: {hint}", file=sys.stderr)
+        return 1
+
+    if not args.to and not args.group:
+        print("error: --to or --group is required for 'send'", file=sys.stderr)
+        return 2
+
+    name = cfg.display_name
+    if args.group:
+        msg = UnifiedMessage.to_group(name, args.group, text)
+    else:
+        msg = UnifiedMessage.direct(name, args.to, text)
+
+    async def run(app: App) -> int:
+        ok = await app.router.send(msg, force_transport=args.transport)
+        print(f"{'sent' if ok else 'FAILED'}: {msg.msg_id} via {msg.transport or '-'}")
+        return 0 if ok else 1
+
+    return _run(_with_app(args.config, run))
+
+
+def _cmd_position(args: argparse.Namespace) -> int:
+    """Show current position from GPS or config; optionally send a beacon."""
+    from .core.position import GPSReader, position_from_config
+
+    cfg = Config.load(args.config)
+    pos = None
+
+    if args.gps:
+        gpsd_host = cfg.position.get("gpsd_host", "127.0.0.1")
+        gpsd_port = int(cfg.position.get("gpsd_port", 2947))
+        print(f"Querying gpsd at {gpsd_host}:{gpsd_port}...")
+        reader = GPSReader(host=gpsd_host, port=gpsd_port)
+        pos = reader.read()
+        if pos is None:
+            print(
+                "No GPS fix available. Check that gpsd is running and the "
+                "receiver has a signal.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        pos = position_from_config(cfg)
+        if pos is None:
+            print(
+                "No position configured. Add to config.toml:\n"
+                "  [position]\n"
+                "  lat = 42.3601\n"
+                "  lon = -71.0589\n"
+                "Or use --gps to query gpsd.",
+                file=sys.stderr,
+            )
+            return 1
+
+    print(f"position : {pos.lat:+.6f}°  {pos.lon:+.6f}°")
+    print(f"grid     : {pos.grid}")
+    if pos.alt_m is not None:
+        print(f"altitude : {pos.alt_m:.0f} m")
+    print(f"source   : {pos.source}")
+
+    if args.beacon:
+        async def run(app: App) -> int:
+            sent = 0
+            for t in app.transports:
+                if hasattr(t, "send_position_beacon") and t.running:
+                    ok = await t.send_position_beacon(pos)
+                    if ok:
+                        print(f"  beacon sent via {t.name}")
+                        sent += 1
+            if sent == 0:
+                print("No running transports support position beacons.")
+            return 0
+
+        return _run(_with_app(args.config, run))
+
+    return 0
+
+
+def _cmd_time(args: argparse.Namespace) -> int:
+    """Show current UTC time and best available clock offset."""
+    from .core.timesource import TimeConsensus, TimeSourceKind
+
+    print("Checking time sources (GPS → local NTP → internet NTP)...")
+    tc = TimeConsensus(timeout=3.0)
+    reading = tc.best_reading()
+    ts = reading.utc.strftime("%Y-%m-%d %H:%M:%S UTC")
+    print(f"time   : {ts}")
+    if reading.offset_ms is not None:
+        off = reading.offset_ms
+        warn = ""
+        if abs(off) > 1000:
+            warn = "  ** CLOCK SEVERELY OUT OF SYNC — HF modes may not work **"
+        elif abs(off) > 100:
+            warn = "  (offset > 100 ms — consider NTP sync)"
+        src_label = {
+            TimeSourceKind.GPS: "GPS (gpsd)",
+            TimeSourceKind.LOCAL_NTP: "local NTP daemon (chrony/ntpd)",
+            TimeSourceKind.NTP: "internet NTP (pool.ntp.org)",
+        }.get(reading.source, reading.source.value)
+        print(f"offset : {off:+.1f} ms{warn}")
+        print(f"source : {src_label}")
+    elif reading.error:
+        print(f"source : system clock ({reading.error})")
+    else:
+        print("source : system")
+    return 0
+
+
+def _cmd_bands(args: argparse.Namespace) -> int:
+    """Print the offline band-plan / EmComm frequency reference."""
+    from .core.bandplan import format_mhz, lookup
+
+    entries = lookup(
+        band=getattr(args, "band", None),
+        mode=getattr(args, "mode", None),
+        region=getattr(args, "region", "US"),
+        transport=getattr(args, "transport", None),
+    )
+    if not entries:
+        print("No entries match those filters.")
+        return 0
+    current_band = None
+    for e in entries:
+        if e.band != current_band:
+            if current_band is not None:
+                print()
+            print(f"  [{e.band}]")
+            current_band = e.band
+        freq = format_mhz(e.freq_khz)
+        notes = f"  {e.notes}" if e.notes else ""
+        tp = f"  [{e.transport}]" if e.transport else ""
+        print(f"    {freq:<14} {e.mode:<8} {e.region:<6}{tp}{notes}")
+    return 0
+
+
+def _cmd_schedule(args: argparse.Namespace) -> int:
+    """Manage scheduled / windowed message sends."""
+    from datetime import UTC, datetime, timedelta
+
+    from .config import Config
+    from .core.message import UnifiedMessage
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+
+    action = getattr(args, "sched_action", None) or "list"
+
+    try:
+        if action == "list":
+            entries = store.schedule_pending()
+            if not entries:
+                print("No pending scheduled messages.")
+                return 0
+            for e in entries:
+                ts = e.fire_at.strftime("%Y-%m-%d %H:%M UTC")
+                tp = f" [{e.transport}]" if e.transport else ""
+                print(f"  {e.id[:8]}  {ts}{tp}  {e.message.content[:60]!r}")
+            return 0
+
+        if action == "cancel":
+            ok = store.schedule_cancel(args.id)
+            print("Cancelled." if ok else f"No pending message with id '{args.id}'.")
+            return 0 if ok else 1
+
+        if action == "add":
+            now = datetime.now(UTC)
+            if getattr(args, "at", None):
+                raw = args.at.strip()
+                if "T" in raw or (len(raw) > 5 and "-" in raw):
+                    try:
+                        fire_at = datetime.fromisoformat(raw).astimezone(UTC)
+                    except ValueError:
+                        print("error: --at must be HH:MM or ISO datetime", file=sys.stderr)
+                        return 2
+                else:
+                    try:
+                        hh, mm = raw.split(":")
+                        fire_at = now.replace(
+                            hour=int(hh), minute=int(mm), second=0, microsecond=0
+                        )
+                        if fire_at <= now:
+                            fire_at += timedelta(days=1)
+                    except (ValueError, AttributeError):
+                        print("error: --at time must be HH:MM", file=sys.stderr)
+                        return 2
+            elif getattr(args, "delay", None):
+                raw = args.delay.strip().lower()
+                try:
+                    minutes = 0
+                    if "h" in raw and "m" in raw:
+                        h_part, rest = raw.split("h")
+                        minutes = int(h_part) * 60 + int(rest.rstrip("m"))
+                    elif "h" in raw:
+                        minutes = int(raw.rstrip("h")) * 60
+                    else:
+                        minutes = int(raw.rstrip("m"))
+                    fire_at = now + timedelta(minutes=minutes)
+                except ValueError:
+                    print("error: --delay must be like 30m, 1h, 90m", file=sys.stderr)
+                    return 2
+            else:
+                print("error: --at or --delay is required", file=sys.stderr)
+                return 2
+
+            name = cfg.display_name
+            if getattr(args, "group", None):
+                msg = UnifiedMessage.to_group(name, args.group, args.message)
+            else:
+                msg = UnifiedMessage.direct(name, args.to, args.message)
+
+            force_tp = getattr(args, "force_transport", None)
+            store.schedule_add(msg, fire_at, transport=force_tp)
+            ts = fire_at.strftime("%Y-%m-%d %H:%M UTC")
+            print(f"Scheduled {msg.msg_id[:8]} for {ts}")
+            return 0
+
+    finally:
+        store.close()
+
+    print(f"Unknown action '{action}'. Use: add | list | cancel", file=sys.stderr)
+    return 2
+
+
+def _cmd_roster(args: argparse.Namespace) -> int:
+    """Show recently-heard callsigns (presence roster)."""
+    from datetime import UTC, datetime, timedelta
+
+    from .config import Config
+    from .core.roster import get_roster
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+
+    raw = getattr(args, "since", "24h").lower().rstrip("h")
+    try:
+        hours = int(raw)
+    except ValueError:
+        print("error: --since must be like 24h, 48h", file=sys.stderr)
+        store.close()
+        return 2
+
+    since = datetime.now(UTC) - timedelta(hours=hours)
+    entries = get_roster(
+        store,
+        since=since,
+        transport=getattr(args, "transport", None),
+        limit=args.limit,
+    )
+    store.close()
+
+    if not entries:
+        print(f"No stations heard in the last {hours}h.")
+        return 0
+
+    print(
+        f"  {'CALLSIGN':<16} {'TRANSPORT':<12} {'LAST SEEN':<20} "
+        f"{'SNR':>6}  {'MSG':>4}  PREVIEW"
+    )
+    print("  " + "-" * 75)
+    for e in entries:
+        ts = e.last_seen.strftime("%m-%d %H:%M UTC")
+        snr = f"{e.last_snr:+.0f}" if e.last_snr is not None else "  —"
+        preview = e.last_content[:30]
+        print(
+            f"  {e.callsign:<16} {e.transport:<12} {ts:<20} "
+            f"{snr:>6}  {e.message_count:>4}  {preview!r}"
+        )
     return 0
 
 

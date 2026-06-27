@@ -22,11 +22,11 @@ of glass* for radio comms.
 
 ## Languages & stack
 
-- **Application code** (~12k lines): **Python 3.11+**, fully type-hinted, async.
+- **Application code** (~19k lines): **Python 3.11+**, fully type-hinted, async.
 - **TUI:** Textual (optional extra). **Config:** TOML (only hard dep: `tomli-w`).
-- **Persistence:** SQLite (stdlib). **Reticulum:** `rns` + `lxmf` (extra).
+- **Persistence:** SQLite + FTS5 (stdlib). **Reticulum:** `rns` + `lxmf` (extra).
   **MeshCore:** `meshcore` companion lib (extra).
-- **Tests:** pytest (347) · ruff · mypy.
+- **Tests:** pytest (544) · ruff · mypy.
 - *Interop targets vendored only for reference (not built or shipped here):*
   **Pat** is Go; **Mercury** is C. The app talks to them over their APIs.
 
@@ -53,7 +53,7 @@ channel name; plus transient RNS Links for NomadNet page fetches.
 
 **Transports:** 4 active built-ins (Reticulum, JS8Call, MeshCore, Winlink),
 Mercury dormant (wire protocol TODO), plus a plugin entry-point mechanism.
-**CLI:** ~18 subcommands.
+**CLI:** ~30 subcommands.
 
 ## Author's intent
 
@@ -94,16 +94,27 @@ per-mode reachability dots, ✓✓ only on confirmed delivery, live byte/encrypt
 indicators in the composer. A slash-command layer keeps power features out of
 the default surface.
 
+Utility surfaces cycle on **F5**: Watch (live all-transport feed with bounded
+scrollback) → Health (transport reachability + system metrics) → Logs (live
+in-process ring buffer, level-filterable) → Chats (all-transport archive).
+**Ctrl+F** opens a full-text search palette (FTS5, BM25-ranked, type-ahead).
+File attachments flow over Reticulum (LXMF file fields) and Winlink (MIME
+multipart); inbound Winlink bodies with base64/QP encoding are auto-decoded to
+readable text. The NomadNet browser fetches pages offline-first from a local
+cache.
+
 ## Simplicity of configuration
 
 **One hand-editable TOML file** holds every setting. Three on-ramps:
 `radioapp setup` (interactive wizard), `radioapp config init` (copy the example),
-or edit the TOML directly. Identity is entered **once** under `[station]` and
-auto-pushed into every transport that needs it. Everything is **off by default**,
-enabled per `[transports.x]` block, with sensible localhost defaults. Missing
-libraries or down daemons disable just that transport — the rest runs — and the
-Reticulum transport now retries `rnsd` in the background and attaches the moment
-it appears.
+or edit the TOML directly. Single-key edits: `radioapp config get|set <key>
+[value]` with smart bool/int/float coercion. Identity is entered **once** under
+`[station]` and auto-pushed into every transport that needs it. Everything is
+**off by default**, enabled per `[transports.x]` block, with sensible localhost
+defaults. Missing libraries or down daemons disable just that transport — the
+rest runs — and the Reticulum transport retries `rnsd` in the background and
+attaches the moment it appears. `radioapp backup` / `restore` snapshot and
+recover the SQLite store + config atomically.
 
 *73 de Radio_App*
 """

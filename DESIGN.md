@@ -101,6 +101,11 @@ hardware capability query.
 > - 7 ✅ Watch has Pause/Resume + Clear.
 > - 8 ✅ Health shows a reachability board **and** a "recently heard → add
 >   contact" discovery list (announce-fed; add turns a station into a favorite).
+>   The System section has been significantly extended: UTC clock with
+>   multi-source time consensus (GPS via gpsd → local chrony/ntpd → internet
+>   NTP, refreshed every 60 s; never starts/manages daemons); station position
+>   and Maidenhead grid (from `[position]` config or live gpsd); and host
+>   battery level with estimated runtime (Linux sysfs, no extra deps).
 
 ### Milestone 3 — MeshCore transport (separate)
 9. New `transports/meshcore_transport.py` implementing `Transport` +
