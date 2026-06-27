@@ -68,6 +68,11 @@ _DEFAULTS: dict[str, Any] = {
         # a transport name (e.g. "meshcore"/"js8call"/"reticulum"), "nomadnet",
         # "watch", "health", or "favorites".
         "home": "",
+        # Max number of rows the Watch live feed retains in memory. The feed is
+        # NOT persisted history (that lives in the database); this is just the
+        # in-memory scrollback, bounded so a long session on a busy band can't
+        # grow without limit. 0 = unbounded (not recommended on small devices).
+        "watch_buffer_limit": 1000,
     },
 }
 

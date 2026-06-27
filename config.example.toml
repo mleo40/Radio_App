@@ -157,7 +157,16 @@ theme = ""
 # transport (the default). Other options: a transport name (e.g. "meshcore",
 # "js8call", "reticulum"), "nomadnet", "watch", "health", or "favorites".
 home = ""
+# Max rows the Watch live feed keeps in memory (in-app scrollback only; full
+# history lives in the database). Bounded so a long session on a busy band can't
+# grow memory without limit. 0 = unbounded (not recommended on small devices).
+watch_buffer_limit = 1000
 
 [logging]
 file = "radio_app.log"
 level = "INFO"
+# Size-based rotation for the on-disk log file. max_bytes = 0 disables rotation
+# (the file then grows without bound). The in-app Logs surface is in-memory and
+# unaffected by these settings.
+max_bytes = 1048576   # rotate after ~1 MiB
+backup_count = 3      # keep radio_app.log.1 .. .3

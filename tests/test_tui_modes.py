@@ -342,7 +342,46 @@ def test_watch_pause_and_clear(config_path):
             await pilot.pause()
             assert len(app._monitor_msgs) == 1
             app._clear_watch()
-            assert app._monitor_msgs == []
+            assert len(app._monitor_msgs) == 0
+
+    asyncio.run(run())
+
+
+def test_watch_buffer_is_bounded(config_path):
+    """The Watch scrollback (buffer + rendered rows) is capped, not unbounded."""
+    from textual.widgets import ListView
+
+    from radio_app.core.message import AddressType, UnifiedMessage
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # Shrink the cap so the test is fast, mirroring the on_mount sizing.
+            from collections import deque
+
+            app._watch_buffer_limit = 5
+            app._monitor_msgs = deque(maxlen=5)
+            app._show_watch()
+            await pilot.pause()
+            for i in range(20):
+                app._append_monitor(
+                    UnifiedMessage(
+                        sender=f"s{i}",
+                        content=f"m{i}",
+                        transport="js8call",
+                        address_type=AddressType.DIRECT,
+                        recipient="me",
+                    )
+                )
+            await pilot.pause()
+            # Master buffer is exactly capped; the rendered list/index map stays
+            # bounded (≤ 2x cap via hysteresis) and aligned with the widget.
+            assert len(app._monitor_msgs) == 5
+            assert len(app._monitor_entries) <= 10
+            assert len(app._monitor_entries) == len(
+                app.query_one("#monitor", ListView).children
+            )
 
     asyncio.run(run())
 

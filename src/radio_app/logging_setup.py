@@ -18,6 +18,7 @@ import logging
 import os
 from collections import deque
 from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from threading import Lock
 
@@ -28,6 +29,10 @@ _CONFIGURED = False
 # Default number of records the in-process Logs surface retains. Bounded so a
 # long-running, chatty session can't grow memory without limit.
 _RING_CAPACITY = 2000
+
+# Default size-based rotation for the on-disk log file (see _build_file_handler).
+_DEFAULT_MAX_BYTES = 1_048_576  # ~1 MiB per file
+_DEFAULT_BACKUP_COUNT = 3       # keep radio_app.log.1 .. .3
 
 
 @dataclass(frozen=True)
@@ -132,6 +137,33 @@ def _strip_console_handlers(root: logging.Logger) -> None:
             root.removeHandler(handler)
 
 
+def _build_file_handler(path: Path, section: dict) -> logging.Handler:
+    """Build the file log handler, with size-based rotation unless disabled.
+
+    Rotation is controlled by ``[logging]``:
+
+        max_bytes    = 1048576   # rotate after ~1 MiB; 0 disables rotation
+        backup_count = 3         # keep radio_app.log.1 .. .3
+
+    Rotation keeps the on-disk log bounded on small/long-running field devices
+    (the in-app Logs surface is in-memory and unaffected). With ``max_bytes=0``
+    we fall back to a plain, ever-growing ``FileHandler`` (previous behaviour).
+    """
+    try:
+        max_bytes = int(section.get("max_bytes", _DEFAULT_MAX_BYTES))
+    except (TypeError, ValueError):
+        max_bytes = _DEFAULT_MAX_BYTES
+    try:
+        backup_count = int(section.get("backup_count", _DEFAULT_BACKUP_COUNT))
+    except (TypeError, ValueError):
+        backup_count = _DEFAULT_BACKUP_COUNT
+    if max_bytes <= 0:
+        return logging.FileHandler(path)
+    return RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=max(0, backup_count)
+    )
+
+
 def configure_logging(config: Config, *, stderr: bool = True) -> Path | None:
     """Install handlers once per process. Returns the log file path, if any."""
     global _CONFIGURED
@@ -169,7 +201,7 @@ def configure_logging(config: Config, *, stderr: bool = True) -> Path | None:
         if not candidate.is_absolute():
             candidate = config.path.parent / candidate
         candidate.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(candidate)
+        fh = _build_file_handler(candidate, section)
         fh.setLevel(level)
         fh.setFormatter(fmt)
         root.addHandler(fh)

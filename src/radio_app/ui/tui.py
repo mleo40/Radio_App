@@ -72,6 +72,11 @@ from ..transports.js8call_transport import (
 from .about import ABOUT_MD
 
 
+# Default cap for the in-memory Watch scrollback (rows). Overridable via
+# [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
+_WATCH_BUFFER_DEFAULT = 1000
+
+
 def _cache_age(when: datetime | None) -> str:
     """Coarse human age (``3m``/``5h``/``2d``) for a cached NomadNet page."""
     if when is None:
@@ -821,9 +826,18 @@ class RadioTUI(App):
         # conversations with no stored messages yet. transport -> ordered keys.
         self._opened_threads: dict[str, list[str]] = {}
         self._monitor_entries: list[tuple[str, str]] = []
-        # Full history of non-announce Monitor messages so the list can be
-        # rebuilt when the favorites-only filter is toggled.
-        self._monitor_msgs: list[UnifiedMessage] = []
+        # Bounded in-memory scrollback of non-announce Watch messages so the list
+        # can be rebuilt when a filter is toggled. The Watch feed is NOT stored
+        # history (that lives in the database) — capping it keeps a long session
+        # on a busy band from growing memory without limit. The maxlen is set
+        # from [ui].watch_buffer_limit once config loads (on_mount); the default
+        # here covers the pre-config window and tests.
+        self._monitor_msgs: deque[UnifiedMessage] = deque(
+            maxlen=_WATCH_BUFFER_DEFAULT
+        )
+        # Effective row cap for the master buffer AND the rendered list (0 =
+        # unbounded). Set from [ui].watch_buffer_limit in on_mount.
+        self._watch_buffer_limit = _WATCH_BUFFER_DEFAULT
         self._monitor_fav_only = False
         # Watch stream group filter: when set to a group name, the feed is
         # restricted to that group's cross-mode traffic. Mutually exclusive with
@@ -1041,6 +1055,15 @@ class RadioTUI(App):
 
         log_path = configure_logging(cfg, stderr=False)
         self.core = CoreApp(cfg)
+        # Size the Watch in-memory scrollback from config (0 = unbounded). Safe
+        # to recreate here: no messages have been buffered before mount.
+        try:
+            limit = int(cfg.ui.get("watch_buffer_limit", _WATCH_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            limit = _WATCH_BUFFER_DEFAULT
+        limit = max(0, limit)
+        self._watch_buffer_limit = limit
+        self._monitor_msgs = deque(maxlen=limit if limit > 0 else None)
         # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
@@ -4631,6 +4654,15 @@ class RadioTUI(App):
         )
         mlist.append(ListItem(Label(line)))
         self._monitor_entries.append((msg.thread_key, msg.transport))
+        # Bound the rendered list so a long live session can't grow the widget
+        # without limit. The master buffer (a capped deque) already holds at most
+        # `cap` rows; once the rendered list drifts to ~2x that, rebuild from the
+        # deque (resets widget + index map together, ≤ cap, staying aligned).
+        # The 2x hysteresis amortises the rebuild to O(1) per message.
+        cap = self._watch_buffer_limit
+        if cap and len(self._monitor_entries) > 2 * cap:
+            self._rebuild_monitor()
+            return
         mlist.scroll_end(animate=False)
 
     def _monitor_passes(self, msg: UnifiedMessage) -> bool:

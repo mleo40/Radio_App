@@ -88,3 +88,69 @@ def test_configure_logging_cli_keeps_one_console_handler(tmp_path):
     finally:
         _reset_logging()
 
+
+def _config_with_logging(tmp_path, extra: str) -> Config:
+    p = tmp_path / "config.toml"
+    p.write_text('[logging]\nfile = "radio_app.log"\nlevel = "INFO"\n' + extra)
+    return Config.load(str(p))
+
+
+def test_file_handler_rotates_by_default(tmp_path):
+    from logging.handlers import RotatingFileHandler
+
+    _reset_logging()
+    try:
+        logging_setup.configure_logging(
+            _config_with_logging(tmp_path, ""), stderr=False
+        )
+        root = logging.getLogger()
+        rotating = [
+            h for h in root.handlers if isinstance(h, RotatingFileHandler)
+        ]
+        assert len(rotating) == 1
+        assert rotating[0].maxBytes == logging_setup._DEFAULT_MAX_BYTES
+        assert rotating[0].backupCount == logging_setup._DEFAULT_BACKUP_COUNT
+    finally:
+        _reset_logging()
+
+
+def test_max_bytes_zero_disables_rotation(tmp_path):
+    from logging.handlers import RotatingFileHandler
+
+    _reset_logging()
+    try:
+        logging_setup.configure_logging(
+            _config_with_logging(tmp_path, "max_bytes = 0\n"), stderr=False
+        )
+        root = logging.getLogger()
+        file_handlers = [
+            h for h in root.handlers if isinstance(h, logging.FileHandler)
+        ]
+        # A plain FileHandler (not the rotating subclass) is installed.
+        assert len(file_handlers) == 1
+        assert not isinstance(file_handlers[0], RotatingFileHandler)
+    finally:
+        _reset_logging()
+
+
+def test_custom_rotation_settings_are_honoured(tmp_path):
+    from logging.handlers import RotatingFileHandler
+
+    _reset_logging()
+    try:
+        logging_setup.configure_logging(
+            _config_with_logging(
+                tmp_path, "max_bytes = 2048\nbackup_count = 5\n"
+            ),
+            stderr=False,
+        )
+        root = logging.getLogger()
+        rotating = next(
+            h for h in root.handlers if isinstance(h, RotatingFileHandler)
+        )
+        assert rotating.maxBytes == 2048
+        assert rotating.backupCount == 5
+    finally:
+        _reset_logging()
+
+
