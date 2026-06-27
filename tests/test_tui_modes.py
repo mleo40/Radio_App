@@ -1144,7 +1144,7 @@ def test_health_board_shows_system_section(config_path):
             await pilot.pause()
             app.action_health()
             await pilot.pause()
-            log = app.query_one("#health-log")
+            log = app.query_one("#health-sys-log")
             written = []
             orig = log.write
             log.write = lambda *a, **k: written.append(a[0] if a else "")
@@ -1179,7 +1179,7 @@ def test_health_board_shows_power_line(config_path, monkeypatch):
             await pilot.pause()
             app.action_health()
             await pilot.pause()
-            log = app.query_one("#health-log")
+            log = app.query_one("#health-sys-log")
             written = []
             orig = log.write
             log.write = lambda *a, **k: written.append(a[0] if a else "")

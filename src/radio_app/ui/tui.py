@@ -798,7 +798,9 @@ class RadioTUI(App):
     #nomad-nodes { height: 1fr; }
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
-    #health-log { height: 1fr; padding: 0 1; }
+    #health-body { height: 1fr; }
+    #health-log { height: 1fr; width: 1fr; padding: 0 1; }
+    #health-sys-log { height: 1fr; width: 1fr; padding: 0 1; border-left: tall $panel; }
     #logs-view { height: 1fr; }
     #logs-bar { height: 1; }
     #logs-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
@@ -1105,9 +1107,13 @@ class RadioTUI(App):
                     "[F5] re-check · [Ctrl+R] refresh",
                     id="health-help",
                 )
-                yield RichLog(
-                    id="health-log", wrap=True, markup=True, highlight=False
-                )
+                with Horizontal(id="health-body"):
+                    yield RichLog(
+                        id="health-log", wrap=True, markup=True, highlight=False
+                    )
+                    yield RichLog(
+                        id="health-sys-log", wrap=True, markup=True, highlight=False
+                    )
             with Vertical(id="logs-view"):
                 with Horizontal(id="logs-bar"):
                     yield Static(
@@ -2535,25 +2541,27 @@ class RadioTUI(App):
                     log, self._device_telemetry.get(t.name)
                 )
         self._render_radio_interlock(log)
-        self._render_system_health(log)
         log.write("[dim]Press F5 to re-check now.[/dim]")
+        self._render_system_health()
 
-    def _render_system_health(self, log: RichLog) -> None:
-        """Render host system health: CPU, memory, temperature, power, disk + DB.
+    def _render_system_health(self) -> None:
+        """Render host system health into the right Health pane.
 
-        All metrics are best-effort (``core.syshealth`` degrades gracefully on
-        platforms/installs where a reading isn't available), so anything unknown
-        is simply omitted. Battery/power matters for field/portable operation;
-        the database line is the single "how big is my history getting?"
-        indicator, alongside free space on its filesystem.
+        Covers: UTC clock + time-source offset, position/grid, CPU, memory,
+        temperature, power/battery, disk, and database stats. All metrics are
+        best-effort — anything unknown is simply omitted.
         """
         from ..core.syshealth import collect, format_bytes, format_duration
 
         if self.core is None:
             return
+        try:
+            log = self.query_one("#health-sys-log", RichLog)
+        except Exception:  # noqa: BLE001 - widget may not be mounted yet
+            return
+        log.clear()
         db_path = self.core.config.database_path()
         health = collect(str(db_path))
-        log.write("")
         log.write("[b]System[/b] (host resources)")
 
         # UTC clock + time-source consensus (GPS → local NTP → internet NTP → system).
