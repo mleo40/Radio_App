@@ -907,9 +907,11 @@ class RadioTUI(App):
         # Pending subject line for the next Winlink message (set via the Subject
         # button or /subject). Cleared after a Winlink send consumes it.
         self._winlink_subject: str = ""
-        # Pending outbound attachment file paths for the next Winlink message
-        # (set via /attach). Cleared after a send consumes them.
-        self._winlink_attach: list[str] = []
+        # Pending outbound attachment file paths for the next message (set via
+        # /attach). Works on any transport whose capabilities advertise
+        # supports_attachments (Winlink email, Reticulum LXMF). Cleared after a
+        # send consumes them.
+        self._attach_queue: list[str] = []
         # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
         # endpoint up/down), shown under its line on the Health board.
         self._winlink_paths: list[dict] = []
@@ -3564,8 +3566,8 @@ class RadioTUI(App):
             if len(subj) > 24:
                 subj = subj[:21] + "..."
             parts.append(f"[dim]subj:[/dim]\u201c{subj}\u201d")
-        if self._winlink_attach:
-            parts.append(f"[dim]\U0001f4ce[/dim]{len(self._winlink_attach)}")
+        if self._attach_queue:
+            parts.append(f"[dim]\U0001f4ce[/dim]{len(self._attach_queue)}")
         label.update("  ".join(parts))
 
     def _winlink_subject_prompt(self) -> None:
@@ -3672,37 +3674,46 @@ class RadioTUI(App):
         else:
             self._log_system("Winlink gateway cleared (telnet uses default CMS).")
 
-    def _add_winlink_attachment(self, arg: str) -> None:
+    def _add_attachment(self, arg: str) -> None:
         """Queue (or list/clear) attachment file paths for the next message.
 
         ``/attach <path>`` queues a file; ``/attach`` lists the queue;
         ``/attach clear`` empties it. Paths are validated up front so the
-        operator finds out immediately if a file is missing.
+        operator finds out immediately if a file is missing. Available on any
+        active mode whose transport advertises ``supports_attachments`` (Winlink
+        email, Reticulum LXMF); other modes get a hint instead.
         """
         arg = arg.strip()
+        t = self._active_transport_obj()
+        caps = t.capabilities() if t is not None else None
+        if not (caps and caps.supports_attachments):
+            self._log_system(
+                f"attachments aren't supported on '{self.active_transport or '(none)'}'."
+            )
+            return
         if not arg:
-            if self._winlink_attach:
-                names = ", ".join(os.path.basename(p) for p in self._winlink_attach)
-                self._log_system(f"Winlink attachments queued: {names}")
+            if self._attach_queue:
+                names = ", ".join(os.path.basename(p) for p in self._attach_queue)
+                self._log_system(f"Attachments queued: {names}")
             else:
                 self._log_system(
                     "No attachments queued. Use /attach <path> to add one."
                 )
             return
         if arg.lower() == "clear":
-            self._winlink_attach = []
+            self._attach_queue = []
             self._update_winlink_bar()
-            self._log_system("Winlink attachments cleared.")
+            self._log_system("Attachments cleared.")
             return
         path = os.path.expanduser(arg)
         if not os.path.isfile(path):
             self._log_system(f"Attachment not found: {arg}")
             return
-        self._winlink_attach.append(path)
+        self._attach_queue.append(path)
         self._update_winlink_bar()
         self._log_system(
             f"Attachment queued: {os.path.basename(path)} "
-            f"({len(self._winlink_attach)} total). Send to deliver."
+            f"({len(self._attach_queue)} total). Send to deliver."
         )
 
     def _winlink_download_dir(self) -> str:
@@ -5233,7 +5244,7 @@ class RadioTUI(App):
                 "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
                 "/sms <phone> <text>, "
                 "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
-                "/attach <path>, /save, "
+                "/attach <path> (Winlink/Reticulum), /save, "
                 "/name <friendly name>, /close [<id>], "
                 "/whoami, /announce, /path [<id>], /quit"
             )
@@ -5313,7 +5324,7 @@ class RadioTUI(App):
         elif cmd == "/subject":
             self._set_winlink_subject(arg)
         elif cmd == "/attach":
-            self._add_winlink_attachment(arg)
+            self._add_attachment(arg)
         elif cmd == "/save":
             self._winlink_save_attachments()
         elif cmd == "/connect":
@@ -5367,12 +5378,19 @@ class RadioTUI(App):
             msg.metadata["subject"] = self._winlink_subject
             self._winlink_subject = ""
             self._update_winlink_bar()
-        # Winlink attachments: hand the queued file paths to the transport
-        # (it uploads them as multipart) and clear the queue.
-        if self.active_transport == "winlink" and self._winlink_attach:
-            msg.metadata["attach"] = list(self._winlink_attach)
-            self._winlink_attach = []
-            self._update_winlink_bar()
+        # Attachments (any transport advertising supports_attachments — Winlink
+        # multipart email, Reticulum LXMF file fields). DIRECT-only: a group/
+        # broadcast send can't carry files, so keep the queue and warn instead.
+        if caps and caps.supports_attachments and self._attach_queue:
+            if self.current_target.startswith("@"):
+                self._log_system(
+                    "Attachments are only supported in direct messages; "
+                    "the queue was kept."
+                )
+            else:
+                msg.metadata["attach"] = list(self._attach_queue)
+                self._attach_queue = []
+                self._update_winlink_bar()
         # Send over the ACTIVE mode only (no auto-selection / fallback).
         ok = await self.core.router.send(msg, force_transport=self.active_transport)
         self._render_message(msg, outgoing=True, ok=ok)

@@ -296,7 +296,7 @@ def test_attach_queues_file_and_injects_into_send(config_path, tmp_path):
             await pilot.pause()
             await app._handle_command(f"/attach {f}")
             await pilot.pause()
-            assert app._winlink_attach == [str(f)]
+            assert app._attach_queue == [str(f)]
 
             captured = {}
 
@@ -308,7 +308,7 @@ def test_attach_queues_file_and_injects_into_send(config_path, tmp_path):
             app._send("body")
             await pilot.pause()
             await pilot.pause()
-            return captured.get("msg"), app._winlink_attach
+            return captured.get("msg"), app._attach_queue
 
     msg, remaining = asyncio.run(run())
     assert msg is not None
@@ -325,9 +325,93 @@ def test_attach_missing_file_is_not_queued(config_path):
             await pilot.pause()
             await app._handle_command("/attach /no/such/file.bin")
             await pilot.pause()
-            return app._winlink_attach
+            return app._attach_queue
 
     assert asyncio.run(run()) == []
+
+
+def test_attach_rejected_on_mode_without_attachment_support(config_path, tmp_path):
+    """`/attach` is gated by the capability flag, not hardcoded to Winlink."""
+    f = tmp_path / "doc.txt"
+    f.write_text("hi")
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # JS8Call has no attachment support -> the file isn't queued.
+            app._select_mode("js8call")
+            await pilot.pause()
+            await app._handle_command(f"/attach {f}")
+            await pilot.pause()
+            return app._attach_queue
+
+    assert asyncio.run(run()) == []
+
+
+def test_attach_works_and_injects_in_reticulum_mode(tmp_path):
+    """Reticulum direct sends carry queued attachments; groups don't.
+
+    A fake active-transport object provides the attachment/group capabilities so
+    the test exercises the TUI's capability-driven gating without starting a real
+    RNS instance.
+    """
+    TRANSPORT_REGISTRY.pop("mercury", None)
+    f = tmp_path / "pic.bin"
+    f.write_bytes(b"\x00\x01\x02")
+
+    class _Caps:
+        supports_attachments = True
+        supports_groups = True
+        max_message_size = 1_000_000
+
+    class _FakeRet:
+        name = "reticulum"
+
+        def capabilities(self):
+            return _Caps()
+
+    async def run():
+        # js8call-only config keeps startup hermetic (no real RNS); we stub the
+        # active transport to advertise attachment support.
+        jcfg = tmp_path / "j.toml"
+        jcfg.write_text(CONFIG)
+        app = RadioTUI(str(jcfg))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app.active_transport = "reticulum"
+            app._active_transport_obj = lambda: _FakeRet()  # type: ignore
+
+            await app._handle_command(f"/attach {f}")
+            await pilot.pause()
+            assert app._attach_queue == [str(f)]
+
+            captured = {}
+
+            async def fake_send(msg, force_transport=None):
+                captured["msg"] = msg
+                return True
+
+            app.core.router.send = fake_send  # type: ignore[assignment]
+            # Direct target: attachment injected + queue consumed.
+            app.current_target = "abcdef0123456789"
+            app._send("body")
+            await pilot.pause()
+            await pilot.pause()
+            direct_msg = captured.get("msg")
+            # Group target keeps the queue (attachments are direct-only).
+            await app._handle_command(f"/attach {f}")
+            await pilot.pause()
+            app.current_target = "@net"
+            app._send("hi all")
+            await pilot.pause()
+            await pilot.pause()
+            return direct_msg, app._attach_queue
+
+    msg, remaining = asyncio.run(run())
+    assert msg is not None
+    assert msg.metadata.get("attach") == [str(f)]
+    assert remaining == [str(f)]  # group send didn't consume the queue
 
 
 def test_pick_gateway_sets_transport_gateway(config_path):

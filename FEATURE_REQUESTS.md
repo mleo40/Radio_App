@@ -225,31 +225,39 @@ TUI (#3).
 ## Reticulum file transfer (attachments)
 
 **Requested:** 2026-06-26
-**Status:** Queued
-**Area:** `transports/reticulum_transport.py`, `core/message.py`, `ui/tui.py`
+**Status:** Done
+**Area:** `transports/reticulum_transport.py`, `transports/base.py`,
+`core/message.py`, `ui/tui.py`, `config.example.toml`
 
 Add the ability to send files over Reticulum, the way `/attach` already works
-for Winlink. Today file attachment is hard-gated to Winlink
-(`tui.py` ~L3916: `if self.active_transport == "winlink" and self._winlink_attach`)
-and the Reticulum `send()` path only forwards `msg.content` (text) into the
-`LXMF.LXMessage` — it never touches `metadata["attach"]`.
+for Winlink. Previously file attachment was hard-gated to Winlink and the
+Reticulum `send()` path only forwarded `msg.content` (text) into the
+`LXMF.LXMessage` — it never touched `metadata["attach"]`.
 
-LXMF/RNS natively support this (LXMF `fields` + Resource-based chunked transfer),
-and `capabilities()` already advertises `max_message_size=1_000_000`, so the
-plumbing exists but is unwired.
+**Delivered:**
+1. ✅ **Capability flag** — `TransportCapabilities.supports_attachments` (set on
+   Winlink + Reticulum). The TUI's `/attach` affordance is now driven by this
+   flag instead of a hardcoded transport name, so any future transport that can
+   carry files gets it for free.
+2. ✅ **Formalised attachment convention** — `UnifiedMessage` gained
+   `attach_paths` / `attachment_names` / `saved_attachments` helpers over the
+   shared `metadata["attach"]` (outbound paths), `metadata["attachments"]`
+   (display names) and `metadata["attachments_saved"]` (inbound saved paths)
+   keys used by both Winlink and Reticulum.
+3. ✅ **Outbound** — `ReticulumTransport.send` reads the queued paths and
+   populates `lxm.fields[LXMF.FIELD_FILE_ATTACHMENTS] = [[name, data], ...]`,
+   forcing the `DIRECT`/Resource method so RNS chunks large payloads. Group/
+   broadcast sends are DIRECT-only for files (a single 383-byte packet can't
+   carry them) — the TUI keeps the queue and warns instead of dropping it.
+4. ✅ **Inbound** — the LXMF delivery callback extracts file fields, saves them
+   to a configurable directory (`[transports.reticulum] attachments_dir`,
+   default `$XDG_DATA_HOME/radio_app/attachments`) with path-traversal-safe,
+   de-duplicated names, and records names + saved paths on the message so the
+   UI shows the paperclip + filenames.
+5. ✅ **TUI** — `/attach` un-gated via the capability flag (renamed the internal
+   queue to `_attach_queue`); injection in `_send` is now capability-driven and
+   direct-only.
 
-**Sketch of work:**
-1. Give `UnifiedMessage` a structured attachment representation (or formalize the
-   existing `metadata["attach"]` convention).
-2. In `ReticulumTransport.send`, read the queued paths and populate
-   `lxm.fields[LXMF.FIELD_FILE_ATTACHMENTS] = [[name, data], ...]`, forcing the
-   `DIRECT`/Resource method for large payloads (RNS handles chunked transfer).
-3. Handle inbound `fields` attachments in the LXMF delivery callback (save +
-   surface them in the UI).
-4. Un-gate `/attach` in the TUI so it isn't Winlink-only — ideally drive it from a
-   new `supports_attachments` capability flag instead of a hardcoded transport
-   name.
-
-**Notes:** Group/broadcast Reticulum sends are a single packet capped at 383 bytes
-(`_GROUP_PAYLOAD_MAX`), so file transfer would be DIRECT-only initially.
+**Notes:** Group/broadcast Reticulum sends remain text-only (single packet
+capped at 383 bytes, `_GROUP_PAYLOAD_MAX`), so file transfer is DIRECT-only.
 

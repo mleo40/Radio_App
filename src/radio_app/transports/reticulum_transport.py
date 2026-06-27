@@ -199,6 +199,7 @@ class ReticulumTransport(Transport):
             supports_groups=True,  # shared-key GROUP destinations
             supports_encryption=True,  # E2E by default
             supports_delivery_confirmation=True,
+            supports_attachments=True,  # LXMF file fields (DIRECT/Resource)
             is_realtime=True,  # RNS Links enable live chat
             typical_latency_s=1.0,
             needs_internet=False,  # also runs over LoRa / serial
@@ -541,6 +542,15 @@ class ReticulumTransport(Transport):
             title="",
             desired_method=method,
         )
+        # Attach any queued files (DIRECT/Resource carries large payloads). LXMF
+        # file fields are [[name, bytes], ...]; record names for UI display.
+        files = self._read_attachments(msg.attach_paths)
+        if files:
+            lxm.desired_method = LXMF.LXMessage.DIRECT
+            lxm.fields[LXMF.FIELD_FILE_ATTACHMENTS] = [
+                [name, data] for name, data in files
+            ]
+            msg.metadata["attachments"] = [name for name, _ in files]
         # Remember which UnifiedMessage this LXMessage corresponds to so the
         # delivery/failure callbacks can report status back to the UI.
         self._sent_refs[id(lxm)] = {
@@ -706,15 +716,103 @@ class ReticulumTransport(Transport):
             if self._local_destination is not None
             else None
         )
+        metadata: dict = {"encrypted": True, "rns_source": source_hex}
+        # Save any inbound file attachments to disk and record their names +
+        # saved paths so the UI can show (and the operator can open) them.
+        names, saved = self._save_inbound_attachments(lxm, source_hex)
+        if names:
+            metadata["attachments"] = names
+            metadata["attachments_saved"] = saved
         msg = UnifiedMessage(
             sender=source_hex,
             content=content or "",
             address_type=AddressType.DIRECT,
             recipient=our_hex,
             transport=self.name,
-            metadata={"encrypted": True, "rns_source": source_hex},
+            metadata=metadata,
         )
         self._dispatch_to_loop(msg)
+
+    # -- attachments ----------------------------------------------------------
+
+    def _read_attachments(self, paths: list[str]) -> list[tuple[str, bytes]]:
+        """Read outbound attachment file paths into ``(name, bytes)`` pairs.
+
+        Unreadable paths are skipped with a warning (never abort a send over one
+        bad path). Names are reduced to their base name for the wire.
+        """
+        out: list[tuple[str, bytes]] = []
+        for p in paths:
+            try:
+                with open(p, "rb") as fh:
+                    out.append((os.path.basename(str(p)), fh.read()))
+            except OSError as exc:
+                log.warning("[reticulum] cannot read attachment %s: %s", p, exc)
+        return out
+
+    def attachments_dir(self) -> str:
+        """Directory where received attachments are saved (config or default)."""
+        configured = str(self.config.get("attachments_dir", "")).strip()
+        if configured:
+            return os.path.expanduser(os.path.expandvars(configured))
+        base = os.environ.get("XDG_DATA_HOME") or os.path.join(
+            os.path.expanduser("~"), ".local", "share"
+        )
+        return os.path.join(base, "radio_app", "attachments")
+
+    def _save_inbound_attachments(
+        self, lxm, source_hex: str
+    ) -> tuple[list[str], list[str]]:
+        """Persist LXMF file attachments to disk. Returns (names, saved_paths).
+
+        Filenames are sanitised to their base name (no path traversal) and made
+        unique on collision. Returns empty lists when the message carries none.
+        """
+        fields = getattr(lxm, "fields", None) or {}
+        items = fields.get(LXMF.FIELD_FILE_ATTACHMENTS) if LXMF else None
+        if not items:
+            return [], []
+        dest_dir = self.attachments_dir()
+        try:
+            os.makedirs(dest_dir, exist_ok=True)
+        except OSError as exc:
+            log.warning("[reticulum] cannot create %s: %s", dest_dir, exc)
+            return [], []
+        names: list[str] = []
+        saved: list[str] = []
+        for item in items:
+            try:
+                raw_name, data = item[0], item[1]
+            except (TypeError, IndexError):
+                continue
+            name = os.path.basename(str(raw_name or "attachment")) or "attachment"
+            path = self._unique_path(dest_dir, name)
+            try:
+                with open(path, "wb") as fh:
+                    fh.write(bytes(data))
+            except (OSError, TypeError) as exc:
+                log.warning("[reticulum] cannot save attachment %s: %s", name, exc)
+                continue
+            names.append(name)
+            saved.append(path)
+        if saved:
+            log.info(
+                "[reticulum] saved %d attachment(s) from %s to %s",
+                len(saved), source_hex, dest_dir,
+            )
+        return names, saved
+
+    @staticmethod
+    def _unique_path(dest_dir: str, name: str) -> str:
+        """A non-colliding path in ``dest_dir`` for ``name`` (adds -1, -2, ...)."""
+        path = os.path.join(dest_dir, name)
+        if not os.path.exists(path):
+            return path
+        stem, ext = os.path.splitext(name)
+        i = 1
+        while os.path.exists(os.path.join(dest_dir, f"{stem}-{i}{ext}")):
+            i += 1
+        return os.path.join(dest_dir, f"{stem}-{i}{ext}")
 
     def _on_delivered(self, lxm) -> None:
         log.info("[reticulum] message delivered")

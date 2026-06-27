@@ -129,6 +129,31 @@ class UnifiedMessage:
         g = self.metadata.get("groups")
         return list(g) if isinstance(g, list) else []
 
+    # -- attachments ----------------------------------------------------------
+    # Attachments ride in ``metadata`` using a single cross-transport convention
+    # (shared by Winlink multipart email and Reticulum LXMF file fields):
+    #   metadata["attach"]       -> outbound: local file paths to send
+    #   metadata["attachments"]  -> display names carried by the message
+    #   metadata["attachments_saved"] -> inbound: where received files were saved
+
+    @property
+    def attach_paths(self) -> list[str]:
+        """Local file paths queued to be sent as attachments (outbound)."""
+        v = self.metadata.get("attach")
+        return [str(p) for p in v] if isinstance(v, list) else []
+
+    @property
+    def attachment_names(self) -> list[str]:
+        """Display names of attachments carried by this message."""
+        v = self.metadata.get("attachments")
+        return [str(p) for p in v] if isinstance(v, list) else []
+
+    @property
+    def saved_attachments(self) -> list[str]:
+        """Filesystem paths where received attachments were saved (inbound)."""
+        v = self.metadata.get("attachments_saved")
+        return [str(p) for p in v] if isinstance(v, list) else []
+
     def to_dict(self) -> dict:
         return {
             "msg_id": self.msg_id,

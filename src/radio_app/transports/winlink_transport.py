@@ -274,6 +274,7 @@ class WinlinkTransport(Transport):
             supports_groups=False,
             supports_encryption=False,       # Winlink content is not E2E encrypted
             supports_delivery_confirmation=False,  # store-and-forward; no live ACK
+            supports_attachments=True,        # multipart file uploads to Pat
             is_realtime=False,
             typical_latency_s=300.0,         # depends on next session/forwarding
             needs_internet=needs_internet,

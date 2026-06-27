@@ -77,6 +77,10 @@ class TransportCapabilities:
     #: exceed ``max_message_size``. Only meaningful for small-MTU text media
     #: (JS8Call, MeshCore); larger transports carry whole messages natively.
     supports_chunking: bool = False
+    #: Whether this transport can carry file attachments alongside a message
+    #: (Winlink multipart email; Reticulum LXMF file fields). Drives whether the
+    #: TUI offers its ``/attach`` affordance for the active mode.
+    supports_attachments: bool = False
     is_realtime: bool = False            # suitable for live keyboard chat?
     typical_latency_s: float = 30.0
     needs_internet: bool = False         # excluded when off-grid

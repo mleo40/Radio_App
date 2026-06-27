@@ -32,6 +32,9 @@ reconnect_interval = 10
 announce_on_start = true
 announce_monitor = true
 display_name = ""
+# Where received file attachments (LXMF file fields) are saved. Defaults to
+# $XDG_DATA_HOME/radio_app/attachments (i.e. ~/.local/share/radio_app/attachments).
+attachments_dir = ""
 
 [transports.reticulum.rnode]
 port = "/dev/ttyUSB0"
