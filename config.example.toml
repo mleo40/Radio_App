@@ -21,6 +21,12 @@ allow_encrypted_on_hf = false
 
 [storage]
 database = "conversations.db"
+# Single folder where ALL downloadable content is saved locally — Winlink
+# attachments, Reticulum/LXMF file attachments, etc. You're asked for this
+# during first-run setup, and every mode saves here. A relative path is taken
+# relative to this config file's folder. Blank = the default app data dir
+# ($XDG_DATA_HOME/radio_app/downloads, i.e. ~/.local/share/radio_app/downloads).
+download_dir = ""
 
 [transports.reticulum]
 enabled = true
@@ -32,8 +38,9 @@ reconnect_interval = 10
 announce_on_start = true
 announce_monitor = true
 display_name = ""
-# Where received file attachments (LXMF file fields) are saved. Defaults to
-# $XDG_DATA_HOME/radio_app/attachments (i.e. ~/.local/share/radio_app/attachments).
+# Where received file attachments (LXMF file fields) are saved. Blank uses the
+# central [storage].download_dir (shared by all modes); set this only to give
+# Reticulum its own override.
 attachments_dir = ""
 
 [transports.reticulum.rnode]
@@ -91,11 +98,17 @@ gateway = ""
 connect_url = ""
 # Seconds between inbox polls for newly received mail.
 poll_interval = 60
-# Where /save downloads received attachments (default shown).
-download_dir = "~/.local/share/radio_app/winlink"
+# Where /save downloads received attachments. Blank uses the central
+# [storage].download_dir (shared by all modes); set this only to give Winlink
+# its own override.
+download_dir = ""
 # When true, each send immediately dials the gateway; when false (default),
 # messages queue in Pat's outbox for the next session you start.
 auto_connect = false
+# When true, the connect session log echoes Pat's full raw transcript (verbose,
+# and includes replayed backlog). Default false shows only concise live events
+# (dialing/connected, per-message transfer progress) plus a final summary.
+verbose_session_log = false
 
 [groups.TTP]
 display_name = "TTP Net"

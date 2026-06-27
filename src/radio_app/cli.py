@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import json
 import shutil
 import sys
 from datetime import UTC, datetime
@@ -149,8 +150,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_transports = sub.add_parser("transports", help="list transports + capabilities")
     p_transports.set_defaults(func=_cmd_transports)
 
-    p_config = sub.add_parser("config", help="inspect/initialise configuration")
-    p_config.add_argument("action", choices=["path", "show", "init"])
+    p_config = sub.add_parser("config", help="inspect/initialise/edit configuration")
+    p_config.add_argument(
+        "action", choices=["path", "show", "init", "get", "set"]
+    )
+    p_config.add_argument(
+        "key",
+        nargs="?",
+        help="dotted key for get/set, e.g. 'storage.download_dir' or "
+        "'transports.winlink.enabled'",
+    )
+    p_config.add_argument(
+        "value",
+        nargs="?",
+        help="new value for 'set' (smart-typed: true/false/int/float, else "
+        "string; use --string/--json to force)",
+    )
+    p_config.add_argument(
+        "--string", action="store_true",
+        help="for 'set': treat VALUE as a literal string (no smart typing)",
+    )
+    p_config.add_argument(
+        "--json", action="store_true",
+        help="for 'set': parse VALUE as JSON (e.g. a list: '[\"telnet\"]')",
+    )
     p_config.set_defaults(func=_cmd_config)
 
     p_tui = sub.add_parser("tui", help="launch the terminal user interface")
@@ -791,7 +814,104 @@ def _cmd_config(args: argparse.Namespace) -> int:
             Config.load(path).save()
         print(f"wrote starter config to {path}")
         return 0
+    if args.action == "get":
+        if not args.key:
+            print("usage: radioapp config get <section.key>", file=sys.stderr)
+            return 2
+        cfg = Config.load(args.config)
+        found, value = _config_lookup(cfg.data, args.key)
+        if not found:
+            print(f"{args.key} is not set", file=sys.stderr)
+            return 1
+        print(_format_config_value(value))
+        return 0
+    if args.action == "set":
+        if not args.key or args.value is None:
+            print(
+                "usage: radioapp config set <section.key> <value>",
+                file=sys.stderr,
+            )
+            return 2
+        if "." not in args.key:
+            print(
+                "error: key must be dotted, e.g. 'storage.download_dir'",
+                file=sys.stderr,
+            )
+            return 2
+        try:
+            value = _parse_config_value(
+                args.value, json_mode=args.json, string_mode=args.string
+            )
+        except json.JSONDecodeError as exc:
+            print(f"error: invalid JSON value: {exc}", file=sys.stderr)
+            return 2
+        cfg = Config.load(args.config)
+        _config_assign(cfg.data, args.key, value)
+        cfg.save()
+        print(f"set {args.key} = {_format_config_value(value)}")
+        print(f"  ({cfg.path})")
+        return 0
     return 1
+
+
+def _config_lookup(data: dict, dotted: str) -> tuple[bool, object]:
+    """Resolve a dotted ``section.key[...]`` path; (found, value)."""
+    cur: object = data
+    for part in dotted.split("."):
+        if isinstance(cur, dict) and part in cur:
+            cur = cur[part]
+        else:
+            return False, None
+    return True, cur
+
+
+def _config_assign(data: dict, dotted: str, value: object) -> None:
+    """Set a dotted ``section.key[...]`` path, creating intermediate tables."""
+    parts = dotted.split(".")
+    cur = data
+    for part in parts[:-1]:
+        nxt = cur.get(part)
+        if not isinstance(nxt, dict):
+            nxt = {}
+            cur[part] = nxt
+        cur = nxt
+    cur[parts[-1]] = value
+
+
+def _parse_config_value(
+    raw: str, *, json_mode: bool = False, string_mode: bool = False
+) -> object:
+    """Convert a CLI string into a typed config value.
+
+    ``--string`` forces a literal string; ``--json`` parses JSON (lists/objects).
+    Otherwise it's smart-typed: ``true``/``false`` -> bool, an integer or float
+    where the text parses cleanly, else the string verbatim.
+    """
+    if string_mode:
+        return raw
+    if json_mode:
+        return json.loads(raw)
+    low = raw.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    try:
+        return int(raw)
+    except ValueError:
+        pass
+    try:
+        return float(raw)
+    except ValueError:
+        pass
+    return raw
+
+
+def _format_config_value(value: object) -> str:
+    """Render a config value for display (TOML-ish booleans, JSON containers)."""
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, (list, dict)):
+        return json.dumps(value)
+    return str(value)
 
 
 def _cmd_tui(args: argparse.Namespace) -> int:
@@ -983,6 +1103,15 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     except ValueError:
         print("  (not a number; keeping everything — 0 days)")
         retention_days = 0
+    # One folder where ALL downloaded content (attachments etc.) is saved, used
+    # by every mode. Blank keeps the default app data dir.
+    print(
+        "\n  Downloaded files (attachments, saved content) from every mode are\n"
+        "  saved in one folder. Leave blank for the default app data directory."
+    )
+    download_dir = _ask(
+        "Download folder", str(cfg.storage.get("download_dir", "") or "")
+    )
 
     # -- Reticulum -----------------------------------------------------------
     print("\nReticulum (encrypted internet / LoRa / serial via rnsd)")
@@ -1116,6 +1245,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     # -- write it all to the single config file ------------------------------
     cfg.set("general", "display_name", display_name)
     cfg.set("general", "history_retention_days", retention_days)
+    cfg.set("storage", "download_dir", download_dir)
     cfg.set("station", "callsign", station.callsign)
     cfg.set("station", "grid_square", station.grid_square)
     cfg.set("compliance", "allow_encrypted_on_hf", allow_enc)

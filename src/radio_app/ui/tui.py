@@ -18,14 +18,17 @@ Surfaces:
 * LOGS (diagnose): a live, level-filterable view of the in-memory application
   log (follow/pause). A WARN/ERR badge in the status bar flags new problems and
   jumps here when clicked.
+* CHATS (recall): the "All chats" archive — every conversation across all
+  modes, newest first, read-only. A Mode button filters to a single transport;
+  Enter on a row opens that conversation (switching to its mode).
 
 Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ unknown.
 
 Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
-       F5 = cycle Watch/Health/Logs/Favorites   Ctrl+R = refresh
+       F5 = cycle Watch/Health/Logs/Chats/Favorites   Ctrl+R = refresh
        Ctrl+F = search history   Ctrl+C / Ctrl+Q / q = quit
 Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
-  /favorites,  /logs,  /loglevel <level>,  /search <text>,
+  /favorites,  /logs,  /loglevel <level>,  /search <text>,  /chats,
   /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
 """
 
@@ -75,6 +78,53 @@ from .about import ABOUT_MD
 # Default cap for the in-memory Watch scrollback (rows). Overridable via
 # [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
 _WATCH_BUFFER_DEFAULT = 1000
+
+
+# Commands that work in every mode (they drive the UI/state, not a transport).
+# Shown by /help under "Everywhere" regardless of the active mode.
+_UNIVERSAL_COMMAND_HELP = (
+    "/to <callsign|@GROUP> [message], /monitor (Watch), "
+    "/favorites (F6), /fav add|rm|list|only [<id> [label]], "
+    "/mode (cycle, F3), /refresh, /logs, "
+    "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
+    "/chats, /name <friendly name>, /close [<id>], /help, /quit"
+)
+
+# Mode-specific commands, keyed by transport name. /help shows only the active
+# mode's group (plus the universal ones), so each panel lists what's usable
+# there instead of the whole command surface. Each command is gated in
+# _handle_command's handlers, so this map mirrors that gating.
+_MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
+    "winlink": (
+        "/subject <text> \u2014 set the email subject for the next message",
+        "type \\n in the body \u2014 inserts a line break (multi-line email)",
+        "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
+        "/save \u2014 save attachments from the open message",
+        "/connect [gateway] \u2014 open a forwarding session (send + receive)",
+        "/gateway <CALL> \u2014 set the RMS gateway; /gateways lists configured",
+    ),
+    "js8call": (
+        "/freq [<MHz|Hz>] \u2014 show or set the dial frequency",
+        "/band [<name>] \u2014 list bands or switch (e.g. /band 20m)",
+        "/inbox \u2014 list JS8Call store-and-forward messages",
+        "/relay <CALL> <text> \u2014 leave a store-and-forward message",
+        "/sms <phone> <text> \u2014 send an APRS SMS",
+        "/cmd [<CALL>] <SNR?|GRID?|...> \u2014 send a directed query",
+    ),
+    "reticulum": (
+        "/whoami \u2014 show your Reticulum address",
+        "/announce \u2014 re-announce your LXMF identity",
+        "/path [<id>] \u2014 request a network path to a contact",
+        "/peers \u2014 list messageable LXMF peers",
+        "/nodes \u2014 list discovered NomadNet nodes",
+        "/browse <hash>[:/page/x.mu] \u2014 open a NomadNet page",
+        "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
+    ),
+    "meshcore": (
+        "/announce \u2014 broadcast a node advert",
+        "/channel list|add <index> <#name> [secret] \u2014 manage channels",
+    ),
+}
 
 
 def _cache_age(when: datetime | None) -> str:
@@ -138,10 +188,12 @@ class SetupScreen(ModalScreen[dict | None]):
     #setup-buttons { height: auto; align-horizontal: right; }
     """
 
-    def __init__(self, station: Station, source_note: str = "") -> None:
+    def __init__(self, station: Station, source_note: str = "",
+                 download_dir: str = "") -> None:
         super().__init__()
         self._station = station
         self._source_note = source_note
+        self._download_dir = download_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-box"):
@@ -158,6 +210,16 @@ class SetupScreen(ModalScreen[dict | None]):
                 value=self._station.grid_square,
                 placeholder="Grid square (e.g. FN31pr)",
                 id="s-grid",
+            )
+            yield Static(
+                "Where to save downloaded files (attachments, etc.) — used by "
+                "every mode:",
+                id="s-download-label",
+            )
+            yield Input(
+                value=self._download_dir,
+                placeholder="Download folder (blank = default app data dir)",
+                id="s-download",
             )
             yield Static("", id="setup-error")
             with Horizontal(id="setup-buttons"):
@@ -182,6 +244,7 @@ class SetupScreen(ModalScreen[dict | None]):
             {
                 "callsign": station.callsign,
                 "grid_square": station.grid_square,
+                "download_dir": self.query_one("#s-download", Input).value.strip(),
             }
         )
 
@@ -750,6 +813,12 @@ class RadioTUI(App):
     #search-input { height: 3; margin: 0 1; }
     #search-help { height: 1; color: $text-muted; padding: 0 1; }
     #search-results { height: 1fr; }
+    #archive-view { height: 1fr; }
+    #archive-bar { height: 1; }
+    #archive-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #archive-spacer { width: 1fr; height: 1; }
+    #archive-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #archive-list { height: 1fr; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -919,6 +988,11 @@ class RadioTUI(App):
         # plus the surface to restore when the palette is closed with Esc.
         self._search_hits: list[tuple[str, str]] = []
         self._search_prev_view: str = "active"
+        # "All chats" archive: row index -> (thread_key, transport) for opening a
+        # conversation, plus an optional transport (mode) filter cycled by the
+        # Mode button (None = every mode).
+        self._archive_rows: list[tuple[str, str]] = []
+        self._archive_mode_filter: str | None = None
         # Logs surface state. ``_logs_min_level`` is the severity floor the live
         # log feed renders at (cycled by the Level button / set by /loglevel).
         # ``_logs_paused`` freezes the live feed so the operator can scroll back
@@ -1072,6 +1146,19 @@ class RadioTUI(App):
                     id="search-input",
                 )
                 yield ListView(id="search-results")
+            with Vertical(id="archive-view"):
+                with Horizontal(id="archive-bar"):
+                    yield Static(
+                        "All chats — every conversation across all modes "
+                        "(read-only). Enter opens one.",
+                        id="archive-help",
+                    )
+                    yield Static("", id="archive-spacer")
+                    yield Button("\u25cb Mode", id="archive-mode", classes="modebtn")
+                    yield Button(
+                        "\u21bb Refresh", id="archive-refresh", classes="modebtn"
+                    )
+                yield ListView(id="archive-list")
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
         yield Footer()
@@ -1222,17 +1309,32 @@ class RadioTUI(App):
                     grid_square=info.grid or station.grid_square,
                 )
                 source_note = "Pre-filled from JS8Call - edit if needed."
-        result = await self.push_screen_wait(SetupScreen(station, source_note))
+        current_dl = str(self.core.config.storage.get("download_dir", "") or "")
+        result = await self.push_screen_wait(
+            SetupScreen(station, source_note, current_dl)
+        )
         if not result:
             self._log_system("Station not set. HF transports need a callsign.")
             return
         cfg = self.core.config
+        # The download location lives in [storage], not [station]; pull it out
+        # before the rest of the result is written as station identity.
+        download_dir = result.pop("download_dir", "")
         for key, value in result.items():
             cfg.set("station", key, value)
+        if download_dir:
+            cfg.set("storage", "download_dir", download_dir)
         cfg.save()
         self.core.station = Station(**result)
         self.core.router._station = self.core.station
+        # Push the chosen download location to every running transport so all
+        # modes save downloads there from now on.
+        self.core.apply_download_dir()
         self._log_system(f"Station saved: {self.core.station.callsign}")
+        if download_dir:
+            self._log_system(
+                f"Downloads will be saved to {self.core.config.download_dir()}"
+            )
 
 
     async def on_unmount(self) -> None:
@@ -1450,7 +1552,10 @@ class RadioTUI(App):
 
     # -- actions --------------------------------------------------------------
     def action_refresh(self) -> None:
-        self._refresh_threads()
+        if self.view == "archive":
+            self._render_archive()
+        else:
+            self._refresh_threads()
         self._update_status()
 
     def action_about(self) -> None:
@@ -1912,6 +2017,13 @@ class RadioTUI(App):
             self._show_favorites()
         elif bid == "view-logs":
             self.action_logs()
+        elif bid == "view-archive":
+            self.action_archive()
+        elif bid == "archive-mode":
+            self._cycle_archive_filter()
+        elif bid == "archive-refresh":
+            self._render_archive()
+            self._update_status()
         elif bid == "logs-pause":
             self._toggle_logs_pause()
         elif bid == "logs-level":
@@ -2013,13 +2125,14 @@ class RadioTUI(App):
         self._update_status()
 
     def action_cycle_utility(self) -> None:
-        """Cycle the utility surfaces with F5: Watch -> Health -> Logs -> Favorites.
+        """Cycle the utility surfaces with F5: Watch -> Health -> Logs -> Chats
+        -> Favorites.
 
         From an operating (chat/NomadNet) mode, F5 jumps into the cycle at
-        Watch. Pressing it again advances Watch -> Health -> Logs -> Favorites
+        Watch, then advances Watch -> Health -> Logs -> Chats -> Favorites
         -> Watch.
         """
-        order = ["monitor", "health", "logs", "favorites"]
+        order = ["monitor", "health", "logs", "archive", "favorites"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -2030,6 +2143,8 @@ class RadioTUI(App):
             self._show_health()
         elif nxt == "logs":
             self._show_logs()
+        elif nxt == "archive":
+            self._show_archive()
         else:
             self._show_favorites()
 
@@ -3506,6 +3621,8 @@ class RadioTUI(App):
                 btn.set_class(self.view == "health", "-active")
             elif bid == "view-logs":
                 btn.set_class(self.view == "logs", "-active")
+            elif bid == "view-archive":
+                btn.set_class(self.view == "archive", "-active")
             elif bid == "view-favorites":
                 btn.set_class(self.view == "favorites", "-active")
         self._update_input_indicator()
@@ -3717,14 +3834,21 @@ class RadioTUI(App):
         )
 
     def _winlink_download_dir(self) -> str:
-        """Where saved inbound attachments go (config override or a default)."""
+        """Where saved inbound attachments go.
+
+        A per-transport ``download_dir`` override wins; otherwise the central
+        ``[storage].download_dir`` chosen at setup is used, so Winlink downloads
+        land with every other mode's.
+        """
         t = self._winlink_transport()
         if t is not None:
             configured = str(t.config.get("download_dir", "")).strip()
             if configured:
                 return os.path.expanduser(configured)
+        if self.core is not None:
+            return str(self.core.config.download_dir())
         return os.path.join(
-            os.path.expanduser("~"), ".local", "share", "radio_app", "winlink"
+            os.path.expanduser("~"), ".local", "share", "radio_app", "downloads"
         )
 
     @work(exclusive=True)
@@ -3831,9 +3955,19 @@ class RadioTUI(App):
         # Suppress Pat's replayed log backlog (it tails its log file to new WS
         # clients) until the session is actually live.
         log_state: dict[str, bool] = {"live": False}
+        # The raw Pat log transcript (LogLine) is both verbose and replayed to
+        # new WS clients (so it shows outdated backlog). Hide it by default and
+        # rely on the concise structured Status/Progress/Notification events plus
+        # the final "sent N, received M" summary. Operators who want the full
+        # Pat transcript can opt in with [transports.winlink] verbose_session_log.
+        verbose = bool(
+            (getattr(t, "config", {}) or {}).get("verbose_session_log", False)
+        )
         if hasattr(t, "stream_events"):
             def _on_event(ev: dict) -> None:
                 if not self._winlink_event_is_live(ev, log_state):
+                    return
+                if "LogLine" in ev and not verbose:
                     return
                 prog = ev.get("Progress")
                 if isinstance(prog, dict) and prog.get("done"):
@@ -4274,6 +4408,7 @@ class RadioTUI(App):
         bar.mount(Button("\u25f7 Watch", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
+        bar.mount(Button("\U0001f5c2 Chats", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
@@ -4565,6 +4700,11 @@ class RadioTUI(App):
         elif list_id == "search-results":
             if idx < len(self._search_hits):
                 thread_key, transport = self._search_hits[idx]
+                if thread_key:
+                    self._open_thread(thread_key, transport)
+        elif list_id == "archive-list":
+            if idx < len(self._archive_rows):
+                thread_key, transport = self._archive_rows[idx]
                 if thread_key:
                     self._open_thread(thread_key, transport)
 
@@ -5149,6 +5289,109 @@ class RadioTUI(App):
         )
         return safe
 
+    # -- "All chats" archive --------------------------------------------------
+
+    def action_archive(self) -> None:
+        """Open the cross-mode "All chats" archive surface."""
+        self._show_archive()
+
+    def _show_archive(self) -> None:
+        """Show every conversation across all modes (read-only), newest first."""
+        self.view = "archive"
+        self.query_one("#main", ContentSwitcher).current = "archive-view"
+        self._enable_composer(False)
+        self._render_archive()
+        self._update_modebar()
+        self._update_status()
+
+    def _render_archive(self) -> None:
+        """Render the conversation rollups, honouring the mode filter."""
+        try:
+            lst = self.query_one("#archive-list", ListView)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        lst.clear()
+        self._archive_rows.clear()
+        if self.core is None:
+            return
+        try:
+            summaries = self.core.store.thread_summaries()
+        except Exception:  # noqa: BLE001 - never let a query crash the UI
+            summaries = []
+        flt = self._archive_mode_filter
+        shown = [s for s in summaries if not flt or s.transport == flt]
+        if not shown:
+            msg = (
+                f"[dim]No conversations for '{flt}'.[/dim]"
+                if flt
+                else "[dim]No conversations yet.[/dim]"
+            )
+            lst.append(ListItem(Label(msg)))
+            self._archive_rows.append(("", ""))
+            self._update_archive_help(len(shown))
+            return
+        for s in shown:
+            lst.append(ListItem(Label(self._format_archive_row(s))))
+            self._archive_rows.append((s.thread_key, s.transport))
+        self._update_archive_help(len(shown))
+
+    def _format_archive_row(self, s) -> str:
+        """Render one archive row: date  mode  thread  count  last preview."""
+        ts = (s.last_ts or "")[:16].replace("T", " ")
+        name = s.transport or "?"
+        color = self._mode_color(name)
+        mode_tag = f"[{color}]{name:<9}[/{color}]"
+        who = (
+            "you"
+            if s.last_status not in ("received", "")
+            else (s.last_sender or "?")
+        )
+        preview = (s.last_content or "").replace("\n", " ")
+        if len(preview) > 48:
+            preview = preview[:47] + "\u2026"
+        preview = preview.replace("\\", "\\\\").replace("[", "\\[")
+        title = self._display_id(s.thread_key)
+        return (
+            f"[dim]{ts}[/dim] {mode_tag} [b]{title}[/b] "
+            f"[dim]({s.count})[/dim]  {who}: {preview}"
+        )
+
+    def _update_archive_help(self, count: int) -> None:
+        try:
+            help_line = self.query_one("#archive-help", Static)
+            btn = self.query_one("#archive-mode", Button)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        flt = self._archive_mode_filter
+        scope = f"mode: {flt}" if flt else "all modes"
+        help_line.update(
+            f"All chats — {count} conversation(s), {scope} (read-only). "
+            "Enter opens one."
+        )
+        btn.label = f"\u25cf {flt}" if flt else "\u25cb Mode"
+
+    def _cycle_archive_filter(self) -> None:
+        """Cycle the archive's mode filter: all -> each transport -> all."""
+        if self.core is None:
+            return
+        names = [t.name for t in self.core.transports]
+        # Only offer filters for modes that actually have conversations, so the
+        # cycle never lands on an always-empty mode.
+        try:
+            present = {
+                s.transport for s in self.core.store.thread_summaries() if s.transport
+            }
+        except Exception:  # noqa: BLE001
+            present = set()
+        options: list[str | None] = [None] + [n for n in names if n in present]
+        try:
+            idx = options.index(self._archive_mode_filter)
+        except ValueError:
+            idx = 0
+        self._archive_mode_filter = options[(idx + 1) % len(options)]
+        self._render_archive()
+        self._update_status()
+
     # -- composer -------------------------------------------------------------
     def _enable_composer(self, enabled: bool) -> None:
         composer = self.query_one("#composer", Input)
@@ -5225,6 +5468,25 @@ class RadioTUI(App):
             except Exception:  # noqa: BLE001 - UI may be mid-teardown
                 pass
 
+    def _show_help(self) -> None:
+        """Print a mode-aware command list for ``/help``.
+
+        Shows the active mode's commands first (only those actually usable in
+        that panel — see ``_MODE_COMMAND_HELP``), then the universal commands
+        that work in every mode. With no mode picked yet, just point the
+        operator at F3 so the list isn't misleadingly empty.
+        """
+        mode = self.active_transport
+        if mode and mode in _MODE_COMMAND_HELP:
+            self._log_system(f"{mode} commands:")
+            for line in _MODE_COMMAND_HELP[mode]:
+                self._log_system(f"  {line}")
+        elif mode:
+            self._log_system(f"{mode}: no mode-specific commands.")
+        else:
+            self._log_system("Pick a mode (F3) to see its commands.")
+        self._log_system(f"Everywhere: {_UNIVERSAL_COMMAND_HELP}")
+
     async def _handle_command(self, text: str) -> None:
         parts = text.split(maxsplit=1)
         cmd = parts[0].lower()
@@ -5232,22 +5494,7 @@ class RadioTUI(App):
         if cmd in ("/quit", "/q", "/exit"):
             await self.action_quit()
         elif cmd == "/help":
-            self._log_system(
-                "Commands: /to <callsign|@GROUP> [message], /monitor (toggle), "
-                "/favorites (F6), /mode (cycle, like F3), "
-                "/fav add|rm|list|only [<id> [label]], "
-                "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
-                "/logs, /loglevel <debug|info|warning|error>, "
-                "/search <text> (Ctrl+F), "
-                "/channel list|add <index> <#name> [secret], "
-                "/freq [<MHz|Hz>], /band [<name>], "
-                "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
-                "/sms <phone> <text>, "
-                "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
-                "/attach <path> (Winlink/Reticulum), /save, "
-                "/name <friendly name>, /close [<id>], "
-                "/whoami, /announce, /path [<id>], /quit"
-            )
+            self._show_help()
         elif cmd == "/to":
             if not self.active_transport:
                 self._log_system("Pick a mode first (press F3).")
@@ -5280,6 +5527,8 @@ class RadioTUI(App):
                 box = self.query_one("#search-input", Input)
                 box.value = arg
                 self._run_search(arg)
+        elif cmd in ("/chats", "/archive", "/all"):
+            self._show_archive()
         elif cmd == "/mode":
             # Typed convenience: cycle modes just like the F3 key.
             self.action_choose_mode()
@@ -5349,6 +5598,11 @@ class RadioTUI(App):
         me = self.core.config.display_name
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None
+        # Winlink is email-style: the single-line composer can't hold real
+        # newlines, so let the operator type the literal escape "\n" to break the
+        # body into multiple lines. (Other transports keep the text verbatim.)
+        if self.active_transport == "winlink" and "\\n" in text:
+            text = text.replace("\\n", "\n")
         # Radio interlock: a send on a continuous radio mode (JS8Call/Mercury)
         # keys the shared HF radio, so refuse while another transport holds it.
         # (Winlink sends only *queue* to Pat's outbox — the radio is keyed by the

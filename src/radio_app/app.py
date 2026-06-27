@@ -50,6 +50,11 @@ class App:
         # is DIRECT). Push the operator identity from [station] into any transport
         # that accepts it, so users don't have to duplicate it per transport block.
         self._apply_station_identity()
+        # Tell every transport where downloaded content (attachments/files) goes,
+        # so all modes save into the one central directory the user picked at
+        # setup ([storage].download_dir). Done in-memory (not persisted per
+        # transport) so changing the central path updates every mode at once.
+        self._apply_download_dir()
         # Read-only NomadNet page browser over the Reticulum transport (if any),
         # with an offline page cache backed by the same database file.
         ret = next((t for t in self.transports if t.name == "reticulum"), None)
@@ -105,6 +110,23 @@ class App:
             setter = getattr(transport, "set_identity", None)
             if callable(setter):
                 setter(callsign, groups)
+
+    def apply_download_dir(self) -> None:
+        """Push the central download directory into every transport.
+
+        Transports that save downloaded content (e.g. Reticulum attachments)
+        expose ``set_download_dir``; others simply don't define it. Re-callable
+        at runtime so changing ``[storage].download_dir`` (e.g. via setup) takes
+        effect across all modes immediately.
+        """
+        path = str(self.config.download_dir())
+        for transport in self.transports:
+            setter = getattr(transport, "set_download_dir", None)
+            if callable(setter):
+                setter(path)
+
+    # Internal alias used during construction.
+    _apply_download_dir = apply_download_dir
 
     # -- lifecycle ------------------------------------------------------------
 

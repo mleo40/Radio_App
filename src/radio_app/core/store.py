@@ -76,6 +76,19 @@ class SearchHit:
     thread_key: str
 
 
+@dataclass(frozen=True)
+class ThreadSummary:
+    """A per-conversation rollup for the cross-mode "All chats" archive."""
+
+    thread_key: str
+    transport: str
+    count: int
+    last_ts: str
+    last_sender: str
+    last_content: str
+    last_status: str
+
+
 class MessageStore:
     """Thin wrapper around SQLite for storing and querying messages."""
 
@@ -193,6 +206,51 @@ class MessageStore:
             """
         )
         return [(r["thread_key"], r["n"], r["last_ts"]) for r in cur.fetchall()]
+
+    def thread_summaries(self, limit: int = 1000) -> list[ThreadSummary]:
+        """Per-conversation rollups across ALL transports, newest activity first.
+
+        Powers the cross-mode "All chats" archive (the superset of the per-mode
+        thread list). For each thread it returns the message count, last-activity
+        time, the carrying transport (most recent non-empty), and a preview of
+        the latest message (sender, body, status) so the UI can show who/what
+        without a second read. One grouped query + one detail query per thread —
+        the thread count is small in practice (the per-mode pane already loops
+        per thread).
+        """
+        rows = self._conn.execute(
+            """
+            SELECT thread_key, COUNT(*) AS n, MAX(timestamp) AS last_ts
+            FROM messages GROUP BY thread_key ORDER BY last_ts DESC LIMIT ?
+            """,
+            (max(1, limit),),
+        ).fetchall()
+        out: list[ThreadSummary] = []
+        for r in rows:
+            key = r["thread_key"]
+            last = self._conn.execute(
+                """
+                SELECT sender, content, status, transport,
+                    (SELECT transport FROM messages
+                     WHERE thread_key = ? AND transport != ''
+                     ORDER BY timestamp DESC LIMIT 1) AS resolved_transport
+                FROM messages WHERE thread_key = ?
+                ORDER BY timestamp DESC LIMIT 1
+                """,
+                (key, key),
+            ).fetchone()
+            out.append(
+                ThreadSummary(
+                    thread_key=key,
+                    transport=(last["resolved_transport"] if last else "") or "",
+                    count=r["n"] or 0,
+                    last_ts=r["last_ts"] or "",
+                    last_sender=(last["sender"] if last else "") or "",
+                    last_content=(last["content"] if last else "") or "",
+                    last_status=(last["status"] if last else "") or "",
+                )
+            )
+        return out
 
     def read_thread(self, thread_key: str, limit: int = 200) -> list[UnifiedMessage]:
         cur = self._conn.execute(

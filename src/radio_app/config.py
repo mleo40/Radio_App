@@ -56,7 +56,14 @@ _DEFAULTS: dict[str, Any] = {
         # lawful in your jurisdiction and service.
         "allow_encrypted_on_hf": False,
     },
-    "storage": {"database": "conversations.db"},
+    "storage": {
+        "database": "conversations.db",
+        # Single directory where ALL downloadable content is saved locally
+        # (Winlink attachments, Reticulum/LXMF file attachments, etc.). Asked
+        # for during first-run setup and used by every mode. Empty = default
+        # XDG data dir (…/radio_app/downloads).
+        "download_dir": "",
+    },
     "transports": {},
     "groups": {},
     "subscriptions": {"groups": [], "show_unsubscribed": False},
@@ -172,6 +179,23 @@ class Config:
         if db_path.is_absolute():
             return db_path
         return self.path.parent / db_path
+
+    def download_dir(self) -> Path:
+        """Central directory for ALL downloaded content, used by every mode.
+
+        Resolves ``[storage].download_dir`` (asked during setup): expands ``~``,
+        treats a relative path as relative to the config dir, and falls back to
+        the XDG data home (``…/radio_app/downloads``) when unset. This is the one
+        place every transport saves attachments/files, so downloads from any mode
+        land together.
+        """
+        configured = str(self.storage.get("download_dir", "") or "").strip()
+        if configured:
+            p = Path(os.path.expandvars(configured)).expanduser()
+            return p if p.is_absolute() else (self.path.parent / p)
+        base = os.environ.get("XDG_DATA_HOME")
+        root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+        return root / _DEFAULT_DIRNAME / "downloads"
 
     def enabled_transports(self) -> dict[str, dict[str, Any]]:
         """Return only transports whose block has ``enabled = true``."""

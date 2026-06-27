@@ -28,10 +28,12 @@ Pat itself is a separate program the operator installs — it is never bundled.
 from __future__ import annotations
 
 import asyncio
+import email
 import json
 import logging
 import mimetypes
 import os
+import re
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -990,7 +992,7 @@ class WinlinkTransport(Transport):
                 _HTTP_TIMEOUT_S,
             )
             detail = json.loads(detail_raw)
-            body_text = str(detail.get("Body", ""))
+            body_text = decode_winlink_body(str(detail.get("Body", "")))
             entry = {**entry, **detail}  # detail carries the body + same fields
         except Exception as exc:  # noqa: BLE001
             log.debug("Winlink message fetch failed for %s: %s", mid, exc)
@@ -1184,4 +1186,117 @@ def _first_addr(value: object) -> str:
     if isinstance(value, list):
         return _addr_str(value[0]) if value else ""
     return _addr_str(value)
+
+
+def decode_winlink_body(raw: str) -> str:
+    """Decode an inbound Winlink body that arrives as a raw MIME entity.
+
+    Pat's ``Body`` is usually decoded plain text, but some messages (e.g. ones
+    composed by Winlink Express with ``Content-Transfer-Encoding: base64`` or
+    multipart bodies) come through as a raw MIME part — headers followed by an
+    encoded payload — which is unreadable if shown verbatim. When the body looks
+    like MIME we parse it with the stdlib ``email`` module and return the decoded
+    text (base64/quoted-printable handled, ``text/plain`` preferred, HTML
+    stripped as a fallback). Non-MIME bodies are returned unchanged.
+    """
+    if not raw or not _looks_like_mime(raw):
+        return raw
+    try:
+        message = email.message_from_string(raw)
+    except Exception:  # noqa: BLE001 - never let a parse error hide the mail
+        return raw
+    decoded = _extract_mime_text(message).strip()
+    # A declared base64/utf-8 part that is actually garbage decodes to mojibake;
+    # showing the original (at least partly legible) raw is better than that.
+    if not decoded or _looks_garbled(decoded):
+        return raw
+    return decoded
+
+
+def _looks_garbled(text: str) -> bool:
+    """Heuristic: True when decoded text is mostly unreadable (mojibake).
+
+    Triggers on the Unicode replacement char (from a failed decode) or when a
+    large share of characters are control/non-printable bytes — the signature of
+    base64 content that decoded to binary rather than real text.
+    """
+    if not text:
+        return False
+    if "\ufffd" in text:
+        return True
+    bad = sum(
+        1 for ch in text
+        if ch not in "\t\n\r" and (ord(ch) < 32 or ord(ch) == 127)
+    )
+    return bad > len(text) * 0.2
+
+
+def _looks_like_mime(raw: str) -> bool:
+    """True when ``raw`` begins with a MIME header block (Content-Type/-Encoding).
+
+    Scans the leading header lines only: a real MIME entity starts with
+    ``Key: value`` headers (or folded continuations) and includes a
+    ``Content-Type`` or ``Content-Transfer-Encoding`` header. This keeps ordinary
+    prose — even text that happens to mention "content-type" mid-paragraph — from
+    being treated as MIME.
+    """
+    saw_content_header = False
+    for line in raw.splitlines():
+        if not line.strip():
+            break  # blank line ends the header block
+        low = line.lower()
+        if low.startswith(("content-type:", "content-transfer-encoding:")):
+            saw_content_header = True
+        elif not (line[:1].isspace() or ":" in line):
+            return False  # not a header line -> not a leading MIME header block
+    return saw_content_header
+
+
+def _extract_mime_text(message: email.message.Message) -> str:
+    """Pull readable text out of a parsed MIME message.
+
+    Prefers decoded ``text/plain`` parts; if none yield text, falls back to
+    stripped ``text/html``.
+    """
+    plains: list[str] = []
+    htmls: list[str] = []
+    parts = message.walk() if message.is_multipart() else [message]
+    for part in parts:
+        if part.is_multipart():
+            continue
+        ctype = part.get_content_type()
+        if ctype == "text/plain":
+            plains.append(_part_text(part))
+        elif ctype == "text/html":
+            htmls.append(_part_text(part))
+    text = "\n".join(p for p in plains if p).strip()
+    if text:
+        return text
+    html = "\n".join(h for h in htmls if h).strip()
+    return _strip_html(html) if html else ""
+
+
+def _part_text(part: email.message.Message) -> str:
+    """Decode a single non-multipart MIME part to text (handles base64/QP)."""
+    payload = part.get_payload(decode=True)
+    if payload is None:
+        body = part.get_payload()
+        return body if isinstance(body, str) else ""
+    charset = part.get_content_charset() or "utf-8"
+    try:
+        return payload.decode(charset, "replace")
+    except (LookupError, ValueError):
+        return payload.decode("utf-8", "replace")
+
+
+def _strip_html(html: str) -> str:
+    """Crude HTML-to-text fallback: drop scripts/styles/tags, unescape entities."""
+    import html as html_lib
+
+    text = re.sub(r"(?is)<(script|style).*?</\1>", "", html)
+    text = re.sub(r"(?s)<[^>]+>", " ", text)
+    text = html_lib.unescape(text)
+    text = re.sub(r"[ \t]+", " ", text)
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    return text.strip()
 

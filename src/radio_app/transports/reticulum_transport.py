@@ -750,15 +750,32 @@ class ReticulumTransport(Transport):
                 log.warning("[reticulum] cannot read attachment %s: %s", p, exc)
         return out
 
+    def set_download_dir(self, path: str) -> None:
+        """Set the central download directory (where all modes save files).
+
+        Called by the app from ``[storage].download_dir``. A per-transport
+        ``attachments_dir`` override (if set) still wins; otherwise inbound
+        attachments are saved here so downloads from every mode land together.
+        """
+        self._central_download_dir = str(path or "").strip()
+
     def attachments_dir(self) -> str:
-        """Directory where received attachments are saved (config or default)."""
+        """Directory where received attachments are saved.
+
+        Resolution order: a per-transport ``attachments_dir`` override, then the
+        central ``[storage].download_dir`` (shared by all modes), then the XDG
+        data default.
+        """
         configured = str(self.config.get("attachments_dir", "")).strip()
         if configured:
             return os.path.expanduser(os.path.expandvars(configured))
+        central = str(getattr(self, "_central_download_dir", "") or "").strip()
+        if central:
+            return os.path.expanduser(os.path.expandvars(central))
         base = os.environ.get("XDG_DATA_HOME") or os.path.join(
             os.path.expanduser("~"), ".local", "share"
         )
-        return os.path.join(base, "radio_app", "attachments")
+        return os.path.join(base, "radio_app", "downloads")
 
     def _save_inbound_attachments(
         self, lxm, source_hex: str
