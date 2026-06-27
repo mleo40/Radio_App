@@ -23,10 +23,10 @@ Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ u
 
 Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
        F5 = cycle Watch/Health/Logs/Favorites   Ctrl+R = refresh
-       Ctrl+C / Ctrl+Q / q = quit
+       Ctrl+F = search history   Ctrl+C / Ctrl+Q / q = quit
 Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
-  /favorites,  /logs,  /loglevel <level>,  /browse <hash>[:/page/x.mu],
-  /nodes,  /peers,  /help,  /quit
+  /favorites,  /logs,  /loglevel <level>,  /search <text>,
+  /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
 """
 
 from __future__ import annotations
@@ -746,6 +746,10 @@ class RadioTUI(App):
     #fav-bar { height: 1; padding: 0 1; }
     #fav-spacer { width: 1fr; }
     #favorites-list { height: 1fr; }
+    #search-view { height: 1fr; }
+    #search-input { height: 3; margin: 0 1; }
+    #search-help { height: 1; color: $text-muted; padding: 0 1; }
+    #search-results { height: 1fr; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -773,6 +777,10 @@ class RadioTUI(App):
         ("delete", "remove_favorite", "Remove fav"),
         Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
         ("ctrl+r", "refresh", "Refresh"),
+        # Full-text history search palette. Priority so it fires even while the
+        # composer (or another Input) has focus.
+        Binding("ctrl+f", "search", "Search", priority=True),
+        Binding("escape", "close_search", "Close search", show=False, priority=True),
         # Hidden easter egg: technical "about" overview. show=False keeps it out
         # of the footer; priority lets it fire even while the composer is focused.
         Binding("ctrl+g", "about", "About", show=False, priority=True),
@@ -811,6 +819,10 @@ class RadioTUI(App):
         # Cycle the Watch stream group filter: only on the Watch surface.
         if action == "cycle_watch_group":
             return self.view == "monitor"
+        # Escape only closes the search palette while it's open (otherwise let
+        # the key pass through to focused widgets).
+        if action == "close_search":
+            return self.view == "search"
         return True
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -901,6 +913,10 @@ class RadioTUI(App):
         # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
         # endpoint up/down), shown under its line on the Health board.
         self._winlink_paths: list[dict] = []
+        # Search palette: row index -> (thread_key, transport) for opening a hit,
+        # plus the surface to restore when the palette is closed with Esc.
+        self._search_hits: list[tuple[str, str]] = []
+        self._search_prev_view: str = "active"
         # Logs surface state. ``_logs_min_level`` is the severity floor the live
         # log feed renders at (cycled by the Level button / set by /loglevel).
         # ``_logs_paused`` freezes the live feed so the operator can scroll back
@@ -1042,6 +1058,18 @@ class RadioTUI(App):
                     )
                     yield Button("\u2716 Remove", id="fav-remove", classes="modebtn")
                 yield ListView(id="favorites-list")
+            with Vertical(id="search-view"):
+                yield Static(
+                    "Search history — type to find messages across every mode "
+                    "(full-text). Enter on a result opens that conversation. "
+                    "[Esc] closes.",
+                    id="search-help",
+                )
+                yield Input(
+                    placeholder="Search messages…  (e.g. 'net control', 'brid')",
+                    id="search-input",
+                )
+                yield ListView(id="search-results")
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
         yield Footer()
@@ -4523,6 +4551,11 @@ class RadioTUI(App):
         elif list_id == "favorites-list":
             if idx < len(self._fav_keys) and self._fav_keys[idx]:
                 self._open_favorite(self._fav_keys[idx])
+        elif list_id == "search-results":
+            if idx < len(self._search_hits):
+                thread_key, transport = self._search_hits[idx]
+                if thread_key:
+                    self._open_thread(thread_key, transport)
 
     def _load_thread(self, thread_key: str) -> None:
         if self.core is None:
@@ -4998,6 +5031,10 @@ class RadioTUI(App):
         if idx >= len(self._monitor_entries):
             return
         thread_key, transport = self._monitor_entries[idx]
+        self._open_thread(thread_key, transport)
+
+    def _open_thread(self, thread_key: str, transport: str) -> None:
+        """Open a conversation, switching the active mode to its transport."""
         # Entering a conversation switches the active mode to its transport.
         if transport and transport != self.active_transport:
             self.active_transport = transport
@@ -5012,6 +5049,95 @@ class RadioTUI(App):
         self._update_status()
         self.query_one("#composer", Input).focus()
 
+    # -- search palette -------------------------------------------------------
+
+    def action_search(self) -> None:
+        """Open the full-text history search palette (Ctrl+F)."""
+        self._show_search()
+
+    def action_close_search(self) -> None:
+        """Close the search palette, returning to the prior surface."""
+        if self.view != "search":
+            return
+        prev = self._search_prev_view
+        if prev == "monitor":
+            self._show_watch()
+        elif prev == "health":
+            self._show_health()
+        elif prev == "logs":
+            self._show_logs()
+        elif prev == "favorites":
+            self._show_favorites()
+        elif prev == "nomadnet":
+            self._show_nomadnet()
+        else:
+            self._show_active()
+
+    def _show_search(self) -> None:
+        """Show the search palette and focus its input.
+
+        Remembers the current surface so Esc can restore it. The global composer
+        is disabled here; the dedicated search box drives the query.
+        """
+        if self.view != "search":
+            self._search_prev_view = self.view
+        self.view = "search"
+        self.query_one("#main", ContentSwitcher).current = "search-view"
+        self._enable_composer(False)
+        self._update_modebar()
+        self._update_status()
+        box = self.query_one("#search-input", Input)
+        box.focus()
+        # Re-run the current term so reopening keeps prior results in view.
+        self._run_search(box.value.strip())
+
+    def _run_search(self, term: str) -> None:
+        """Execute a search and render ranked hits (newest/most-relevant first)."""
+        results = self.query_one("#search-results", ListView)
+        results.clear()
+        self._search_hits.clear()
+        term = (term or "").strip()
+        if self.core is None or not term:
+            return
+        try:
+            hits = self.core.store.search_ranked(term, limit=200)
+        except Exception:  # noqa: BLE001 - a bad query must never crash the UI
+            hits = []
+        if not hits:
+            results.append(ListItem(Label("[dim]No matches.[/dim]")))
+            self._search_hits.append(("", ""))
+            return
+        for hit in hits:
+            results.append(ListItem(Label(self._format_search_hit(hit))))
+            self._search_hits.append((hit.thread_key, hit.message.transport or ""))
+
+    def _format_search_hit(self, hit) -> str:
+        """Render one search result row: time · mode · sender · snippet."""
+        msg = hit.message
+        ts = msg.timestamp.strftime("%Y-%m-%d %H:%M")
+        name = msg.transport or "?"
+        color = self._mode_color(name)
+        mode_tag = f"[{color}]{name:<9}[/{color}]"
+        who = "[cyan]you[/cyan]" if msg.status is not DeliveryStatus.RECEIVED else msg.sender
+        snippet = self._render_snippet(hit.snippet)
+        return f"[dim]{ts}[/dim] {mode_tag} {who}: {snippet}"
+
+    @staticmethod
+    def _render_snippet(snippet: str) -> str:
+        """Escape Rich markup in a snippet, then apply match highlighting.
+
+        The store wraps matched terms in sentinel control chars (SNIPPET_OPEN/
+        CLOSE) that can't occur in real text, so we can safely escape first and
+        swap the sentinels for reverse-video markup afterward.
+        """
+        from ..core.store import SNIPPET_CLOSE, SNIPPET_OPEN
+
+        safe = snippet.replace("\\", "\\\\").replace("[", "\\[")
+        safe = safe.replace(SNIPPET_OPEN, "[reverse]").replace(
+            SNIPPET_CLOSE, "[/reverse]"
+        )
+        return safe
+
     # -- composer -------------------------------------------------------------
     def _enable_composer(self, enabled: bool) -> None:
         composer = self.query_one("#composer", Input)
@@ -5023,6 +5149,11 @@ class RadioTUI(App):
         )
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
+        # The dedicated search box drives the history palette; Enter just keeps
+        # the results (selection opens a thread). Route it before view logic.
+        if event.input.id == "search-input":
+            self._run_search(event.value.strip())
+            return
         # In NomadNet the bottom composer is repurposed as an address bar so the
         # input position stays put across modes - route by view, not widget id.
         # Slash-commands (/fav, /help, /quit, ...) must still work there, so we
@@ -5066,6 +5197,11 @@ class RadioTUI(App):
         self._send(text)
 
     def on_input_changed(self, event: Input.Changed) -> None:
+        # Live, type-ahead history search (FTS prefix-matches the last word).
+        if event.input.id == "search-input":
+            if self.view == "search":
+                self._run_search(event.value.strip())
+            return
         # Keep the live size counter in the status bar current as the operator
         # types into the active mode's composer.
         if (
@@ -5091,6 +5227,7 @@ class RadioTUI(App):
                 "/fav add|rm|list|only [<id> [label]], "
                 "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
                 "/logs, /loglevel <debug|info|warning|error>, "
+                "/search <text> (Ctrl+F), "
                 "/channel list|add <index> <#name> [secret], "
                 "/freq [<MHz|Hz>], /band [<name>], "
                 "/inbox, /relay <CALL> <text>, /cmd [<CALL>] <SNR?|GRID?|...>, "
@@ -5126,6 +5263,12 @@ class RadioTUI(App):
             self._show_logs()
         elif cmd in ("/loglevel", "/loglvl"):
             self._set_log_level(arg)
+        elif cmd in ("/search", "/find"):
+            self._show_search()
+            if arg:
+                box = self.query_one("#search-input", Input)
+                box.value = arg
+                self._run_search(arg)
         elif cmd == "/mode":
             # Typed convenience: cycle modes just like the F3 key.
             self.action_choose_mode()

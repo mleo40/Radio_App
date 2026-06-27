@@ -174,7 +174,7 @@ now auto-reconnects (so a sync can fire when the stack comes online).
 ## Past-chats history view + searchable message archive
 
 **Requested:** 2026-06-26
-**Status:** In progress (CLI history + search done; FTS5 + TUI surface queued)
+**Status:** In progress (CLI history + search done; FTS5 + TUI surface done; export queued)
 **Area:** `core/store.py`, `cli.py`, `ui/tui.py`
 
 Give users a way to browse and search their full conversation history offline.
@@ -195,12 +195,22 @@ read/query feature, not a data-model change.
 2. **Full-text search (FTS5)** — add a SQLite FTS5 virtual table mirroring
    `content` (+ sender/group), synced via triggers/on-insert, for fast ranked
    queries with `snippet()` highlighting. FTS5 ships with Python's `sqlite3` (no
-   new dependency).
+   new dependency). ✅ **Done** — external-content `messages_fts` (unicode61)
+   kept in sync by AFTER INSERT/UPDATE/DELETE triggers, backfilled on first
+   creation (migration via `'rebuild'`). New `MessageStore.search_ranked()`
+   returns `SearchHit`s (message + highlighted snippet + thread) ordered by BM25
+   `rank`, with a transparent LIKE fallback when a sqlite build lacks FTS5.
+   Single words prefix-match; multi-word terms match as a phrase.
 3. **TUI history/search surface** — a search box (`/search <text>` or a `Ctrl+F`
    palette) listing matches with mode + timestamp that jump into the thread at the
    hit; plus a cross-mode "All chats" archive view (the thread list scopes by
    transport — this is the superset) with mode/date/group/unread filters and
-   lazy-loaded scroll-back for huge threads.
+   lazy-loaded scroll-back for huge threads. ✅ **Search palette done** — a
+   dedicated `#search-view` (Ctrl+F / `/search`) with a live, type-ahead input
+   over `search_ranked()`; results show time · mode · sender · highlighted
+   snippet, Enter opens the conversation (switching to its mode), Esc restores
+   the prior surface. The cross-mode "All chats" archive view + lazy scroll-back
+   remain a later polish item.
 4. **Richer filters** — query by captured `metadata` (SNR, hops, frequency,
    delivery status), date-bucketed "jump to date", per-contact stats.
 5. **Export/backup** — `radioapp export --thread <key> --format {json,txt,md,

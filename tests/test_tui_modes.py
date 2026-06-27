@@ -347,6 +347,51 @@ def test_watch_pause_and_clear(config_path):
     asyncio.run(run())
 
 
+def test_search_surface_finds_and_opens_thread(config_path):
+    """Ctrl+F search lists hits; selecting one opens that conversation."""
+    from textual.widgets import ListView
+
+    from radio_app.core.message import AddressType, UnifiedMessage
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            for i, (txt, tr) in enumerate(
+                [("net control bridge", "js8call"), ("hello there", "reticulum")]
+            ):
+                app.core.store.save(
+                    UnifiedMessage(
+                        sender=f"s{i}",
+                        content=txt,
+                        transport=tr,
+                        address_type=AddressType.DIRECT,
+                        recipient="me",
+                    )
+                )
+            app.action_search()
+            await pilot.pause()
+            assert app.query_one("#main").current == "search-view"
+            app._run_search("bridge")
+            await pilot.pause()
+            results = app.query_one("#search-results", ListView)
+            assert len(results.children) == 1
+            assert len(app._search_hits) == 1
+            thread_key, transport = app._search_hits[0]
+            app._open_thread(thread_key, transport)
+            await pilot.pause()
+            assert app.query_one("#main").current == "active-view"
+            assert app.active_transport == "js8call"
+            # Esc from search returns to the prior surface.
+            app.action_search()
+            await pilot.pause()
+            app.action_close_search()
+            await pilot.pause()
+            assert app.query_one("#main").current != "search-view"
+
+    asyncio.run(run())
+
+
 def test_watch_buffer_is_bounded(config_path):
     """The Watch scrollback (buffer + rendered rows) is capped, not unbounded."""
     from textual.widgets import ListView
@@ -1913,6 +1958,7 @@ def test_watch_group_filter_cycles_and_filters(groups_config_path):
             assert app._monitor_entries == [("@TTP", "js8call")]
 
             app._cycle_watch_group()                # -> TTPNE
+            await pilot.pause()
             assert app._monitor_group_filter == "TTPNE"
             assert app._monitor_entries == [("@TTPNE", "js8call")]
 

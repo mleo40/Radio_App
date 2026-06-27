@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -33,6 +34,47 @@ CREATE INDEX IF NOT EXISTS idx_thread ON messages(thread_key, timestamp);
 CREATE INDEX IF NOT EXISTS idx_group ON messages(group_name);
 """
 
+# Full-text index over message bodies (+ sender/group) kept in sync with the
+# ``messages`` table by triggers. An *external-content* FTS5 table stores only
+# the index (not a copy of the text), mapping back via ``messages.rowid``. FTS5
+# is a compile-time option; on a sqlite build without it, creation raises and we
+# fall back to LIKE substring search (see MessageStore._init_fts / search_ranked).
+_FTS_SCHEMA = """
+CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
+    content, sender, group_name,
+    content='messages', content_rowid='rowid',
+    tokenize='unicode61'
+);
+CREATE TRIGGER IF NOT EXISTS messages_fts_ai AFTER INSERT ON messages BEGIN
+    INSERT INTO messages_fts(rowid, content, sender, group_name)
+    VALUES (new.rowid, new.content, new.sender, new.group_name);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_ad AFTER DELETE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, sender, group_name)
+    VALUES ('delete', old.rowid, old.content, old.sender, old.group_name);
+END;
+CREATE TRIGGER IF NOT EXISTS messages_fts_au AFTER UPDATE ON messages BEGIN
+    INSERT INTO messages_fts(messages_fts, rowid, content, sender, group_name)
+    VALUES ('delete', old.rowid, old.content, old.sender, old.group_name);
+    INSERT INTO messages_fts(rowid, content, sender, group_name)
+    VALUES (new.rowid, new.content, new.sender, new.group_name);
+END;
+"""
+
+# Sentinel markers FTS5 ``snippet()`` wraps around matched terms; the UI swaps
+# these control chars for its own highlight markup (they can't occur in text).
+SNIPPET_OPEN = "\x01"
+SNIPPET_CLOSE = "\x02"
+
+
+@dataclass(frozen=True)
+class SearchHit:
+    """A ranked search result: the message, a highlighted snippet, its thread."""
+
+    message: UnifiedMessage
+    snippet: str
+    thread_key: str
+
 
 class MessageStore:
     """Thin wrapper around SQLite for storing and querying messages."""
@@ -44,9 +86,38 @@ class MessageStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.commit()
+        self._init_fts()
+
+    def _init_fts(self) -> None:
+        """Create the FTS5 index + sync triggers, backfilling on first creation.
+
+        Sets ``self.fts_enabled``. If this sqlite build lacks FTS5 the creation
+        raises ``OperationalError`` ("no such module: fts5") and we degrade to
+        LIKE search — no data is lost, queries are just unranked.
+        """
+        self.fts_enabled = False
+        try:
+            existed = (
+                self._conn.execute(
+                    "SELECT 1 FROM sqlite_master "
+                    "WHERE type='table' AND name='messages_fts'"
+                ).fetchone()
+                is not None
+            )
+            self._conn.executescript(_FTS_SCHEMA)
+            if not existed:
+                # Populate the index from any pre-existing rows (migration).
+                self._conn.execute(
+                    "INSERT INTO messages_fts(messages_fts) VALUES('rebuild')"
+                )
+            self._conn.commit()
+            self.fts_enabled = True
+        except sqlite3.OperationalError:
+            self.fts_enabled = False
 
     def close(self) -> None:
         self._conn.close()
+
 
     # -- writes ---------------------------------------------------------------
 
@@ -235,6 +306,149 @@ class MessageStore:
         if not newest_first:
             msgs.reverse()
         return msgs
+
+    def search_ranked(
+        self,
+        term: str,
+        *,
+        limit: int = 100,
+        transport: str | None = None,
+        group: str | None = None,
+        since: datetime | None = None,
+        until: datetime | None = None,
+    ) -> list[SearchHit]:
+        """Full-text search returning ranked hits with highlighted snippets.
+
+        Uses the FTS5 index (BM25 ``rank`` ordering + ``snippet()`` highlights)
+        when available, transparently falling back to a LIKE substring scan
+        (newest-first, snippet built around the first match) otherwise. Optional
+        ``transport``/``group``/``since``/``until`` filters are ANDed in. The
+        single-word case is prefix-matched ("brid" finds "bridge"); multi-word
+        terms match as an ordered phrase.
+        """
+        term = (term or "").strip()
+        if not term:
+            return []
+        if self.fts_enabled:
+            hits = self._search_fts(term, limit, transport, group, since, until)
+            if hits is not None:
+                return hits
+        return self._search_like(term, limit, transport, group, since, until)
+
+    def _search_fts(
+        self,
+        term: str,
+        limit: int,
+        transport: str | None,
+        group: str | None,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> list[SearchHit] | None:
+        clauses = ["messages_fts MATCH ?"]
+        params: list[object] = [self._fts_match_query(term)]
+        if transport:
+            clauses.append("m.transport = ?")
+            params.append(transport)
+        if group:
+            clauses.append("m.group_name = ?")
+            params.append(group.lstrip("@"))
+        if since is not None:
+            clauses.append("m.timestamp >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("m.timestamp <= ?")
+            params.append(until.isoformat())
+        params.append(max(1, limit))
+        sql = (
+            "SELECT m.*, "
+            f"snippet(messages_fts, 0, '{SNIPPET_OPEN}', '{SNIPPET_CLOSE}', "
+            "'…', 12) AS snip "
+            "FROM messages_fts JOIN messages m ON m.rowid = messages_fts.rowid "
+            f"WHERE {' AND '.join(clauses)} ORDER BY rank LIMIT ?"
+        )
+        try:
+            rows = self._conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            # Malformed MATCH expression for this term — let the caller fall back.
+            return None
+        return [
+            SearchHit(
+                self._row_to_message(r),
+                r["snip"] or r["content"],
+                r["thread_key"],
+            )
+            for r in rows
+        ]
+
+    def _search_like(
+        self,
+        term: str,
+        limit: int,
+        transport: str | None,
+        group: str | None,
+        since: datetime | None,
+        until: datetime | None,
+    ) -> list[SearchHit]:
+        clauses = ["content LIKE ?"]
+        params: list[object] = [f"%{term}%"]
+        if transport:
+            clauses.append("transport = ?")
+            params.append(transport)
+        if group:
+            clauses.append("group_name = ?")
+            params.append(group.lstrip("@"))
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since.isoformat())
+        if until is not None:
+            clauses.append("timestamp <= ?")
+            params.append(until.isoformat())
+        params.append(max(1, limit))
+        rows = self._conn.execute(
+            f"SELECT * FROM messages WHERE {' AND '.join(clauses)} "
+            "ORDER BY timestamp DESC LIMIT ?",
+            params,
+        ).fetchall()
+        return [
+            SearchHit(
+                self._row_to_message(r),
+                self._like_snippet(r["content"], term),
+                r["thread_key"],
+            )
+            for r in rows
+        ]
+
+    @staticmethod
+    def _fts_match_query(term: str) -> str:
+        """Build a safe FTS5 MATCH expression from free user text.
+
+        A single alphanumeric word becomes a prefix query (``brid`` → ``brid*``);
+        anything else is phrase-quoted token-by-token (embedded quotes escaped),
+        which neutralises FTS5 operators so a user can't accidentally write
+        query syntax.
+        """
+        tokens = [t for t in term.split() if t]
+        if not tokens:
+            return '""'
+        if len(tokens) == 1 and tokens[0].isalnum():
+            return tokens[0] + "*"
+        return " ".join('"' + t.replace('"', '""') + '"' for t in tokens)
+
+    @staticmethod
+    def _like_snippet(content: str, term: str, *, width: int = 60) -> str:
+        """Build a highlighted snippet around the first case-insensitive match."""
+        low = content.lower()
+        idx = low.find(term.lower())
+        if idx < 0:
+            return content[:width] + ("…" if len(content) > width else "")
+        start = max(0, idx - width // 3)
+        end = min(len(content), idx + len(term) + width // 2)
+        prefix = "…" if start > 0 else ""
+        suffix = "…" if end < len(content) else ""
+        head = content[start:idx]
+        match = content[idx : idx + len(term)]
+        tail = content[idx + len(term) : end]
+        return f"{prefix}{head}{SNIPPET_OPEN}{match}{SNIPPET_CLOSE}{tail}{suffix}"
 
     def delete_thread(self, thread_key: str) -> int:
         """Delete every message in a conversation. Returns rows removed.
