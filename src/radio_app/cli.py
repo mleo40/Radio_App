@@ -51,7 +51,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_send = sub.add_parser("send", help="send a message")
     target = p_send.add_mutually_exclusive_group(required=True)
     target.add_argument("--to", help="recipient identity/callsign")
-    target.add_argument("--group", help="group name, e.g. TTP")
+    target.add_argument("--group", help="group name, e.g. EMS")
     target.add_argument("--broadcast", action="store_true", help="send to everyone")
     p_send.add_argument("text", help="message body")
     p_send.add_argument(
@@ -72,7 +72,7 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_read = sub.add_parser("read", help="print a conversation")
     rtarget = p_read.add_mutually_exclusive_group(required=True)
-    rtarget.add_argument("--thread", help="thread key, e.g. @TTP or a callsign")
+    rtarget.add_argument("--thread", help="thread key, e.g. @EMS or a callsign")
     rtarget.add_argument("--to", help="direct conversation with this identity")
     p_read.add_argument("--limit", type=int, default=200)
     p_read.set_defaults(func=_cmd_read)
@@ -80,7 +80,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_history = sub.add_parser(
         "history", help="browse stored message history (offline, read-only)"
     )
-    p_history.add_argument("--thread", help="thread key, e.g. @TTP or a callsign")
+    p_history.add_argument("--thread", help="thread key, e.g. @EMS or a callsign")
     p_history.add_argument("--to", help="alias for --thread (a direct conversation)")
     p_history.add_argument(
         "--mode", help="only this transport (js8call, reticulum, meshcore, winlink)"
@@ -155,7 +155,7 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     export_target = p_export.add_mutually_exclusive_group(required=True)
     export_target.add_argument(
-        "--thread", help="export a single thread, e.g. @TTP or a callsign"
+        "--thread", help="export a single thread, e.g. @EMS or a callsign"
     )
     export_target.add_argument(
         "--all", action="store_true", help="export every stored thread"
@@ -181,7 +181,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_tmpl.add_argument("name", nargs="?", help="template name for 'send'")
     tmpl_target = p_tmpl.add_mutually_exclusive_group()
     tmpl_target.add_argument("--to", help="recipient identity/callsign")
-    tmpl_target.add_argument("--group", help="group name, e.g. TTP")
+    tmpl_target.add_argument("--group", help="group name, e.g. EMS")
     p_tmpl.add_argument("--transport", help="force a specific transport")
     p_tmpl.set_defaults(func=_cmd_templates)
 
@@ -195,7 +195,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_group = sub.add_parser(
         "group", help="manage a group's cross-mode membership (incoming)"
     )
-    p_group.add_argument("name", help="group name, e.g. ttp")
+    p_group.add_argument("name", help="group name, e.g. ems")
     p_group.add_argument(
         "action",
         choices=["show", "add", "remove", "tag", "untag", "delete"],
@@ -471,7 +471,7 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sched_add.add_argument("message", help="message text to send")
     sched_target = p_sched_add.add_mutually_exclusive_group(required=True)
     sched_target.add_argument("--to", help="recipient callsign/identity")
-    sched_target.add_argument("--group", help="group name, e.g. TTP")
+    sched_target.add_argument("--group", help="group name, e.g. EMS")
     p_sched_add.add_argument(
         "--at", metavar="HH:MM|YYYY-MM-DDTHH:MM",
         help="fire at this UTC time today (HH:MM) or a full ISO datetime",

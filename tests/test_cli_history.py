@@ -26,10 +26,10 @@ def seeded(tmp_path, monkeypatch):
     store = MessageStore(db)
     base = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
     rows = [
-        ("W1AW", "js8call", "TTP", "net starting on 40m", AddressType.GROUP, 0),
+        ("W1AW", "js8call", "EMS", "net starting on 40m", AddressType.GROUP, 0),
         ("KE0XYZ", "js8call", None, "copy, checking in", AddressType.DIRECT, 1),
         ("a1b2c3", "meshcore", None, "mesh relay up here", AddressType.DIRECT, 2),
-        ("N0CALL", "reticulum", "TTP", "anyone need a bridge?", AddressType.GROUP, 3),
+        ("N0CALL", "reticulum", "EMS", "anyone need a bridge?", AddressType.GROUP, 3),
         ("W1AW", "winlink", None, "SITREP attached", AddressType.DIRECT, 5),
     ]
     for sender, tp, grp, content, at, doff in rows:
@@ -81,8 +81,8 @@ def test_query_filters_by_transport(seeded):
 def test_query_filters_by_group_tolerates_at_prefix(seeded):
     s = _store(seeded)
     try:
-        assert len(s.query(group="TTP")) == 2
-        assert len(s.query(group="@TTP")) == 2
+        assert len(s.query(group="EMS")) == 2
+        assert len(s.query(group="@EMS")) == 2
     finally:
         s.close()
 
@@ -138,16 +138,16 @@ def test_cli_history_all(seeded, capsys):
     assert "net starting on 40m" in out
     assert "SITREP attached" in out
     # Cross-mode listing annotates each line with its thread.
-    assert "{@TTP}" in out
+    assert "{@EMS}" in out
 
 
 def test_cli_history_thread_scopes_and_hides_thread_tag(seeded, capsys):
-    assert main(["history", "--thread", "@TTP"]) == 0
+    assert main(["history", "--thread", "@EMS"]) == 0
     out = capsys.readouterr().out
     assert "net starting on 40m" in out and "anyone need a bridge?" in out
     assert "copy, checking in" not in out
     # With a specific thread the {thread} annotation is omitted.
-    assert "{@TTP}" not in out
+    assert "{@EMS}" not in out
 
 
 def test_cli_history_mode_and_group_filters(seeded, capsys):

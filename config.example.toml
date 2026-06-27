@@ -110,8 +110,8 @@ auto_connect = false
 # (dialing/connected, per-message transfer progress) plus a final summary.
 verbose_session_log = false
 
-[groups.TTP]
-display_name = "TTP Net"
+[groups.EMS]
+display_name = "EMS Net"
 transports = [
     "js8call",
     "reticulum",
@@ -119,10 +119,10 @@ transports = [
 # Cross-mode membership (INCOMING aggregation only — outbound fan-out is not
 # done yet). Membership is entirely operator-declared; the app never guesses
 # that two identities are "the same person". Manage these with the CLI:
-#   radioapp group TTP add js8call:KE0XYZ
-#   radioapp group TTP add reticulum:ff00112233...
-#   radioapp group TTP tag ttp        # a JS8 @group or Winlink subject tag
-#   radioapp group TTP show
+#   radioapp group EMS add js8call:KE0XYZ
+#   radioapp group EMS add reticulum:ff00112233...
+#   radioapp group EMS tag ems        # a JS8 @group or Winlink subject tag
+#   radioapp group EMS show
 # A member is "transport:identifier" (a bare "identifier" matches any
 # transport); hex hashes are prefix-tolerant, callsigns case-insensitive.
 members = [
@@ -130,38 +130,38 @@ members = [
     "reticulum:ff00112233445566778899aabbccddeeff",
 ]
 # Native group names / labels that also map a message into this group
-# regardless of who sent it (e.g. a JS8 @TTP group or a Winlink "ttp" tag).
+# regardless of who sent it (e.g. a JS8 @EMS group or a Winlink "ems" tag).
 tags = [
-    "ttp",
+    "ems",
 ]
 
-[groups.TTPNE]
-display_name = "TTP NE Region"
+[groups.EMSNE]
+display_name = "EMS NE Region"
 transports = [
     "js8call",
 ]
 
 [subscriptions]
 groups = [
-    "TTP",
-    "TTPNE",
+    "EMS",
+    "EMSNE",
 ]
 show_unsubscribed = false
 
 [[filters]]
-name = "TTP on HF gets my attention"
+name = "EMS on HF gets my attention"
 action = "notify"
 
 [filters.match]
-group = "TTP"
+group = "EMS"
 transport = "js8call"
 
 [[filters]]
-name = "Keep all TTP* groups quietly"
+name = "Keep all EMS* groups quietly"
 action = "file"
 
 [filters.match]
-group = "TTP*"
+group = "EMS*"
 
 [[filters]]
 name = "Default"

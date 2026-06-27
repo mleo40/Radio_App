@@ -31,7 +31,7 @@ windows, propagation forecasts, and low-power deferred sends. Backed by a new
 
 **Delivered:**
 1. ✅ **`scheduled_messages` table** in `store.py` — `ScheduledEntry` dataclass; `schedule_add`, `schedule_pending`, `schedule_cancel`, `schedule_mark_sent` methods.
-2. ✅ **CLI** — `radioapp schedule add --delay 30m|1h --to CALL|--group TTP "text"` and `--at HH:MM|ISO`. `radioapp schedule list` / `radioapp schedule cancel <id>`.
+2. ✅ **CLI** — `radioapp schedule add --delay 30m|1h --to CALL|--group EMS "text"` and `--at HH:MM|ISO`. `radioapp schedule list` / `radioapp schedule cancel <id>`.
 3. ✅ **TUI** — `_check_scheduled` worker fires every 30 seconds via `set_interval`; `/sched +30m [text]` or `/sched HH:MM [text]` schedules from the composer or inline text.
 
 ---
@@ -123,7 +123,7 @@ in `config.toml` as `name = "text"` pairs.
 
 **Delivered:**
 1. ✅ **`core/templates.py`** — `Templates` class loading from `[templates]` config section.
-2. ✅ **CLI** — `radioapp templates` (list) / `radioapp templates send <name> --to CALL|--group TTP`.
+2. ✅ **CLI** — `radioapp templates` (list) / `radioapp templates send <name> --to CALL|--group EMS`.
 3. ✅ **TUI** — `/tmpl [<name>]` lists templates or loads one into the composer for review before sending.
 
 ---
@@ -156,8 +156,8 @@ post-incident review.
 
 Aggregate one collective's traffic across every transport under a single label,
 with membership **declared by the operator** (no automatic identity
-reconciliation): "callsign XYZ is in TTP, mesh hash … is in TTP, the Winlink tag
-`ttp` is TTP" → all stamped as group `ttp`.
+reconciliation): "callsign XYZ is in EMS, mesh hash … is in EMS, the Winlink tag
+`ems` is EMS" → all stamped as group `ems`.
 
 **Delivered (incoming aggregation):**
 1. ✅ **Membership model** — `Group` gained `members` (a list of
@@ -177,7 +177,7 @@ reconciliation): "callsign XYZ is in TTP, mesh hash … is in TTP, the Winlink t
    covered by backup/restore). Documented in `config.example.toml`.
 
 **Deferred (separate request):**
-- **Outbound fan-out** — "post to TTP across all member transports" with
+- **Outbound fan-out** — "post to EMS across all member transports" with
   per-mode size caps + HF-encryption compliance + self-echo dedup.
 
 **Follow-up done — Watch group filter (instead of a new panel):** rather than
@@ -187,7 +187,7 @@ favorites. The `[g]` key / "◯ Group" button cycles off → each configured gro
 off; favorites and group filters are mutually exclusive. Reuses all of Watch's
 rendering / pause / sort-by-mode machinery and is driven by the same
 `metadata['groups']` stamp. A group also auto-claims its own name as a tag (a
-JS8 `@TTP` message maps to group `TTP` with no extra config).
+JS8 `@EMS` message maps to group `EMS` with no extra config).
 
 **Presentation sketch (not built — design only):** a single scrollback that
 interleaves every member's messages in time order, each row prefixed with a

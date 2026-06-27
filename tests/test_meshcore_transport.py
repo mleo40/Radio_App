@@ -127,7 +127,7 @@ def test_send_group_uses_channel_index():
     # Our node name is prepended so channel peers can attribute the message.
     assert t._mc.commands.chan_sent[-1] == (2, "MeFi: net in 5")
     # Non-numeric group falls back to the public channel 0.
-    msg2 = UnifiedMessage.to_group("me", "TTP", "hello")
+    msg2 = UnifiedMessage.to_group("me", "EMS", "hello")
     asyncio.run(t.send(msg2))
     assert t._mc.commands.chan_sent[-1] == (0, "MeFi: hello")
 

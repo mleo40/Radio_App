@@ -30,13 +30,13 @@ class _FakeDest:
 # -- pure helpers -------------------------------------------------------------
 
 def test_group_shared_key_is_deterministic_and_name_normalised():
-    a = group_shared_key("TTP")
+    a = group_shared_key("EMS")
     assert len(a) == 32
     # Leading '@', case and surrounding space don't change the channel.
-    assert group_shared_key("@ttp") == a
-    assert group_shared_key("  TtP ") == a
+    assert group_shared_key("@ems") == a
+    assert group_shared_key("  EmS ") == a
     # Different channel -> different key.
-    assert group_shared_key("ttpne") != a
+    assert group_shared_key("emsne") != a
 
 
 def test_encode_decode_group_payload_round_trips():
@@ -62,8 +62,8 @@ def test_capabilities_advertise_groups_and_broadcast():
 
 def test_set_identity_normalises_and_dedupes_group_names():
     t = ReticulumTransport({})
-    t.set_identity("N0CALL", ("@TTP", "TTP", "ttpNE"))
-    assert t._group_names == ("ttp", "ttpne")
+    t.set_identity("N0CALL", ("@EMS", "EMS", "emsNE"))
+    assert t._group_names == ("ems", "emsne")
 
 
 # -- inbound (received GROUP packet -> UnifiedMessage) ------------------------
@@ -79,11 +79,11 @@ def _capture(config=None):
 def test_received_group_packet_builds_group_message():
     t, captured = _capture()
     payload = encode_group_payload("cc" * 16, "Carol", "hello group")
-    t._group_packet_received("ttp", payload, object())
+    t._group_packet_received("ems", payload, object())
     assert len(captured) == 1
     msg = captured[0]
     assert msg.address_type is AddressType.GROUP
-    assert msg.group == "ttp"
+    assert msg.group == "ems"
     assert msg.sender == "cc" * 16
     assert msg.content == "hello group"
     assert msg.metadata["display_name"] == "Carol"
@@ -101,13 +101,13 @@ def test_received_group_packet_ignores_our_own_echo():
     t, captured = _capture()
     # Sender == our local destination hash -> dropped (no echo).
     payload = encode_group_payload("ab" * 16, "Me", "loopback")
-    t._group_packet_received("ttp", payload, object())
+    t._group_packet_received("ems", payload, object())
     assert captured == []
 
 
 def test_received_group_packet_ignores_garbage():
     t, captured = _capture()
-    t._group_packet_received("ttp", b"not a payload", object())
+    t._group_packet_received("ems", b"not a payload", object())
     assert captured == []
 
 
@@ -129,11 +129,11 @@ def _sendable(config=None):
 
 def test_send_group_encodes_and_routes_to_named_channel():
     t, sent = _sendable({"display_name": "Bob"})
-    msg = UnifiedMessage.to_group("me", "TTP", "meet at noon")
+    msg = UnifiedMessage.to_group("me", "EMS", "meet at noon")
     assert asyncio.run(t.send(msg)) is True
     assert len(sent) == 1
     norm, payload = sent[0]
-    assert norm == "ttp"
+    assert norm == "ems"
     parsed = decode_group_payload(payload)
     assert parsed["content"] == "meet at noon"
     assert parsed["sender"] == "ab" * 16   # our local hash
@@ -151,14 +151,14 @@ def test_send_broadcast_routes_to_reserved_channel():
 
 def test_send_group_rejects_oversize_payload():
     t, sent = _sendable()
-    msg = UnifiedMessage.to_group("me", "TTP", "x" * 500)  # over the packet MDU
+    msg = UnifiedMessage.to_group("me", "EMS", "x" * 500)  # over the packet MDU
     assert asyncio.run(t.send(msg)) is False
     assert sent == []   # never handed to the radio
 
 
 def test_send_when_not_running_returns_false():
     t, _ = _capture()
-    msg = UnifiedMessage.to_group("me", "TTP", "hi")
+    msg = UnifiedMessage.to_group("me", "EMS", "hi")
     assert asyncio.run(t.send(msg)) is False
 
 
@@ -170,7 +170,7 @@ def test_is_reachable_true_for_group_when_up():
     pytest.importorskip("RNS")
     t = ReticulumTransport({})
     t._running = True
-    grp = UnifiedMessage.to_group("me", "TTP", "hi")
+    grp = UnifiedMessage.to_group("me", "EMS", "hi")
     bcast = UnifiedMessage(
         sender="me", content="x", address_type=AddressType.BROADCAST
     )
@@ -205,8 +205,8 @@ def test_real_group_channel_shared_hash_and_crypto(tmp_path):
     t = ReticulumTransport({"display_name": "Bob"})
     t._local_destination = _Dest()
 
-    out = t._group_out_destination("ttp")     # creates OUT (+ joins IN)
-    din = t._groups_in["ttp"]                  # the IN from the internal join
+    out = t._group_out_destination("ems")     # creates OUT (+ joins IN)
+    din = t._groups_in["ems"]                  # the IN from the internal join
     assert out is not None and din is not None
     assert out.hash == din.hash                # deterministic shared channel
 

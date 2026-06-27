@@ -80,7 +80,7 @@ class FilterEngine:
 
     def decide(self, msg: UnifiedMessage) -> FilterAction:
         """Return the action to take for an inbound message."""
-        # Subscription gate for *named* group traffic (e.g. amateur @TTP groups
+        # Subscription gate for *named* group traffic (e.g. amateur @EMS groups
         # you opt into). Numeric group tags are device-managed channels - notably
         # MeshCore channels addressed as @0/@2 - that the operator already joined
         # on the companion radio, so they bypass the opt-in gate; otherwise their

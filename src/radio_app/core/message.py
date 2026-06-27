@@ -26,7 +26,7 @@ class AddressType(str, Enum):
 
     DIRECT = "direct"        # one specific identity
     BROADCAST = "broadcast"  # everyone (e.g. JS8 @ALLCALL)
-    GROUP = "group"          # a named collective (e.g. @TTP, @TTPNE)
+    GROUP = "group"          # a named collective (e.g. @EMS, @EMSNE)
 
 
 class DeliveryStatus(str, Enum):

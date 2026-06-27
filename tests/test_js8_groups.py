@@ -16,18 +16,18 @@ def _line(obj) -> bytes:
 
 
 def test_groups_in_line_explicit_string_field():
-    line = _line({"type": "STATION.INFO", "params": {"GROUPS": "@TTP, @TTPNE"}})
-    assert _groups_in_line(line) == ["@TTP", "@TTPNE"]
+    line = _line({"type": "STATION.INFO", "params": {"GROUPS": "@EMS, @EMSNE"}})
+    assert _groups_in_line(line) == ["@EMS", "@EMSNE"]
 
 
 def test_groups_in_line_list_field():
-    line = _line({"params": {"GROUPS": ["TTP", "EMCOMM"]}})
-    assert _groups_in_line(line) == ["TTP", "EMCOMM"]
+    line = _line({"params": {"GROUPS": ["EMS", "EMCOMM"]}})
+    assert _groups_in_line(line) == ["EMS", "EMCOMM"]
 
 
 def test_groups_in_line_scrapes_freetext_info():
-    line = _line({"params": {"INFO": "qrv on @ttp and @ares today"}})
-    assert _groups_in_line(line) == ["@TTP", "@ARES"]
+    line = _line({"params": {"INFO": "qrv on @ems and @ares today"}})
+    assert _groups_in_line(line) == ["@EMS", "@ARES"]
 
 
 def test_groups_in_line_ignores_non_json_and_empty():

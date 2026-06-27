@@ -62,8 +62,8 @@ def store(tmp_path):
 
 def _make_router(store, transports, rules=None, subs=None):
     groups = GroupRegistry(
-        groups={"TTP": Group("TTP", transports=["fake"])},
-        subscriptions=subs if subs is not None else {"TTP"},
+        groups={"EMS": Group("EMS", transports=["fake"])},
+        subscriptions=subs if subs is not None else {"EMS"},
         show_unsubscribed=False,
     )
     rules = rules or [FilterRule(action=FilterAction.SHOW)]
@@ -174,11 +174,11 @@ def test_group_fanout(store):
     asyncio.run(t.start())
     router = _make_router(store, [t])
 
-    msg = UnifiedMessage.to_group("me", "TTP", "net in 5")
+    msg = UnifiedMessage.to_group("me", "EMS", "net in 5")
     ok = asyncio.run(router.send(msg))
 
     assert ok is True
-    assert t.sent[0].group == "TTP"
+    assert t.sent[0].group == "EMS"
 
 
 def test_inbound_dedup(store):
@@ -204,10 +204,10 @@ def test_subscription_filter_drops_unsubscribed_group(store):
     # Subscribed to nothing; router registers the inbound filter callback.
     _make_router(store, [t], subs=set())
 
-    msg = UnifiedMessage.to_group("N0CALL", "TTP", "should be dropped")
+    msg = UnifiedMessage.to_group("N0CALL", "EMS", "should be dropped")
 
     asyncio.run(t.receive(msg))
-    assert store.read_thread("@TTP") == []
+    assert store.read_thread("@EMS") == []
 
 
 def test_numeric_channel_bypasses_subscription_gate(store):

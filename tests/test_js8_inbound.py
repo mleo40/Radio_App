@@ -29,10 +29,10 @@ def test_direct_to_my_callsign():
 
 
 def test_group_message_sets_group():
-    ev = _directed(FROM="KE7XYZ", TO="@TTP", TEXT="net in 5")
+    ev = _directed(FROM="KE7XYZ", TO="@EMS", TEXT="net in 5")
     msg = message_from_event(ev, my_callsign="N0CALL")
     assert msg.address_type is AddressType.GROUP
-    assert msg.group == "TTP"
+    assert msg.group == "EMS"
     assert msg.recipient is None
 
 
@@ -56,18 +56,18 @@ def test_directed_to_other_station_is_overheard_not_direct():
 
 
 def test_bare_subscribed_group_treated_as_group():
-    ev = _directed(FROM="KE7XYZ", TO="TTP", TEXT="hi")
-    msg = message_from_event(ev, my_callsign="N0CALL", my_groups=("TTP",))
+    ev = _directed(FROM="KE7XYZ", TO="EMS", TEXT="hi")
+    msg = message_from_event(ev, my_callsign="N0CALL", my_groups=("EMS",))
     assert msg.address_type is AddressType.GROUP
-    assert msg.group == "TTP"
+    assert msg.group == "EMS"
 
 
 def test_target_folded_into_text_fallback():
     # Some builds omit TO and prefix the body with the target token.
-    ev = {"type": "RX.DIRECTED", "params": {"FROM": "KE7XYZ", "TEXT": "@TTP rolling"}}
+    ev = {"type": "RX.DIRECTED", "params": {"FROM": "KE7XYZ", "TEXT": "@EMS rolling"}}
     msg = message_from_event(ev, my_callsign="N0CALL")
     assert msg.address_type is AddressType.GROUP
-    assert msg.group == "TTP"
+    assert msg.group == "EMS"
     assert msg.content == "rolling"
 
 
@@ -80,7 +80,7 @@ def test_non_message_event_returns_none():
 
 
 def test_stable_id_uses_native_id_when_present():
-    ev = _directed(FROM="KE7XYZ", TO="@TTP", TEXT="x", _ID=12345)
+    ev = _directed(FROM="KE7XYZ", TO="@EMS", TEXT="x", _ID=12345)
     a = message_from_event(ev)
     b = message_from_event(ev)
     assert a.msg_id == b.msg_id == "js8-12345"
@@ -106,18 +106,18 @@ def test_sentinel_id_minus_one_does_not_collapse_messages():
 
 def test_zero_id_falls_back_to_hash():
     msg = message_from_event(
-        _directed(FROM="KE7XYZ", TO="@TTP", TEXT="hi", _ID=0)
+        _directed(FROM="KE7XYZ", TO="@EMS", TEXT="hi", _ID=0)
     )
     assert msg.msg_id != "js8-0"
     assert msg.msg_id.startswith("js8-")
 
 
 def test_stable_id_is_deterministic_without_native_id():
-    params = {"FROM": "KE7XYZ", "TO": "@TTP", "FREQ": 7078000}
-    first = _stable_msg_id(params, "KE7XYZ", "@TTP", "same body")
-    second = _stable_msg_id(params, "KE7XYZ", "@TTP", "same body")
+    params = {"FROM": "KE7XYZ", "TO": "@EMS", "FREQ": 7078000}
+    first = _stable_msg_id(params, "KE7XYZ", "@EMS", "same body")
+    second = _stable_msg_id(params, "KE7XYZ", "@EMS", "same body")
     assert first == second
-    other = _stable_msg_id(params, "KE7XYZ", "@TTP", "different body")
+    other = _stable_msg_id(params, "KE7XYZ", "@EMS", "different body")
     assert first != other
 
 
@@ -125,7 +125,7 @@ def test_stable_id_is_deterministic_without_native_id():
 
 
 def test_snr_query_from_cmd_param():
-    ev = _directed(FROM="KE7XYZ", TO="@TTP", TEXT="SNR?", CMD="SNR?")
+    ev = _directed(FROM="KE7XYZ", TO="@EMS", TEXT="SNR?", CMD="SNR?")
     msg = message_from_event(ev, my_callsign="N0CALL")
     assert msg.metadata["js8_command"] == "SNR?"
     assert msg.metadata["js8_query"] is True

@@ -27,6 +27,9 @@ radio_app.log
 # Local user config (the single source of truth lives outside the repo)
 config.toml
 
+# Local-only planning notes (not tracked)
+NEXT_STEPS.local.md
+
 # Stray literal "~" dir (accidental ~/.reticulum holding private identity keys)
 /~/
 

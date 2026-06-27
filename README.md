@@ -24,7 +24,7 @@ via Pat), or the **Mercury** HF modem.
 - **Pluggable transports** — every medium implements one `Transport` interface and
   self-registers. Adding a platform (known or unknown) is a single new class, or a
   separate pip package discovered via entry points. No core changes.
-- **Groups** (`@TTP`, `@TTPNE`) — a first-class address type, mapped to each
+- **Groups** (`@EMS`, `@EMSNE`) — a first-class address type, mapped to each
   transport's native mechanism, with **subscriptions + filter rules** controlling
   what you receive.
 - **Saved conversations** — every message (any transport) persists to one SQLite
@@ -91,7 +91,7 @@ src/radio_app/
 │   ├── message.py         # UnifiedMessage, AddressType, DeliveryStatus
 │   ├── selector.py        # best-transport scoring + SelectionMode
 │   ├── router.py          # outbound selection/fallback, inbound dedup/filter/store
-│   ├── groups.py          # Group + GroupRegistry (@TTP, subscriptions)
+│   ├── groups.py          # Group + GroupRegistry (@EMS, subscriptions)
 │   ├── filters.py         # inbound filter rule engine
 │   ├── store.py           # SQLite persistence + FTS5 search + scheduled messages
 │   ├── templates.py       # canned message templates ([templates] config section)
@@ -144,7 +144,7 @@ Identity here is an **anonymous** Reticulum address — your callsign/grid are n
 attached on this medium.
 
 **Groups & broadcast.** Reticulum also supports shared **group channels** and a
-**broadcast** channel. A group (e.g. `@TTP`) maps to an RNS **GROUP destination**
+**broadcast** channel. A group (e.g. `@EMS`) maps to an RNS **GROUP destination**
 whose address *and* encryption key are derived from the channel name — so every
 node that knows the name joins the same encrypted channel, exactly like a
 MeshCore hashtag channel. Group/broadcast traffic is single-packet (≈300 chars)
@@ -357,16 +357,16 @@ An unrecognized value falls back to the first configured mode.
 ```bash
 radioapp send --to N0CALL "meeting at 1900"        # router picks best transport
 radioapp send --to N0CALL --mode secure "private"  # require encryption
-radioapp send --group TTP "net starts in 5"        # send to a group
+radioapp send --group EMS "net starts in 5"        # send to a group
 radioapp send --to N0CALL --transport js8call "hi" # force a transport
 
 radioapp threads                  # list saved conversations
-radioapp read --thread @TTP       # print a group thread
+radioapp read --thread @EMS       # print a group thread
 radioapp read --to N0CALL         # print a direct thread
-radioapp listen --group TTP       # stream incoming TTP messages
+radioapp listen --group EMS       # stream incoming EMS messages
 
 radioapp groups                   # list configured groups (+ subscription mark)
-radioapp sub add TTPNE            # subscribe to a group
+radioapp sub add EMSNE            # subscribe to a group
 radioapp transports               # list transports + capabilities
 radioapp status                   # what's up / connected
 radioapp nodes                    # discovered NomadNet sites
@@ -382,9 +382,9 @@ radioapp js8 relay W1AW "qsy 40m" # leave a store-and-forward message for W1AW
 radioapp send --to N0CALL --mode secure --encrypt "x"  # guarded on HF
 
 # Message history & export
-radioapp history [--thread @TTP] [--mode js8call] [--status received] [--snr-min 5] [--date 2026-06-27]
+radioapp history [--thread @EMS] [--mode js8call] [--status received] [--snr-min 5] [--date 2026-06-27]
 radioapp search "checking in" [--status received] [--snr-min 0]
-radioapp export --thread @TTP --format md --out history.md
+radioapp export --thread @EMS --format md --out history.md
 radioapp export --all --format maildir --out ~/radio_archive
 
 # Templates
@@ -403,7 +403,7 @@ radioapp bands --mode JS8                 # all JS8Call calling frequencies
 
 # Scheduled sends
 radioapp schedule add --delay 30m --to W1AW "Net check-in"
-radioapp schedule add --at 19:00 --group TTP "Net starting now"
+radioapp schedule add --at 19:00 --group EMS "Net starting now"
 radioapp schedule list
 radioapp schedule cancel <id>
 
@@ -444,7 +444,7 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     standard JS8 directed queries to the open conversation with one tap —
     **SNR?**, **HEARING?**, **STATUS?**, **INFO?**. Open a callsign to ask one
     station, or an `@GROUP` to ask the whole group (the target prefix is added
-    for you, e.g. `@TTP SNR?`).
+    for you, e.g. `@EMS SNR?`).
   - **JS8Call inbox & relay:** `/inbox` lists the messages JS8Call is holding
     for **store-and-forward** relay; `/relay <CALL> <text>` leaves a message
     JS8Call forwards when it next hears that station; and `/cmd [<CALL>] <SNR?|
@@ -490,7 +490,7 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   MeshCore channels, MeshCore contacts and hashes**, grouped by type. Add entries
   **without the peer being online first** — type
   `[node|peer|call|group|channel|contact] <id> [label]` in the bar and press
-  Enter (e.g. `node a1b2… HomeNode` saves a NomadNet server; `@TTP net` saves a
+  Enter (e.g. `node a1b2… HomeNode` saves a NomadNet server; `@EMS net` saves a
   JS8Call group; `channel ops Ops Net` saves a MeshCore channel by name;
   `contact a1b2c3… Bob` saves a MeshCore user by public-key prefix; the type is
   persisted). You can also favorite the **open conversation** in one step — the
@@ -520,7 +520,7 @@ radioapp tui              # launch it
 
  Watch tab: all transports, read-only
    12:01:03 [reticulum] ENC a1b2... -> : ping over LoRa
-   12:01:04 [js8call]   --- KE7XYZ  -> @TTP: net in 5
+   12:01:04 [js8call]   --- KE7XYZ  -> @EMS: net in 5
 ```
 
 Keys: **F3** choose mode · **F4** favorites-only (Watch + every mode) ·
@@ -533,7 +533,7 @@ In-composer commands:
 |---------|--------|
 | `/to <callsign>` | start/switch a **direct** conversation (in the active mode) |
 | `/to @GROUP` | start/switch a **group** conversation (if the mode supports groups) |
-| `/to <callsign\|@GROUP> <message>` | switch **and** immediately send (e.g. `/to @TTP SNR?`) |
+| `/to <callsign\|@GROUP> <message>` | switch **and** immediately send (e.g. `/to @EMS SNR?`) |
 | `/channel add <index> <#name> [secret]` | (MeshCore) create/join a channel — a `#name` hashtag channel needs no secret |
 | `/channel list` / `/channel rm <index>` | (MeshCore) list channels / drop a saved channel name |
 | `/fav add [type] <id> [label]` | add a favorite (`type` = `node\|peer\|call\|group\|channel\|contact`) |

@@ -234,20 +234,20 @@ def test_js8_group_favorite_classify_and_open(config_path):
             await pilot.pause()
             # A '@'-prefixed favorite is classified as a JS8Call group, and a
             # callsign as a callsign - even without an explicit type keyword.
-            app._add_favorite_from_input("@TTP tactical net")
+            app._add_favorite_from_input("@EMS tactical net")
             app._add_favorite_from_input("KD2ABC Bob")
             await pilot.pause()
-            assert app._favorite_kind_by_id("@TTP") == "group"
+            assert app._favorite_kind_by_id("@EMS") == "group"
             assert app._favorite_kind_by_id("KD2ABC") == "callsign"
             # The group kind persists to config.
             from radio_app.core.favorites import Favorites
             reloaded = Favorites.from_config(app.core.config)
-            assert reloaded.match("@TTP").kind == "group"
-            # Opening the group favorite switches to js8call and targets @TTP.
-            app._open_favorite("@TTP")
+            assert reloaded.match("@EMS").kind == "group"
+            # Opening the group favorite switches to js8call and targets @EMS.
+            app._open_favorite("@EMS")
             await pilot.pause()
             assert app.active_transport == "js8call"
-            assert app.current_target == "@TTP"
+            assert app.current_target == "@EMS"
 
     asyncio.run(run())
 
@@ -263,15 +263,15 @@ def test_import_js8_groups_button_and_apply(config_path):
             ids = [b.id for b in app.query_one("#fav-bar").query(Button)]
             assert "fav-import-groups" in ids
             # Applying fetched groups adds them as group-kind favorites.
-            app._apply_imported_groups(["TTP", "TTPNE"])
+            app._apply_imported_groups(["EMS", "EMSNE"])
             await pilot.pause()
-            assert app.core.favorites.is_favorite("@TTP")
-            assert app.core.favorites.is_favorite("@TTPNE")
-            assert app._favorite_kind_by_id("@TTP") == "group"
+            assert app.core.favorites.is_favorite("@EMS")
+            assert app.core.favorites.is_favorite("@EMSNE")
+            assert app._favorite_kind_by_id("@EMS") == "group"
             # Persisted with the group kind.
             from radio_app.core.favorites import Favorites
             reloaded = Favorites.from_config(app.core.config)
-            assert reloaded.match("@TTPNE").kind == "group"
+            assert reloaded.match("@EMSNE").kind == "group"
 
     asyncio.run(run())
 
@@ -596,7 +596,7 @@ def test_friendly_name_truncates_hash_in_left_pane(config_path):
             assert app._display_id(full) == full[:10] + "\u2026"
             # ...callsigns/@groups are shown unchanged.
             assert app._display_id("KD2ABC") == "KD2ABC"
-            assert app._display_id("@TTP") == "@TTP"
+            assert app._display_id("@EMS") == "@EMS"
 
     asyncio.run(run())
 
@@ -679,9 +679,9 @@ def test_learn_does_not_override_callsign_or_group(config_path):
             await pilot.pause()
             # An explicit group/callsign classification must never be flipped by
             # a (spoofable) announce aspect.
-            app.core.favorites.add("@TTP", kind="group")
-            app._learn_favorite_kind("@TTP", "node")
-            assert app.core.favorites.match("@TTP").kind == "group"
+            app.core.favorites.add("@EMS", kind="group")
+            app._learn_favorite_kind("@EMS", "node")
+            assert app.core.favorites.match("@EMS").kind == "group"
 
     asyncio.run(run())
 
@@ -1224,11 +1224,11 @@ file = ""
 [transports.js8call]
 enabled = true
 port = 2442
-[groups.TTP]
-display_name = "TTP Net"
+[groups.EMS]
+display_name = "EMS Net"
 transports = ["js8call"]
-[groups.TTPNE]
-display_name = "TTP NE"
+[groups.EMSNE]
+display_name = "EMS NE"
 transports = ["js8call"]
 """
 
@@ -1279,7 +1279,7 @@ def test_js8_query_bar_sends_directed_query(groups_config_path):
                 "js8-query-STATUS",
                 "js8-query-INFO",
             ]
-            await app._handle_command("/to @TTP")
+            await app._handle_command("/to @EMS")
             await pilot.pause()
             sent: list[str] = []
             app._send = lambda text: sent.append(text)  # type: ignore[assignment]
@@ -1321,17 +1321,17 @@ def test_group_favorites_always_show_in_left_pane(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            app.core.favorites.add("@TTP", kind="group")
+            app.core.favorites.add("@EMS", kind="group")
             app.core.favorites.add("@EMCOMM", kind="group")
             app._select_mode("js8call")
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
+            assert "@EMS" in app._thread_keys
             assert "@EMCOMM" in app._thread_keys
             # They also survive the favorites-only filter (groups always show).
             app.current_target = None
             app._toggle_active_fav_only()
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
+            assert "@EMS" in app._thread_keys
             assert "@EMCOMM" in app._thread_keys
 
     asyncio.run(run())
@@ -1355,7 +1355,7 @@ def test_left_pane_three_tier_sort_groups_dialog_then_others(config_path):
             msg.transport = "js8call"
             await app.core.router._handle_inbound(msg)
             # Group favorite + opened-only contacts (no dialog).
-            app.core.favorites.add("@TTP", kind="group")
+            app.core.favorites.add("@EMS", kind="group")
             for tgt in ("AA1AA", "MMM1M"):
                 await app._handle_command(f"/to {tgt}")
             app.current_target = None
@@ -1363,7 +1363,7 @@ def test_left_pane_three_tier_sort_groups_dialog_then_others(config_path):
             await pilot.pause()
             keys = app._thread_keys
             # Tier 0: groups first.
-            assert keys[0] == "@TTP"
+            assert keys[0] == "@EMS"
             # Tier 1: the contact we have dialog with (ZULU) precedes tier-2
             # opened-only contacts even though 'Z' sorts after 'A'/'M'.
             assert keys.index("ZULU") < keys.index("AA1AA")
@@ -1452,8 +1452,8 @@ def test_fav_only_always_shows_configured_groups(groups_config_path):
             app.current_target = None  # so it isn't kept as the open thread
             app._toggle_active_fav_only()
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
-            assert "@TTPNE" in app._thread_keys
+            assert "@EMS" in app._thread_keys
+            assert "@EMSNE" in app._thread_keys
             assert "N0CALL" not in app._thread_keys
 
     asyncio.run(run())
@@ -1936,13 +1936,13 @@ def test_watch_group_filter_cycles_and_filters(groups_config_path):
             await pilot.pause()
             app._show_watch()
             await pilot.pause()
-            # @TTP net, @TTPNE net, and an unrelated direct message.
+            # @EMS net, @EMSNE net, and an unrelated direct message.
             msgs = [
                 UnifiedMessage.to_group(
-                    "W1AW", "TTP", "ttp net", transport="js8call"
+                    "W1AW", "EMS", "ems net", transport="js8call"
                 ),
                 UnifiedMessage.to_group(
-                    "K2ABC", "TTPNE", "ne net", transport="js8call"
+                    "K2ABC", "EMSNE", "ne net", transport="js8call"
                 ),
                 UnifiedMessage(
                     sender="N0CALL", content="hi", transport="js8call",
@@ -1955,15 +1955,15 @@ def test_watch_group_filter_cycles_and_filters(groups_config_path):
             await pilot.pause()
             assert len(app._monitor_entries) == 3  # no filter: all shown
 
-            app._cycle_watch_group()                # -> first group (TTP)
+            app._cycle_watch_group()                # -> first group (EMS)
             await pilot.pause()
-            assert app._monitor_group_filter == "TTP"
-            assert app._monitor_entries == [("@TTP", "js8call")]
+            assert app._monitor_group_filter == "EMS"
+            assert app._monitor_entries == [("@EMS", "js8call")]
 
-            app._cycle_watch_group()                # -> TTPNE
+            app._cycle_watch_group()                # -> EMSNE
             await pilot.pause()
-            assert app._monitor_group_filter == "TTPNE"
-            assert app._monitor_entries == [("@TTPNE", "js8call")]
+            assert app._monitor_group_filter == "EMSNE"
+            assert app._monitor_entries == [("@EMSNE", "js8call")]
 
             app._cycle_watch_group()                # -> off again
             assert app._monitor_group_filter is None
@@ -1984,7 +1984,7 @@ def test_watch_group_and_fav_filters_mutually_exclusive(groups_config_path):
             app._toggle_fav_only()
             assert app._monitor_fav_only is True
             app._cycle_watch_group()
-            assert app._monitor_group_filter == "TTP"
+            assert app._monitor_group_filter == "EMS"
             assert app._monitor_fav_only is False
             # Favorites on again -> the group filter clears.
             app._toggle_fav_only()

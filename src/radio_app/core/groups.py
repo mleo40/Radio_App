@@ -1,4 +1,4 @@
-"""Group model (e.g. @TTP, @TTPNE) + cross-transport membership.
+"""Group model (e.g. @EMS, @EMSNE) + cross-transport membership.
 
 A group is a named, broadcast-style destination. This app owns the
 cross-transport group convention: each transport adapter maps a group to its
@@ -12,8 +12,8 @@ entirely operator-declared — there is no automatic identity reconciliation:
 * a **member** is a ``transport:identifier`` pair (e.g. ``js8call:KE0XYZ``,
   ``meshcore:a1b2c3…``, ``reticulum:ff0011…``). A bare ``identifier`` with no
   ``transport:`` prefix matches on any transport.
-* a **tag** is a native group / label (e.g. a JS8 ``@TTP`` group or a Winlink
-  subject tag ``ttp``) that maps a message into this group regardless of who
+* a **tag** is a native group / label (e.g. a JS8 ``@EMS`` group or a Winlink
+  subject tag ``ems``) that maps a message into this group regardless of who
   sent it.
 
 :meth:`GroupRegistry.groups_for_message` is the single, pure lookup the router
@@ -198,8 +198,8 @@ class GroupRegistry:
     def groups_for_tag(self, tag: str | None) -> list[str]:
         """Group names that claim a native group / label ``tag``.
 
-        A group always claims its own name (so a JS8 ``@TTP`` message maps to
-        group ``TTP`` with no extra config), plus any explicit ``tags`` it
+        A group always claims its own name (so a JS8 ``@EMS`` message maps to
+        group ``EMS`` with no extra config), plus any explicit ``tags`` it
         declares (e.g. a Winlink subject tag).
         """
         if not tag:

@@ -80,8 +80,8 @@ def test_send_directed_command_validates_and_transmits():
 
 def test_send_directed_command_to_group():
     t, w = _running()
-    assert asyncio.run(t.send_directed_command("@TTP", "HEARING?")) is True
-    assert _last(w)["value"] == "@TTP HEARING?"
+    assert asyncio.run(t.send_directed_command("@EMS", "HEARING?")) is True
+    assert _last(w)["value"] == "@EMS HEARING?"
 
 
 def test_send_directed_command_rejects_unknown():

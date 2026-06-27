@@ -1128,7 +1128,7 @@ class RadioTUI(App):
                     "groups, MeshCore channels/contacts & hashes. Add (works "
                     "offline): type "
                     "'[node|peer|call|group|channel|contact] <id> [label]' below "
-                    "+ Enter — e.g. 'node a1b2... HomeNode', '@TTP net' for a "
+                    "+ Enter — e.g. 'node a1b2... HomeNode', '@EMS net' for a "
                     "JS8Call group, 'channel ops Ops net', or 'contact a1b2c3... "
                     "Bob'. Enter on a row opens it. Delete: select a row, then "
                     "Remove (or Ctrl+D, or '/fav rm <id>').",
@@ -3154,7 +3154,7 @@ class RadioTUI(App):
         return self._favorite_kind_by_id(fav.id)
 
     def _favorite_kind_by_id(self, fid: str) -> str:
-        # A leading '@' is a JS8Call group, by convention (e.g. @TTP) - this is
+        # A leading '@' is a JS8Call group, by convention (e.g. @EMS) - this is
         # syntactic so it wins over any stored kind.
         if (fid or "").strip().startswith("@"):
             return "group"
@@ -5757,8 +5757,8 @@ class RadioTUI(App):
             if not arg:
                 self._log_system("usage: /to <callsign|@GROUP> [message]")
                 return
-            # Accept an optional trailing message: "/to @TTP SNR?" switches to the
-            # @TTP conversation AND sends "SNR?". Only the first token is the
+            # Accept an optional trailing message: "/to @EMS SNR?" switches to the
+            # @EMS conversation AND sends "SNR?". Only the first token is the
             # target; the remainder (if any) is sent as a message.
             target, _, trailing = arg.partition(" ")
             self.current_target = self._normalize_target(target)

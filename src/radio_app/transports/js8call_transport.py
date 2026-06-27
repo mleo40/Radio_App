@@ -2,7 +2,7 @@
 
 We do not drive the modem directly; we talk to a running JS8Call application over
 its TCP/JSON API (default port 2442). JS8Call natively understands ``@``-groups
-(e.g. @TTP), which is the model the rest of the app generalises from.
+(e.g. @EMS), which is the model the rest of the app generalises from.
 
 This adapter connects with the standard library only. The connection + JSON
 framing is implemented, and inbound ``RX.DIRECTED`` events are mapped to a fully
@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 _BROADCAST_TARGETS = {"", "@ALLCALL", "ALLCALL", "@HB", "@CQ", "CQ"}
 
 # Matches a leading group/callsign target token in free-form JS8 text, e.g.
-# "@TTP net in 5" or "KE7XYZ hello". Used only as a fallback when the structured
+# "@EMS net in 5" or "KE7XYZ hello". Used only as a fallback when the structured
 # ``TO`` param is absent.
 _LEADING_TARGET_RE = re.compile(r"^\s*(@?[A-Z0-9/]{2,})[\s:,-]+(.*)$", re.DOTALL)
 
@@ -185,7 +185,7 @@ def message_from_event(
         return None
 
     target = str(params.get("TO") or "").strip().upper()
-    # Fallback: some builds fold the target into the text body ("@TTP hello").
+    # Fallback: some builds fold the target into the text body ("@EMS hello").
     if not target:
         m = _LEADING_TARGET_RE.match(text)
         if m:
@@ -427,7 +427,7 @@ class JS8CallTransport(Transport):
             return False
         # Build the JS8Call API command. Directed/group text uses the API's
         # TX.SEND_MESSAGE, with the target encoded as a leading token in the body
-        # (JS8Call's on-air convention, e.g. "@TTP net in 5" / "KE7XYZ hello").
+        # (JS8Call's on-air convention, e.g. "@EMS net in 5" / "KE7XYZ hello").
         if msg.address_type is AddressType.GROUP and msg.group:
             target = f"@{msg.group.lstrip('@')}"
         elif msg.address_type is AddressType.DIRECT and msg.recipient:

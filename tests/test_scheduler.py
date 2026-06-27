@@ -129,12 +129,12 @@ def test_cli_schedule_add_1h_delay(cfg, capsys):
 
 
 def test_cli_schedule_add_compound_delay(cfg, capsys):
-    assert main(["schedule", "add", "--delay", "1h30m", "--group", "TTP", "later"]) == 0
+    assert main(["schedule", "add", "--delay", "1h30m", "--group", "EMS", "later"]) == 0
     assert "Scheduled" in capsys.readouterr().out
 
 
 def test_cli_schedule_add_at_time(cfg, capsys):
-    assert main(["schedule", "add", "--at", "23:59", "--group", "TTP", "net check"]) == 0
+    assert main(["schedule", "add", "--at", "23:59", "--group", "EMS", "net check"]) == 0
     assert "Scheduled" in capsys.readouterr().out
 
 

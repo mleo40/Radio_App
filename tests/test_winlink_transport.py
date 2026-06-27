@@ -418,7 +418,7 @@ def test_send_rejects_group_messages(fake_pat):
     async def run():
         t = _transport(url)
         await t.start()
-        msg = UnifiedMessage.to_group("N0CALL", "TTP", "hi all")
+        msg = UnifiedMessage.to_group("N0CALL", "EMS", "hi all")
         ok = await t.send(msg)
         await t.stop()
         return ok

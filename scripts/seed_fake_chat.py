@@ -50,7 +50,7 @@ SCRIPTS: dict[str, list[tuple[str, str]]] = {
     ],
     "4c8e0d12fa6b47931e5a7c0b9d2f3e64": [
         ("in", "hey, you around for the net later?"),
-        ("out", "yep, 1900 local on @TTP right?"),
+        ("out", "yep, 1900 local on @EMS right?"),
         ("in", "correct. bring the grid square for the log"),
         ("out", "will do, 73"),
     ],

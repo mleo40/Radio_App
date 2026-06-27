@@ -17,9 +17,9 @@ async def main():
     async with app.run_test(size=(96, 26)) as pilot:
         await pilot.pause()
 
-        # 1) User starts a group conversation: types "/to @TTP" + Enter
+        # 1) User starts a group conversation: types "/to @EMS" + Enter
         await pilot.click("#composer")
-        for ch in "/to @TTP":
+        for ch in "/to @EMS":
             await pilot.press(ch if ch != " " else "space")
         await pilot.press("enter")
         await pilot.pause()
@@ -31,7 +31,7 @@ async def main():
         await pilot.pause()
 
         # 3) A message arrives over the air (simulate an inbound from a peer)
-        inbound = UnifiedMessage.to_group("KE7XYZ", "TTP", "Copy, QRV on 40m")
+        inbound = UnifiedMessage.to_group("KE7XYZ", "EMS", "Copy, QRV on 40m")
         inbound.transport = "js8call"
         inbound.metadata = {"snr": -3, "freq": 7078000}
         await app.core.router._handle_inbound(inbound)
