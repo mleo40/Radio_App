@@ -1342,7 +1342,7 @@ def _cmd_transports(args: argparse.Namespace) -> int:
 
     discover_plugin_transports()
     for name, cls in sorted(TRANSPORT_REGISTRY.items()):
-        caps = cls.__new__(cls).capabilities()  # capabilities are static here
+        caps = cls().capabilities()  # capabilities are static; empty config = defaults
         print(
             f"{name:<12} mtu={caps.max_message_size:<8} "
             f"enc={'Y' if caps.supports_encryption else 'N'} "
