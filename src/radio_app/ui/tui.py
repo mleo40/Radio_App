@@ -4456,7 +4456,8 @@ class RadioTUI(App):
         bar = self.query_one("#modebar", Horizontal)
         # One chip per configured transport = one operating mode.
         for t in self.core.transports:
-            bar.mount(Button(t.name, id=f"mode-{t.name}", classes="modebtn"))
+            label = t.display_name or t.name
+            bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
         # NomadNet is a virtual mode (read-only page browsing over Reticulum).
         bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))

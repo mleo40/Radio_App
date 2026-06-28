@@ -111,6 +111,11 @@ class Transport(abc.ABC):
     #: Unique short name, e.g. "reticulum". Setting it registers the subclass.
     name: str = ""
 
+    #: Human-readable label shown in the mode-selector chip. Defaults to
+    #: ``name``; override when the internal name is an ugly slug (e.g. "wsjt_x"
+    #: → "WSJT-X"). The TUI uses this; the router always uses ``name``.
+    display_name: str = ""
+
     #: What the UI should render for this transport's mode workspace. "chat" is
     #: a contacts + conversation surface; "browse" is a page browser (NomadNet).
     #: Future surfaces can be added without touching the core.

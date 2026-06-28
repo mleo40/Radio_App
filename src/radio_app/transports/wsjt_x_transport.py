@@ -376,6 +376,7 @@ class WsjtXTransport(Transport):
     """WSJT-X UDP transport: receive FT8/FT4 decodes, send free-text messages."""
 
     name = "wsjt_x"
+    display_name = "WSJT-X"
 
     def __init__(self, config: dict | None = None) -> None:
         super().__init__(config)
