@@ -3783,6 +3783,9 @@ class RadioTUI(App):
         bar.display = (
             self.view == "active" and self.active_transport == "meshcore"
         )
+        down = self._health.get("meshcore") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            btn.disabled = down
 
     def _winlink_transport(self) -> Transport | None:
         """The live WinlinkTransport instance, or None when not configured."""
@@ -3806,6 +3809,9 @@ class RadioTUI(App):
             return
         show = self.view == "active" and self.active_transport == "winlink"
         bar.display = show
+        down = self._health.get("winlink") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            btn.disabled = down
         if not show:
             return
         t = self._winlink_transport()
@@ -4322,10 +4328,16 @@ class RadioTUI(App):
             return
         show = self.view == "active" and self.active_transport == "js8call"
         bar.display = show
+        down = self._health.get("js8call") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            btn.disabled = down
         # The bottom one-click query bar (SNR?/HEARING?/STATUS?/INFO?) tracks the
         # band bar's visibility - both belong to the JS8 chat panel.
         try:
-            self.query_one("#js8-query-bar", Horizontal).display = show
+            qbar = self.query_one("#js8-query-bar", Horizontal)
+            qbar.display = show
+            for btn in qbar.query(Button):
+                btn.disabled = down
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
         if not show:
