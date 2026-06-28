@@ -2348,6 +2348,16 @@ class RadioTUI(App):
                 anon = getter()
             except Exception:  # noqa: BLE001
                 anon = None
+        display = ""
+        display_getter = getattr(t, "local_display_name", None)
+        if callable(display_getter):
+            try:
+                display = display_getter() or ""
+            except Exception:  # noqa: BLE001
+                display = ""
+        if display:
+            suffix = f" [dim]({anon})[/dim]" if anon else ""
+            return f"[dim]id:[/dim] [b]{display}[/b]{suffix}"
         return f"[dim]id:[/dim] anonymous{f' ({anon})' if anon else ''}"
 
     def _transport_endpoint(self, t) -> str | None:
