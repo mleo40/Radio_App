@@ -748,6 +748,7 @@ class RadioTUI(App):
         padding: 0 1;
     }
     #modebar Button.-active { text-style: bold reverse; }
+    #modebar Button.-down { color: $text-muted; opacity: 40%; }
     #modebar #modebar-spacer { width: 1fr; height: 1; }
     #modebar #input-ind { width: auto; height: 1; color: $text-muted; padding: 0 1; }
     .-touch #modebar { height: 5; }
@@ -3740,12 +3741,20 @@ class RadioTUI(App):
             if bid == "mode-nomadnet":
                 btn.label = f"{self._health_dot('nomadnet')} nomadnet"
                 btn.set_class(current == "nomadnet", "-active")
+                btn.set_class(
+                    self._health.get("nomadnet") is ReachabilityStatus.DOWN,
+                    "-down",
+                )
             elif bid.startswith("mode-"):
                 name = bid[len("mode-"):]
                 btn.label = f"{self._health_dot(name)} {name}"
                 btn.set_class(
                     self.view == "active" and current == name,
                     "-active",
+                )
+                btn.set_class(
+                    self._health.get(name) is ReachabilityStatus.DOWN,
+                    "-down",
                 )
             elif bid == "view-watch":
                 btn.set_class(self.view == "monitor", "-active")
