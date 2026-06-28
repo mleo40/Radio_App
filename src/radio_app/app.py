@@ -20,10 +20,10 @@ from .core.nomadnet import NomadnetBrowser
 from .core.proc_manager import ProcManager
 from .core.radio_interlock import RadioInterlock
 from .core.router import Router
-from .core.timesource import WSJTXDTMonitor
 from .core.selector import SelectionMode
 from .core.station import Station
 from .core.store import MessageStore
+from .core.timesource import WSJTXDTMonitor
 from .transports import load_transports
 
 log = logging.getLogger(__name__)

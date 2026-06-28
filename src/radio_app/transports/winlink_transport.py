@@ -460,7 +460,7 @@ class WinlinkTransport(Transport):
             return
         try:
             await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("Winlink: modem did not exit cleanly; sending SIGKILL")
             try:
                 proc.kill()

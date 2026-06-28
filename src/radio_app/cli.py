@@ -1032,8 +1032,8 @@ def _cmd_bands(args: argparse.Namespace) -> int:
         pass
 
     if solar:
-        from datetime import datetime, timezone
-        age_s = int((datetime.now(timezone.utc) - solar.fetched_at).total_seconds())
+        from datetime import UTC, datetime
+        age_s = int((datetime.now(UTC) - solar.fetched_at).total_seconds())
         age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
         geo = f"  Geo:{solar.geo_field}" if solar.geo_field else ""
         print(
@@ -2706,7 +2706,7 @@ def _cmd_peers(args: argparse.Namespace) -> int:
 
 def _cmd_start(args: argparse.Namespace) -> int:
     """Launch a transport's backing application and connect the transport adapter."""
-    from .core.proc_manager import ProcManager, _TRANSPORT_DEFS
+    from .core.proc_manager import _TRANSPORT_DEFS
 
     name = args.transport.lower().strip()
     if name not in _TRANSPORT_DEFS:

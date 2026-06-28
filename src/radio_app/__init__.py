@@ -1,8 +1,9 @@
 """Radio_App: unified multi-transport messaging.
 
 A single application that sends and receives messages over radio, the internet
-and LoRa devices via pluggable transports (Reticulum, JS8Call, Mercury), exposing
-one uniform message format to the user regardless of the medium used.
+and LoRa devices via pluggable transports (Reticulum, JS8Call, MeshCore,
+Winlink, WSJT-X), exposing one uniform message format to the user regardless
+of the medium used.
 """
 
 from __future__ import annotations

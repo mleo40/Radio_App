@@ -11,7 +11,7 @@ import logging
 import urllib.request
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import UTC, datetime
 
 log = logging.getLogger(__name__)
 
@@ -35,7 +35,7 @@ class PropagationData:
     geo_field: str                        # geomagnetic field description (e.g. "QUIET")
     # band-range → {"day": "Good"|"Fair"|"Poor", "night": ...}
     conditions: dict[str, dict[str, str]] = field(default_factory=dict)
-    fetched_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+    fetched_at: datetime = field(default_factory=lambda: datetime.now(UTC))
 
     def condition_for(self, band: str) -> dict[str, str]:
         """Return day/night condition dict for a single band name, or {}."""

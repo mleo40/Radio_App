@@ -22,13 +22,13 @@ of glass* for radio comms.
 
 ## Languages & stack
 
-- **Application code** (~19k lines): **Python 3.11+**, fully type-hinted, async.
+- **Application code** (~19k lines): **Python 3.10+**, fully type-hinted, async.
 - **TUI:** Textual (optional extra). **Config:** TOML (only hard dep: `tomli-w`).
 - **Persistence:** SQLite + FTS5 (stdlib). **Reticulum:** `rns` + `lxmf` (extra).
   **MeshCore:** `meshcore` companion lib (extra).
-- **Tests:** pytest (544) · ruff · mypy.
+- **Tests:** pytest (765) · ruff · mypy.
 - *Interop targets vendored only for reference (not built or shipped here):*
-  **Pat** is Go; **Mercury** is C. The app talks to them over their APIs.
+  **Pat** is Go. The app talks to external programs over their network APIs.
 
 The core + CLI run on the **standard library alone**; every transport and the
 TUI are opt-in extras.
@@ -51,9 +51,8 @@ one LXMF delivery destination, plus one shared GROUP destination per configured
 group (and the reserved `broadcast` channel), with hashes derived from the
 channel name; plus transient RNS Links for NomadNet page fetches.
 
-**Transports:** 4 active built-ins (Reticulum, JS8Call, MeshCore, Winlink),
-Mercury dormant (wire protocol TODO), plus a plugin entry-point mechanism.
-**CLI:** ~30 subcommands.
+**Transports:** 5 active built-ins (Reticulum, JS8Call, MeshCore, Winlink,
+WSJT-X), plus a plugin entry-point mechanism. **CLI:** ~30 subcommands.
 
 ## Author's intent
 

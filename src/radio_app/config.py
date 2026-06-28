@@ -218,6 +218,10 @@ class Config:
         return self._data.get("ui", {})
 
     @property
+    def power(self) -> dict[str, Any]:
+        return self._data.get("power", {})
+
+    @property
     def branding(self) -> dict[str, Any]:
         return self._data.get("ui", {}).get("branding", {})
 

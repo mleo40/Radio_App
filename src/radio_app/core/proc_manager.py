@@ -305,7 +305,7 @@ class ProcManager:
             return
         try:
             await asyncio.wait_for(proc.wait(), timeout=3.0)
-        except asyncio.TimeoutError:
+        except TimeoutError:
             log.warning("proc_manager: %s did not exit cleanly; sending SIGKILL", name)
             try:
                 proc.kill()
@@ -313,7 +313,7 @@ class ProcManager:
                 pass
             try:
                 await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except asyncio.TimeoutError:
+            except TimeoutError:
                 log.warning("proc_manager: %s still running after SIGKILL", name)
 
     async def stop_all(self) -> None:

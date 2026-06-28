@@ -19,7 +19,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > leaving user identity to the operator. A full suite of **field/EmComm
 > utilities** is built in: message export, canned templates, UTC time widget with
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
-> awareness, offline band-plan, scheduled sends, and a presence roster. ~738 tests
+> awareness, offline band-plan, scheduled sends, and a presence roster. 765 tests
 > pass; the whole suite runs without radio hardware.
 
 ## Key ideas
@@ -205,7 +205,7 @@ Notes:
 The **Winlink** transport carries email-style store-and-forward messages over
 radio (or internet). It works by wrapping **[Pat](https://github.com/la5nta/pat)**,
 a mature open-source (MIT) Winlink client, over its HTTP API — the same
-"talk to an external app" pattern used for JS8Call and Mercury. **Pat is
+"talk to an external app over its network API" pattern. **Pat is
 user-installed and never bundled**; this app ships only a thin HTTP client, so
 there are no extra Python dependencies.
 
@@ -247,9 +247,8 @@ Pat** — nothing in this app changes:
 **Automatic fallback (recommended).** Set `connect = "auto"` and Winlink tries
 each path in `connect_order` (default `telnet → varahf → ardop`), probing each
 modem's port first and using the **first that's reachable and connects** — so the
-operator never chooses telnet vs Mercury vs VARA; the message just gets out by
-whatever path is available. (Mercury and VARA both answer the `varahf` probe, so
-they share that slot.) Force a single path any time with `connect = "telnet"`
+operator never chooses telnet vs modem; the message just gets out by whatever
+path is available. (Any VARA-compatible modem answers the `varahf` probe.) Force a single path any time with `connect = "telnet"`
 (etc.), and a picked RMS gateway still overrides everything.
 
 On the **Health** tab, the `winlink` row shows Pat's reachability plus a line per
@@ -605,7 +604,7 @@ In-composer commands:
 > **Targeting a MeshCore user:** there is no `@`/bracket syntax — address a
 > contact by their **name** or **hex public-key prefix** (e.g. `/to Alice` or
 > `/to a1b2c3d4e5f6`). `@<index>` is reserved for **channels** (`@0` = public).
-> Callsigns (JS8Call/Mercury) are upper-cased for you; MeshCore names/hashes and
+> Callsigns (JS8Call/Winlink) are upper-cased for you; MeshCore names/hashes and
 > Reticulum addresses are kept **case-sensitive**.
 
 Typing plain text sends to the selected conversation **over the active mode only**.
