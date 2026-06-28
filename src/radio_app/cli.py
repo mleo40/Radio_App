@@ -525,10 +525,27 @@ async def _with_app(config_path, func):
 # -- commands ----------------------------------------------------------------
 
 
+def _cli_sender(cfg: "Config", transport_name: str | None) -> str:
+    """Return the sender label for a CLI-originated message.
+
+    Resolves from the target transport's own identity (callsign for HF,
+    display_name for anonymous transports) with a fallback to [station].callsign.
+    """
+    if transport_name:
+        t_cfg = cfg.transports.get(transport_name, {})
+        callsign = str(t_cfg.get("callsign", "") or "")
+        if callsign:
+            return callsign
+        display = str(t_cfg.get("display_name", "") or "")
+        if display:
+            return display
+    return str(cfg.station.get("callsign", "") or "")
+
+
 def _cmd_send(args: argparse.Namespace) -> int:
     mode = SelectionMode(args.mode) if args.mode else None
     cfg = Config.load(args.config)
-    name = cfg.display_name
+    name = _cli_sender(cfg, args.transport)
     if not cfg.is_station_configured():
         print(
             "note: no callsign configured. Run 'radioapp setup' before using HF.",
@@ -867,7 +884,7 @@ def _cmd_templates(args: argparse.Namespace) -> int:
         print("error: --to or --group is required for 'send'", file=sys.stderr)
         return 2
 
-    name = cfg.display_name
+    name = _cli_sender(cfg, args.transport)
     if args.group:
         msg = UnifiedMessage.to_group(name, args.group, text)
     else:
@@ -969,8 +986,27 @@ def _cmd_time(args: argparse.Namespace) -> int:
 
 
 def _cmd_bands(args: argparse.Namespace) -> int:
-    """Print the offline band-plan / EmComm frequency reference."""
+    """Print the band-plan / EmComm frequency reference with live conditions."""
     from .core.bandplan import format_mhz, lookup
+    from .core.propagation import fetch_sync
+
+    # One-shot live conditions fetch (5 s timeout; silently skipped if offline).
+    solar = None
+    try:
+        solar = fetch_sync(timeout=5.0)
+    except Exception:
+        pass
+
+    if solar:
+        from datetime import datetime, timezone
+        age_s = int((datetime.now(timezone.utc) - solar.fetched_at).total_seconds())
+        age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
+        geo = f"  Geo:{solar.geo_field}" if solar.geo_field else ""
+        print(
+            f"Solar  SFI={solar.sfi}  SSN={solar.ssn}"
+            f"  A={solar.a_index}  K={solar.k_index}{geo}  ({age})"
+        )
+        print()
 
     entries = lookup(
         band=getattr(args, "band", None),
@@ -981,12 +1017,24 @@ def _cmd_bands(args: argparse.Namespace) -> int:
     if not entries:
         print("No entries match those filters.")
         return 0
+
+    _COND_MARK = {"Good": "+", "Fair": "~", "Poor": "-"}
     current_band = None
     for e in entries:
         if e.band != current_band:
             if current_band is not None:
                 print()
-            print(f"  [{e.band}]")
+            if solar:
+                cond = solar.condition_for(e.band)
+                parts = []
+                for period in ("day", "night"):
+                    val = cond.get(period, "")
+                    if val:
+                        parts.append(f"{period.capitalize()}:{_COND_MARK.get(val, '?')}{val}")
+                suffix = f"  ({' / '.join(parts)})" if parts else ""
+            else:
+                suffix = ""
+            print(f"  [{e.band}]{suffix}")
             current_band = e.band
         freq = format_mhz(e.freq_khz)
         notes = f"  {e.notes}" if e.notes else ""
@@ -1066,7 +1114,7 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 print("error: --at or --delay is required", file=sys.stderr)
                 return 2
 
-            name = cfg.display_name
+            name = _cli_sender(cfg, getattr(args, "force_transport", None))
             if getattr(args, "group", None):
                 msg = UnifiedMessage.to_group(name, args.group, args.message)
             else:
@@ -1280,7 +1328,6 @@ def _cmd_sub(args: argparse.Namespace) -> int:
 
 def _cmd_status(args: argparse.Namespace) -> int:
     async def run(app: App) -> int:
-        print(f"display name : {app.config.display_name}")
         st = app.station
         ident = st.callsign or "(not set - run 'radioapp setup')"
         print(f"callsign     : {ident}")
@@ -1657,9 +1704,22 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print(f"\nRadio_App setup  ->  {cfg.path}")
     print("Press Enter to keep the current/[]-shown value.\n")
 
+    # -- station identity (asked first; callsign flows to each HF transport) --
+    print("Station identity (your callsign; used by all HF transports)")
+    print("  Reticulum is anonymous — do NOT enter your callsign there.")
+    s = cfg.station
+    callsign = _ask("Callsign (e.g. KC1QKM)", s.get("callsign", ""))
+    grid = _ask("Grid square (e.g. FN31pr)", s.get("grid_square", ""))
+    station = Station(callsign=callsign, grid_square=grid)
+    problems = station.validate()
+    if problems:
+        print("\nPlease fix:", file=sys.stderr)
+        for p in problems:
+            print(f"  - {p}", file=sys.stderr)
+        return 2
+
     # -- general -------------------------------------------------------------
-    print("General")
-    display_name = _ask("Display name", cfg.display_name)
+    print("\nGeneral")
     # History retention: messages and cached pages accumulate in the SQLite DB
     # over time. 0 keeps everything forever (simplest, but the file grows without
     # bound); a positive number auto-prunes anything older on each startup.
@@ -1697,9 +1757,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "Connect to a running rnsd (shared instance)?",
             ret.get("shared_instance", True),
         )
-        # Public LXMF name shown to peers when you message them. Distinct from
-        # the general display name; Reticulum is anonymous by default, so this is
-        # blank unless set. NEVER put a callsign here (this medium is anonymous).
+        # Public LXMF name shown to peers when you message them. Reticulum is
+        # anonymous by default; NEVER put a callsign here.
         ret["display_name"] = _ask(
             "Public Reticulum name shown to peers (blank = anonymous; "
             "do NOT use your callsign)",
@@ -1711,11 +1770,10 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     print("\nJS8Call (HF weak-signal; JS8Call drives the radio)")
     js8 = dict(cfg.transports.get("js8call", {}))
     js8_enabled = _ask_bool("Enable JS8Call?", js8.get("enabled", False))
-    js8_info = None
     if js8_enabled:
         js8["host"] = _ask("JS8Call API host", js8.get("host", "127.0.0.1"))
         js8["port"] = int(_ask("JS8Call API port", str(js8.get("port", 2442))))
-        # Ask JS8Call for the operator identity so the user need not retype it.
+        # Query JS8Call to confirm it's reachable; shown for info only.
         print("  querying JS8Call for callsign/grid...")
         js8_info = query_station(js8["host"], js8["port"])
         if js8_info.any_found:
@@ -1724,7 +1782,10 @@ def _cmd_setup(args: argparse.Namespace) -> int:
                 f"grid={js8_info.grid or '-'}"
             )
         else:
-            print("  (JS8Call did not answer; you can enter these manually)")
+            print("  (JS8Call did not answer — start it, then run setup again if needed)")
+        js8["callsign"] = _ask(
+            "JS8Call callsign", js8.get("callsign", "") or station.callsign
+        )
     js8["enabled"] = js8_enabled
 
     # -- MeshCore ------------------------------------------------------------
@@ -1757,21 +1818,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             mc.get("display_name", ""),
         )
     mc["enabled"] = mc_enabled
-
-    # -- station identity (prefilled from JS8Call when available) ------------
-    print("\nStation identity (used on HF; Reticulum stays anonymous)")
-    s = cfg.station
-    call_default = (js8_info.callsign if js8_info else "") or s.get("callsign", "")
-    grid_default = (js8_info.grid if js8_info else "") or s.get("grid_square", "")
-    callsign = _ask("Callsign (e.g. N0CALL)", call_default)
-    grid = _ask("Grid square (e.g. FN31pr)", grid_default)
-    station = Station(callsign=callsign, grid_square=grid)
-    problems = station.validate()
-    if problems:
-        print("\nPlease fix:", file=sys.stderr)
-        for p in problems:
-            print(f"  - {p}", file=sys.stderr)
-        return 2
 
     # -- Winlink (store-and-forward email via a separately-installed Pat) -----
     print("\nWinlink (email over radio/internet; a separately-installed Pat does"
@@ -1808,8 +1854,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     wl["enabled"] = wl_enabled
 
     # -- WSJT-X (FT8/FT4 weak-signal via UDP) ----------------------------------
-    print("\nWSJT-X / JS8Call (FT8/FT4 weak-signal; listens for UDP datagrams"
-          " on port 2237)")
+    print("\nWSJT-X (FT8/FT4 weak-signal; listens for UDP datagrams on port 2237)")
     wsjtx = dict(cfg.transports.get("wsjt_x", {}))
     wsjtx_enabled = _ask_bool("Enable WSJT-X?", wsjtx.get("enabled", False))
     if wsjtx_enabled:
@@ -1834,7 +1879,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     )
 
     # -- write it all to the single config file ------------------------------
-    cfg.set("general", "display_name", display_name)
     cfg.set("general", "history_retention_days", retention_days)
     cfg.set("storage", "download_dir", download_dir)
     cfg.set("station", "callsign", station.callsign)

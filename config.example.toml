@@ -3,7 +3,6 @@ favorites = [
 ]
 
 [general]
-display_name = "Anonymous"
 default_mode = "auto"
 # How many days of message history (and cached NomadNet pages) to keep. The
 # database grows over time, so on small devices set a positive number to

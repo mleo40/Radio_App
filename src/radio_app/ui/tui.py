@@ -964,6 +964,9 @@ class RadioTUI(App):
         self._time_reading = None  # TimeReading | None
         self._time_queried: bool = False
         self._last_time_check: float = -999.0
+        # HF propagation conditions fetched once at launch via _fetch_propagation().
+        self._solar_data = None   # PropagationData | None
+        self._solar_fetched: bool = False
         # Cached GPS/config position for the Health board display.
         self._position = None
         # Last input method seen ("key" or "pointer"), shown as a glyph and used
@@ -1198,7 +1201,7 @@ class RadioTUI(App):
         # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
-        self.title = f"Radio_App - {cfg.display_name}"
+        self.title = "Radio_App"
         self._build_mode_selector()
         self._update_modebar()
         self._update_status()
@@ -1228,6 +1231,20 @@ class RadioTUI(App):
         # — a slow/unreachable transport (e.g. an offline JS8Call host whose TCP
         # connect sits in a multi-second timeout) no longer delays first paint.
         self._start_core()
+        # Fetch HF propagation conditions once; updates health panel when done.
+        self._fetch_propagation()
+
+    @work(thread=True)
+    def _fetch_propagation(self) -> None:
+        """Fetch HF propagation conditions once at launch in a thread worker."""
+        from ..core.propagation import fetch_sync
+        try:
+            data = fetch_sync(timeout=10.0)
+        except Exception:
+            data = None
+        self._solar_data = data
+        self._solar_fetched = True
+        self.call_from_thread(self._refresh_health)
 
     @work
     async def _start_core(self) -> None:
@@ -2674,6 +2691,8 @@ class RadioTUI(App):
         except Exception:  # noqa: BLE001 - never let stats break the board
             pass
 
+        self._render_propagation(log)
+
     def _render_power_line(self, log: RichLog, health, format_duration) -> None:
         """Render a battery/power line: charge %, AC/battery, time remaining.
 
@@ -2699,6 +2718,48 @@ class RadioTUI(App):
                 bits.append(f"~{format_duration(health.battery_secs_left)} left")
         if bits:
             log.write(f"  power : {'  '.join(bits)}")
+
+    def _render_propagation(self, log: RichLog) -> None:
+        """Render a compact solar conditions block in the System health pane."""
+        if self.core is None:
+            return
+        solar = self._solar_data
+        log.write("")
+        log.write("[b]HF Conditions[/b] (hamqsl.com)")
+        if solar is None:
+            if self._solar_fetched:
+                log.write("  [dim](unavailable — no internet at launch)[/dim]")
+            else:
+                log.write("  [dim](fetching…)[/dim]")
+            return
+
+        age_s = int((datetime.now(UTC) - solar.fetched_at).total_seconds())
+        age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
+        geo = f"  {solar.geo_field}" if solar.geo_field else ""
+        log.write(
+            f"  solar : SFI=[b]{solar.sfi}[/b]  SSN=[b]{solar.ssn}[/b]"
+            f"  A=[b]{solar.a_index}[/b]  K=[b]{solar.k_index}[/b]"
+            f"[dim]{geo}  ({age})[/dim]"
+        )
+
+        _C = {"Good": "green", "Fair": "yellow", "Poor": "red"}
+
+        def _fmt(val: str) -> str:
+            col = _C.get(val, "")
+            return f"[{col}]{val}[/{col}]" if col else val
+
+        # One compact line per band group: "Day/Night"
+        groups = [
+            ("80-40m", "80m-40m"),
+            ("30-20m", "30m-20m"),
+            ("17-15m", "17m-15m"),
+            ("12-10m", "12m-10m"),
+        ]
+        for label, key in groups:
+            cond = solar.conditions.get(key, {})
+            d = _fmt(cond.get("day", "?"))
+            n = _fmt(cond.get("night", "?"))
+            log.write(f"  [b]{label:<7}[/b]  day {d}  night {n}")
 
     def _render_winlink_paths(self, log: RichLog) -> None:
         """Render Winlink connection-path availability under its status line.
@@ -5272,7 +5333,7 @@ class RadioTUI(App):
             self._log_system(f"Template text: {text}")
 
     def _handle_bands_command(self, arg: str) -> None:
-        """Show the offline band-plan / EmComm frequency reference."""
+        """Show the band-plan / EmComm frequency reference with live conditions."""
         from ..core.bandplan import format_mhz, lookup
         band = arg.strip().lower() or None
         entries = lookup(band=band, region="US")
@@ -5281,12 +5342,47 @@ class RadioTUI(App):
                 f"No band-plan entries{f' for {band}' if band else ''}."
             )
             return
-        lines = [f"[b]Band plan{f' — {band}' if band else ''}:[/b]"]
+
+        solar = self._solar_data
+        lines = []
+        if solar:
+            age_s = int(
+                (
+                    __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    )
+                    - solar.fetched_at
+                ).total_seconds()
+            )
+            age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
+            geo = f"  Geo:[b]{solar.geo_field}[/b]" if solar.geo_field else ""
+            lines.append(
+                f"[dim]Solar  SFI=[b]{solar.sfi}[/b]  SSN=[b]{solar.ssn}[/b]"
+                f"  A=[b]{solar.a_index}[/b]  K=[b]{solar.k_index}[/b]{geo}"
+                f"  ({age})[/dim]"
+            )
+            lines.append("")
+
+        _COND_COLOR = {"Good": "green", "Fair": "yellow", "Poor": "red"}
+
+        lines.append(f"[b]Band plan{f' — {band}' if band else ''}:[/b]")
         current_band = None
         for e in entries:
             if e.band != current_band:
-                lines.append(f"  [b]{e.band}[/b]")
                 current_band = e.band
+                if solar:
+                    cond = solar.condition_for(e.band)
+                    parts = []
+                    for period in ("day", "night"):
+                        val = cond.get(period, "")
+                        if val:
+                            col = _COND_COLOR.get(val, "")
+                            label = f"[{col}]{val}[/{col}]" if col else val
+                            parts.append(f"{period.capitalize()}: {label}")
+                    suffix = f"  [dim]({' / '.join(parts)})[/dim]" if parts else ""
+                else:
+                    suffix = ""
+                lines.append(f"  [b]{e.band}[/b]{suffix}")
             freq = format_mhz(e.freq_khz)
             tp = f" [{e.transport}]" if e.transport else ""
             lines.append(f"    {freq:<14} {e.mode:<6}{tp}  {e.notes}")
@@ -5887,9 +5983,15 @@ class RadioTUI(App):
         if not self.current_target:
             self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
             return
-        me = self.core.config.display_name
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None
+        if t and getattr(t, "carries_operator_identity", False):
+            me = str(t.config.get("callsign") or self.core.config.station.get("callsign", "") or "")
+        elif t:
+            display_getter = getattr(t, "local_display_name", None)
+            me = (display_getter() if callable(display_getter) else None) or ""
+        else:
+            me = str(self.core.config.station.get("callsign", "") or "")
         # Winlink is email-style: the single-line composer can't hold real
         # newlines, so let the operator type the literal escape "\n" to break the
         # body into multiple lines. (Other transports keep the text verbatim.)

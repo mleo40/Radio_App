@@ -2,6 +2,40 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## On-demand transport app launcher (`/start` command)
+
+**Requested:** 2026-06-27
+**Status:** Backlog
+**Area:** `core/proc_manager.py` (new), `transports/base.py`, `ui/tui.py`, `cli.py`
+
+A `/start` command in each transport mode that:
+- Launches the backing app for the **current** transport (JS8Call, Pat, WSJT-X, etc.)
+- Stops the backing apps for **all other** transports that Radio_App previously started
+- Only fires **on explicit operator command** — no automatic start/stop on mode switch
+
+**Design notes:**
+- Opt-in per transport via `launch_cmd` config key — supports a full command with
+  arguments (e.g. `launch_cmd = "js8call --rig FT-991A"`, `launch_cmd = "pat http"`,
+  `launch_cmd = "wsjtx --rig IC-7300"`). Arguments are passed through verbatim.
+- Process is launched **detached in the background** — stdio is not inherited, the
+  app window (if any) opens behind the TUI and does not steal focus
+- Radio_App tracks which processes it owns (`_child_proc` on the transport object);
+  it only stops processes it started, never externally-launched instances
+- Existing `check_reachable()` already provides port-open detection — no psutil needed
+  to determine if the app is already running
+- After launching, retry `check_reachable()` in a backoff loop before calling
+  `transport.start()` to reconnect the adapter
+- CLI equivalent: `radioapp start` (stops others, launches current transport's app)
+
+**UX sketch:**
+```
+/start
+  → Stopping Pat (Winlink)...
+  → Starting JS8Call... connected.
+```
+
+---
+
 ## Presence roster — recently-heard callsigns across all transports
 
 **Requested:** 2026-06-27

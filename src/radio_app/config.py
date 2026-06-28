@@ -39,7 +39,6 @@ def default_config_path() -> Path:
 
 _DEFAULTS: dict[str, Any] = {
     "general": {
-        "display_name": "Anonymous",
         "default_mode": "auto",
         "history_retention_days": 0,
     },
@@ -182,10 +181,6 @@ class Config:
     @property
     def position(self) -> dict:
         return self._data.get("position", {})
-
-    @property
-    def display_name(self) -> str:
-        return self.general.get("display_name", "Anonymous")
 
     @property
     def default_mode(self) -> str:
