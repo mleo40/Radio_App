@@ -15,7 +15,6 @@ import pytest
 
 pytest.importorskip("textual")
 
-from radio_app.transports.base import TRANSPORT_REGISTRY  # noqa: E402
 from radio_app.ui.tui import RadioTUI  # noqa: E402
 
 CONFIG = """\
@@ -33,7 +32,6 @@ port = 2442
 def config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 

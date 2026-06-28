@@ -56,11 +56,12 @@ host = "127.0.0.1"
 port = 2442
 callsign = "N0CALL"
 presence_quiet_seconds = 600
-
-[transports.mercury]
-enabled = false
-host = "127.0.0.1"
-port = 7373
+# Command to launch JS8Call when you type /start or click ⚡ Start in the TUI.
+# Leave blank to use the built-in default ("js8call"). Set a full path if the
+# binary isn't on your PATH, or add arguments (e.g. "--rig IC7300").
+# launch_cmd = "js8call"
+# Seconds to wait for JS8Call's API port to open after spawning (default 15).
+# launch_wait_s = 15
 
 [transports.meshcore]
 enabled = false
@@ -117,6 +118,15 @@ auto_connect = false
 # and includes replayed backlog). Default false shows only concise live events
 # (dialing/connected, per-message transfer progress) plus a final summary.
 verbose_session_log = false
+# Command to launch Pat when you type /start or click ⚡ Start.
+# launch_cmd = "pat http"
+# launch_wait_s = 15
+# RF modem to auto-launch before a varahf/varafm connect session (Mercury,
+# VARA HF, etc.). Radio_App spawns this process when you connect and the modem
+# port (vara_port, default 8300) is not yet open. Blank = assume already running.
+# modem_cmd = "mercury"
+# Seconds to wait for the modem port to open after spawning (default 10).
+# modem_wait_s = 10
 
 [transports.wsjt_x]
 enabled = false
@@ -131,6 +141,9 @@ wsjtx_host = "127.0.0.1"
 # Your callsign, if you want Radio_App to identify traffic addressed to you.
 # Leave blank to learn it automatically from WSJT-X Status datagrams.
 callsign = "N0CALL"
+# Command to launch WSJT-X when you type /start or click ⚡ Start.
+# launch_cmd = "wsjtx"
+# launch_wait_s = 15
 
 [groups.EMS]
 display_name = "EMS Net"

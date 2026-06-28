@@ -11,13 +11,9 @@ from __future__ import annotations
 import logging
 
 # Import built-ins so they self-register.
-# NOTE: mercury is temporarily disabled (not registered) per design decision -
-# re-enable by restoring the import below. Its config block is also ignored
-# while commented out.
 from . import (
     js8call_transport,  # noqa: F401,E402
     meshcore_transport,  # noqa: F401,E402
-    # mercury_transport,  # noqa: F401,E402  # TODO: re-enable mercury mode later
     reticulum_transport,  # noqa: F401,E402
     winlink_transport,  # noqa: F401,E402
     wsjt_x_transport,  # noqa: F401,E402

@@ -17,6 +17,7 @@ from .core.filters import FilterEngine
 from .core.groups import GroupRegistry
 from .core.nomad_cache import NomadPageCache
 from .core.nomadnet import NomadnetBrowser
+from .core.proc_manager import ProcManager
 from .core.radio_interlock import RadioInterlock
 from .core.router import Router
 from .core.timesource import WSJTXDTMonitor
@@ -47,6 +48,7 @@ class App:
         # each other. This single-owner token gates our transmit actions; the UI
         # claims/releases it as the operator switches modes / runs sessions.
         self.radio_interlock = RadioInterlock(self._radio_contenders())
+        self.proc_manager = ProcManager(config, self.radio_interlock)
         # HF transports route inbound traffic by our callsign (a message "TO" us
         # is DIRECT). Push the operator identity from [station] into any transport
         # that accepts it, so users don't have to duplicate it per transport block.
@@ -160,6 +162,7 @@ class App:
                 self.favorites.save(self.config)
         except Exception:  # noqa: BLE001 - never let persistence break shutdown
             log.exception("failed to persist favorites")
+        await self.proc_manager.stop_all()
         for transport in self.transports:
             try:
                 await transport.stop()

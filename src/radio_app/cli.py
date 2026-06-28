@@ -499,6 +499,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_roster.add_argument("--limit", type=int, default=50, help="max rows (default 50)")
     p_roster.set_defaults(func=_cmd_roster)
 
+    p_start = sub.add_parser(
+        "start",
+        help="launch a transport's backing application (JS8Call, Pat, etc.)",
+    )
+    p_start.add_argument(
+        "transport",
+        help="transport name to start (e.g. js8call, winlink, wsjt_x)",
+    )
+    p_start.set_defaults(func=_cmd_start)
+
     return parser
 
 
@@ -1381,8 +1391,8 @@ def _cmd_status(args: argparse.Namespace) -> int:
             }.get(reach, str(reach.value))
             caps = t.capabilities()
             # Show the *actual* identity this transport uses, not just its kind.
-            # Callsign-carrying media (HF: js8call/winlink/mercury) identify with
-            # a callsign — from the transport's own config if set, else the
+            # Callsign-carrying media (HF: js8call/winlink) identify with a
+            # callsign — from the transport's own config if set, else the
             # station callsign. Anonymous media (Reticulum/MeshCore) expose a
             # non-identifying address via local_identity().
             if caps.carries_operator_identity:
@@ -1696,6 +1706,26 @@ def _ask_bool(prompt: str, default: bool) -> bool:
     return answer in ("y", "yes", "true", "1")
 
 
+def _setup_launch_cmd(transport_cfg: dict, name: str, label: str | None = None) -> None:
+    """Ask the operator for a launch command, pre-filled from the merged config.
+
+    If the user clears the value (hits Enter on a blank line), the key is removed
+    from the transport dict so the built-in default (from ProcManager) is used.
+    Any dist-config-provided value shows up as the pre-filled default.
+    """
+    from .core.proc_manager import launch_default
+
+    builtin = launch_default(name) or ""
+    current = (transport_cfg.get("launch_cmd", "") or "").strip()
+    hint = f"blank = built-in default: {builtin!r}" if builtin else "blank = none"
+    display = label or f"{name} launch command"
+    cmd = _ask(f"{display} ({hint})", current).strip()
+    if cmd:
+        transport_cfg["launch_cmd"] = cmd
+    else:
+        transport_cfg.pop("launch_cmd", None)
+
+
 def _probe_pat(url: str) -> bool:
     """Best-effort check that a Pat HTTP API answers ``/api/status``.
 
@@ -1727,6 +1757,8 @@ def _cmd_setup(args: argparse.Namespace) -> int:
 
     cfg = Config.load(args.config)
     print(f"\nRadio_App setup  ->  {cfg.path}")
+    if cfg.dist_path.exists():
+        print(f"  distribution defaults: {cfg.dist_path}")
     print("Press Enter to keep the current/[]-shown value.\n")
 
     # -- station identity (asked first; callsign flows to each HF transport) --
@@ -1811,6 +1843,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         js8["callsign"] = _ask(
             "JS8Call callsign", js8.get("callsign", "") or station.callsign
         )
+        _setup_launch_cmd(js8, "js8call", "JS8Call launch command")
     js8["enabled"] = js8_enabled
 
     # -- MeshCore ------------------------------------------------------------
@@ -1876,6 +1909,17 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "  note: configure your Winlink account password INSIDE Pat "
             "(Radio_App never stores it)."
         )
+        _setup_launch_cmd(wl, "winlink", "Pat launch command")
+        # VARA/modem launch command (separate from Pat; only used on RF paths)
+        modem_current = (wl.get("modem_cmd", "") or "").strip()
+        modem_cmd = _ask(
+            "RF modem launch command, e.g. varahf (blank = no auto-launch)",
+            modem_current,
+        ).strip()
+        if modem_cmd:
+            wl["modem_cmd"] = modem_cmd
+        else:
+            wl.pop("modem_cmd", None)
     wl["enabled"] = wl_enabled
 
     # -- WSJT-X (FT8/FT4 weak-signal via UDP) ----------------------------------
@@ -1894,6 +1938,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             "Your callsign (blank = auto-learn from WSJT-X Status)",
             wsjtx.get("callsign", "") or station.callsign,
         )
+        _setup_launch_cmd(wsjtx, "wsjt_x", "WSJT-X launch command")
         print("  note: WSJT-X must be configured to send UDP packets to this machine.")
     wsjtx["enabled"] = wsjtx_enabled
 
@@ -2655,6 +2700,50 @@ def _cmd_peers(args: argparse.Namespace) -> int:
             name = p["name"] or "(anonymous)"
             print(f"  {p['dest']}  {name}")
         return 0
+
+    return _run(_with_app(args.config, run))
+
+
+def _cmd_start(args: argparse.Namespace) -> int:
+    """Launch a transport's backing application and connect the transport adapter."""
+    from .core.proc_manager import ProcManager, _TRANSPORT_DEFS
+
+    name = args.transport.lower().strip()
+    if name not in _TRANSPORT_DEFS:
+        known = ", ".join(sorted(_TRANSPORT_DEFS))
+        print(
+            f"Unknown transport {name!r}. Manageable transports: {known}",
+            file=sys.stderr,
+        )
+        return 1
+
+    async def run(app: App) -> int:
+        pm = app.proc_manager
+        transport = next((t for t in app.transports if t.name == name), None)
+        if transport is None:
+            print(
+                f"{name} is not enabled in your config. "
+                f"Add [transports.{name}] with enabled = true.",
+                file=sys.stderr,
+            )
+            return 1
+
+        if pm.is_running(name) and not pm.we_own(name):
+            print(f"{name} is already running (externally). Reconnecting…")
+        else:
+            print(f"Starting {name}…")
+
+        ok = await pm.start(name, transport)
+        if ok:
+            print(f"{name} ready.")
+            return 0
+        else:
+            print(
+                f"Failed to start {name}. Check logs or set "
+                f"[transports.{name}].launch_cmd in your config.",
+                file=sys.stderr,
+            )
+            return 1
 
     return _run(_with_app(args.config, run))
 

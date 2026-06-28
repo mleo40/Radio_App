@@ -25,6 +25,7 @@ except ModuleNotFoundError:  # pragma: no cover - writing is optional
 _ENV_VAR = "RADIO_APP_CONFIG"
 _DEFAULT_DIRNAME = "radio_app"
 _DEFAULT_FILENAME = "config.toml"
+_DIST_FILENAME = "config.dist.toml"
 
 
 def default_config_path() -> Path:
@@ -35,6 +36,18 @@ def default_config_path() -> Path:
     base = os.environ.get("XDG_CONFIG_HOME")
     root = Path(base).expanduser() if base else Path.home() / ".config"
     return root / _DEFAULT_DIRNAME / _DEFAULT_FILENAME
+
+
+def dist_config_path(user_path: Path | None = None) -> Path:
+    """Package-bundled distribution config: config.dist.toml inside the installed package.
+
+    A distributor forks the repo (or patches the wheel) and ships their own
+    config.dist.toml baked into src/radio_app/. It lands at
+    site-packages/radio_app/config.dist.toml on install and is picked up here
+    via __file__. The upstream repo does not ship one, so standard installs see
+    no change. The user's config.toml always wins on conflict.
+    """
+    return Path(__file__).parent / _DIST_FILENAME
 
 
 _DEFAULTS: dict[str, Any] = {
@@ -67,7 +80,12 @@ _DEFAULTS: dict[str, Any] = {
         # XDG data dir (…/radio_app/downloads).
         "download_dir": "",
     },
-    "transports": {},
+    "transports": {
+        # Per-transport keys (merged with whatever the user sets):
+        #   launch_cmd   – command to spawn the backing app (e.g. "pat http").
+        #                  Leave blank to use the built-in default.
+        #   launch_wait_s – seconds to wait for the port to open after spawn.
+    },
     "groups": {},
     "subscriptions": {"groups": [], "show_unsubscribed": False},
     "filters": [],
@@ -107,10 +125,20 @@ class Config:
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
         resolved = Path(path).expanduser() if path else default_config_path()
-        data = _deep_merge(_DEFAULTS, {})
+
+        # Layer 2: package-bundled distribution config (optional, shipped by packager)
+        dist_path = dist_config_path()
+        dist_data: dict[str, Any] = {}
+        if dist_path.exists():
+            with dist_path.open("rb") as fh:
+                dist_data = tomllib.load(fh)
+
+        # Merge: layer 1 (built-in defaults) → layer 2 (dist) → layer 3 (user)
+        base = _deep_merge(_DEFAULTS, dist_data)
+        data = base
         if resolved.exists():
             with resolved.open("rb") as fh:
-                data = _deep_merge(_DEFAULTS, tomllib.load(fh))
+                data = _deep_merge(base, tomllib.load(fh))
         return cls(data, resolved)
 
     def save(self) -> None:
@@ -124,6 +152,11 @@ class Config:
         with tmp.open("wb") as fh:
             tomli_w.dump(self._data, fh)
         tmp.replace(self.path)
+
+    @property
+    def dist_path(self) -> Path:
+        """Path where a distribution config.dist.toml would live (may not exist)."""
+        return dist_config_path()
 
     # -- raw access -----------------------------------------------------------
 

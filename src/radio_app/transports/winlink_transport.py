@@ -132,6 +132,9 @@ class WinlinkTransport(Transport):
         # actually forwarded it (it disappears from the outbox). Maps Pat's
         # outbox MID -> (our msg_id, recipient).
         self._pending_out: dict[str, tuple[str, str]] = {}
+        # RF modem process owned by this transport (e.g. Mercury spawned via
+        # modem_cmd). None when not spawned by us (externally managed).
+        self._modem_proc: asyncio.subprocess.Process | None = None
 
     # -- config helpers -------------------------------------------------------
 
@@ -362,6 +365,7 @@ class WinlinkTransport(Transport):
         if self._poll_task:
             self._poll_task.cancel()
             self._poll_task = None
+        await self._stop_modem()
 
     async def check_reachable(self) -> ReachabilityStatus:
         """Reachable iff Pat's HTTP API answers ``/api/status``."""
@@ -370,6 +374,98 @@ class WinlinkTransport(Transport):
         except Exception:  # noqa: BLE001 - any failure means "down"
             return ReachabilityStatus.DOWN
         return ReachabilityStatus.OK
+
+    # -- modem auto-launch (Mercury / VARA HF) --------------------------------
+
+    async def _start_modem_if_needed(self, method_name: str) -> bool:
+        """Spawn the configured RF modem if its control port is not yet open.
+
+        Called before a varahf/varafm connect attempt. If ``modem_cmd`` is not
+        set in config the call is a no-op and returns True (caller can still
+        proceed; the modem may already be running externally). Only acts on
+        methods whose ``needs_modem`` flag is True.
+
+        Returns True when the modem port is open after this call, False when
+        the modem could not be started (no command, binary missing, timeout).
+        """
+        import shlex
+
+        method = CONNECT_METHODS.get(method_name)
+        if not method or not method.needs_modem:
+            return True
+
+        port = self._probe_port_for(method)
+        if port is None:
+            return True  # no probe possible; proceed without check
+
+        host = self._probe_host()
+
+        # If port is already open (externally managed or already running), done.
+        status = await probe_tcp(host, port, _PROBE_TIMEOUT_S)
+        if status is ReachabilityStatus.OK:
+            return True
+
+        modem_cmd = str(self.config.get("modem_cmd", "") or "").strip()
+        if not modem_cmd:
+            return False  # not configured to auto-launch
+
+        # If we already own a running modem proc, just wait for it.
+        if self._modem_proc is None or self._modem_proc.returncode is not None:
+            argv = shlex.split(modem_cmd)
+            log.info("Winlink: spawning RF modem %r", argv)
+            try:
+                self._modem_proc = await asyncio.create_subprocess_exec(
+                    *argv,
+                    stdin=asyncio.subprocess.DEVNULL,
+                    stdout=asyncio.subprocess.DEVNULL,
+                    stderr=asyncio.subprocess.DEVNULL,
+                    start_new_session=True,
+                )
+            except FileNotFoundError:
+                log.error(
+                    "Winlink: modem command not found: %r. "
+                    "Set [transports.winlink].modem_cmd in your config.",
+                    modem_cmd,
+                )
+                return False
+            except Exception:  # noqa: BLE001
+                log.exception("Winlink: failed to spawn modem %r", modem_cmd)
+                return False
+
+        wait_s = max(1.0, float(self.config.get("modem_wait_s", 10) or 10))
+        deadline = asyncio.get_event_loop().time() + wait_s
+        while asyncio.get_event_loop().time() < deadline:
+            status = await probe_tcp(host, port, _PROBE_TIMEOUT_S)
+            if status is ReachabilityStatus.OK:
+                log.info("Winlink: modem ready on %s:%d", host, port)
+                return True
+            await asyncio.sleep(0.5)
+
+        log.error(
+            "Winlink: modem %r did not open port %d within %.0fs",
+            modem_cmd, port, wait_s,
+        )
+        return False
+
+    async def _stop_modem(self) -> None:
+        """Terminate the owned modem process if we spawned it."""
+        proc = self._modem_proc
+        self._modem_proc = None
+        if proc is None or proc.returncode is not None:
+            return
+        log.info("Winlink: stopping owned modem process")
+        try:
+            proc.terminate()
+        except ProcessLookupError:
+            return
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=3.0)
+        except asyncio.TimeoutError:
+            log.warning("Winlink: modem did not exit cleanly; sending SIGKILL")
+            try:
+                proc.kill()
+            except ProcessLookupError:
+                pass
 
     # -- data path ------------------------------------------------------------
 
@@ -623,6 +719,8 @@ class WinlinkTransport(Transport):
             return await self._attempt_connect(connect_url)
         if self.is_auto:
             return await self._connect_auto()
+        # Single configured method — auto-launch modem if needed before dialing.
+        await self._start_modem_if_needed(self._method.scheme)
         return await self._attempt_connect(self.build_connect_url())
 
     async def _connect_auto(self) -> int:
@@ -631,6 +729,10 @@ class WinlinkTransport(Transport):
         errors: list[str] = []
         for name in self._connect_order():
             method = CONNECT_METHODS[name]
+            # Try to auto-launch the modem before probing so the probe passes
+            # even if the operator hasn't started it manually.
+            if method.needs_modem:
+                await self._start_modem_if_needed(name)
             port = self._probe_port_for(method)
             if port is not None:
                 status = await probe_tcp(self._probe_host(), port, _PROBE_TIMEOUT_S)

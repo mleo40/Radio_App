@@ -88,7 +88,8 @@ _UNIVERSAL_COMMAND_HELP = (
     "/mode (cycle, F3), /refresh, /logs, "
     "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
     "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
-    "/roster [Nh], /name <friendly name>, /close [<id>], /help, /quit"
+    "/roster [Nh], /name <friendly name>, /close [<id>], "
+    "/start [transport], /help, /quit"
 )
 
 # Mode-specific commands, keyed by transport name. /help shows only the active
@@ -733,6 +734,65 @@ class AboutScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class LaunchCmdScreen(ModalScreen):
+    """One-shot prompt to customise the launch command for a transport's backing app.
+
+    Shown the first time the operator runs /start for a transport that has no
+    ``launch_cmd`` in config.  Pressing Enter with an empty field accepts the
+    default.  The result is the command string chosen (possibly the default), or
+    None if the operator pressed Escape / Cancel.
+    """
+
+    CSS = """
+    LaunchCmdScreen { align: center middle; }
+    #lc-box {
+        width: 72; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #lc-title { height: auto; }
+    #lc-hint  { height: auto; color: $text-muted; }
+    #lc-input { height: 3; }
+    #lc-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, transport_name: str, default_cmd: str) -> None:
+        super().__init__()
+        self._transport_name = transport_name
+        self._default_cmd = default_cmd
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="lc-box"):
+            yield Static(
+                f"[b]Launch command for {self._transport_name}[/b]", id="lc-title"
+            )
+            yield Static(
+                f"[dim]Default: {self._default_cmd!r}. "
+                "Press Enter to accept, or type a custom path/flags.[/dim]",
+                id="lc-hint",
+            )
+            yield Input(placeholder=self._default_cmd, id="lc-input")
+            with Horizontal(id="lc-buttons"):
+                yield Button("Cancel", id="lc-cancel")
+                yield Button("Use this command", id="lc-ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#lc-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or self._default_cmd)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "lc-ok":
+            val = self.query_one("#lc-input", Input).value.strip()
+            self.dismiss(val or self._default_cmd)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class RadioTUI(App):
     """The Textual application."""
 
@@ -1034,6 +1094,9 @@ class RadioTUI(App):
                     yield Static("MeshCore", id="mesh-bar-label")
                     yield Static("", id="mesh-spacer")
                     yield Button(
+                        "\u26a1 Start", id="mesh-start", classes="modebtn"
+                    )
+                    yield Button(
                         "\u2605 Favorite", id="mesh-fav", classes="modebtn"
                     )
                     yield Button(
@@ -1045,6 +1108,7 @@ class RadioTUI(App):
                 with Horizontal(id="js8-bar"):
                     yield Static("JS8Call", id="js8-bar-label")
                     yield Static("", id="js8-spacer")
+                    yield Button("\u26a1 Start", id="js8-start", classes="modebtn")
                     for _band in ("80m", "40m", "30m", "20m", "17m", "15m", "10m"):
                         yield Button(
                             _band, id=f"js8-band-{_band}", classes="modebtn"
@@ -1056,6 +1120,7 @@ class RadioTUI(App):
                 with Horizontal(id="winlink-bar"):
                     yield Static("Winlink", id="winlink-bar-label")
                     yield Static("", id="winlink-spacer")
+                    yield Button("\u26a1 Start", id="winlink-start", classes="modebtn")
                     yield Button(
                         "\u270e Subject", id="winlink-subject", classes="modebtn"
                     )
@@ -2100,6 +2165,11 @@ class RadioTUI(App):
             self.action_toggle_nomad_favorite()
         elif bid == "nomad-sync":
             self.action_sync_nomad()
+        elif bid in ("mesh-start", "js8-start", "winlink-start"):
+            transport_name = bid.split("-")[0]
+            if transport_name == "mesh":
+                transport_name = "meshcore"
+            self._handle_start_command(transport_name)
         elif bid == "mesh-fav":
             self._favorite_current_conversation()
         elif bid == "mesh-announce":
@@ -2363,7 +2433,7 @@ class RadioTUI(App):
     def _transport_identity(self, t) -> str:
         """Human description of the on-air identity a transport uses.
 
-        Callsign-carrying media (HF: js8call/winlink/mercury) identify with a
+        Callsign-carrying media (HF: js8call/winlink) identify with a
         callsign — from the transport's own config if set, else the station
         callsign. Anonymous media (Reticulum/MeshCore) expose a non-identifying
         address via ``local_identity()``. Mirrors ``radioapp status``.
@@ -3800,7 +3870,10 @@ class RadioTUI(App):
         )
         down = self._health.get("meshcore") is ReachabilityStatus.DOWN
         for btn in bar.query(Button):
-            btn.disabled = down
+            if btn.id == "mesh-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
 
     def _winlink_transport(self) -> Transport | None:
         """The live WinlinkTransport instance, or None when not configured."""
@@ -3826,7 +3899,10 @@ class RadioTUI(App):
         bar.display = show
         down = self._health.get("winlink") is ReachabilityStatus.DOWN
         for btn in bar.query(Button):
-            btn.disabled = down
+            if btn.id == "winlink-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
         if not show:
             return
         t = self._winlink_transport()
@@ -4345,7 +4421,10 @@ class RadioTUI(App):
         bar.display = show
         down = self._health.get("js8call") is ReachabilityStatus.DOWN
         for btn in bar.query(Button):
-            btn.disabled = down
+            if btn.id == "js8-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
         # The bottom one-click query bar (SNR?/HEARING?/STATUS?/INFO?) tracks the
         # band bar's visibility - both belong to the JS8 chat panel.
         try:
@@ -4833,7 +4912,7 @@ class RadioTUI(App):
         target = target.strip()
         if target.startswith("@"):
             return target
-        if self.active_transport in ("js8call", "mercury"):
+        if self.active_transport == "js8call":
             return target.upper()
         return target
 
@@ -5071,7 +5150,6 @@ class RadioTUI(App):
         "reticulum": "cyan",
         "js8call": "yellow",
         "meshcore": "green",
-        "mercury": "magenta",
         "nomadnet": "blue",
     }
 
@@ -5594,6 +5672,73 @@ class RadioTUI(App):
             )
         self._log_system("\n".join(lines))
 
+    @work
+    async def _handle_start_command(self, arg: str) -> None:
+        """Launch or reconnect the backing process for a transport.
+
+        /start          — start the currently active transport's backing app
+        /start js8call  — start a specific transport by name
+        """
+        if self.core is None:
+            return
+        pm = getattr(self.core, "proc_manager", None)
+        if pm is None:
+            self._log_system("Process manager unavailable.")
+            return
+
+        name = (arg.strip().lower() or self.active_transport or "").strip()
+        if not name:
+            self._log_system("usage: /start [transport_name]  (or pick a mode first)")
+            return
+
+        if pm.definition(name) is None:
+            known = ", ".join(pm.known_transports())
+            self._log_system(
+                f"Unknown transport {name!r}. Manageable transports: {known}"
+            )
+            return
+
+        transport = next(
+            (t for t in self.core.transports if t.name == name), None
+        )
+        if transport is None:
+            self._log_system(
+                f"{name} is not enabled in your config. Add it to [transports.{name}]."
+            )
+            return
+
+        # Build the contextual prompt function so the modal runs in the TUI.
+        async def _prompt(transport_name: str, default_cmd: str) -> str | None:
+            result: list[str | None] = [None]
+            ev = asyncio.Event()
+
+            def _cb(val: str | None) -> None:
+                result[0] = val
+                ev.set()
+
+            self.app.push_screen(
+                LaunchCmdScreen(transport_name, default_cmd), _cb
+            )
+            await ev.wait()
+            return result[0]
+
+        # Show a status line before the potentially-slow launch.
+        if pm.is_running(name):
+            self._log_system(f"Reconnecting {name}…")
+        else:
+            self._log_system(f"Starting {name}…")
+
+        ok = await pm.start(name, transport, prompt_fn=_prompt)
+        if ok:
+            self._log_system(f"{name} ready.")
+            self._refresh_health()
+            self._update_status()
+        else:
+            self._log_system(
+                f"Failed to start {name}. Check logs or set "
+                f"[transports.{name}].launch_cmd in your config."
+            )
+
     def _handle_browse_command(self, arg: str) -> None:
         """Open the NomadNet page viewer: /browse <hash>[:/page/x.mu]."""
         if self.core is None:
@@ -6079,6 +6224,8 @@ class RadioTUI(App):
             self._handle_sched_command(arg)
         elif cmd == "/roster":
             self._handle_roster_command(arg)
+        elif cmd == "/start":
+            await self._handle_start_command(arg)
         else:
             self._log_system(f"unknown command: {cmd}")
 

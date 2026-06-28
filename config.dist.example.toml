@@ -1,0 +1,59 @@
+# config.dist.example.toml — template for distributors
+#
+# This file shows what a DISTRIBUTOR puts in src/radio_app/config.dist.toml
+# when shipping a pre-configured Radio_App package (custom installer, fork,
+# OS package, etc.). It is NOT the same as config.example.toml — that file
+# documents what an end-user puts in their own config.toml.
+#
+# HOW THE THREE-LAYER MERGE WORKS
+# --------------------------------
+# 1. Built-in defaults (hardcoded in config.py)
+# 2. Distribution config  ← THIS FILE, baked into the wheel as
+#                            src/radio_app/config.dist.toml
+# 3. User config           ← ~/.config/radio_app/config.toml (always wins)
+#
+# The user's config.toml is written by `radioapp setup` and by the TUI.
+# It always takes precedence. If the user has not set a key, the dist value
+# is used; if neither is set, the built-in default applies.
+#
+# WHAT BELONGS HERE
+# -----------------
+# • launch_cmd / modem_cmd — how to start the backing app on THIS distro
+#   (paths differ between Debian, Fedora, Flatpak, etc.)
+# • Default ports/hosts if your packaging changes them
+# • Sane transport defaults matched to the platform (e.g. serial port name)
+#
+# WHAT DOES NOT BELONG HERE
+# --------------------------
+# • Station identity (callsign, grid_square) — always left to the user
+# • transport enabled = true/false — the user decides what they run
+# • User preferences (theme, history_days, download_dir)
+# • Compliance overrides
+
+# -- JS8Call -----------------------------------------------------------------
+[transports.js8call]
+# Full path to the JS8Call binary when it is not on the system PATH.
+launch_cmd = "js8call"
+# Seconds to wait for JS8Call's API port to open after spawning.
+launch_wait_s = 15
+
+# -- WSJT-X ------------------------------------------------------------------
+[transports.wsjt_x]
+# Full path to the WSJT-X binary.
+launch_cmd = "wsjtx"
+launch_wait_s = 15
+
+# -- Winlink (Pat) -----------------------------------------------------------
+[transports.winlink]
+# Command to start Pat's HTTP server.
+launch_cmd = "pat http"
+launch_wait_s = 15
+# RF modem to auto-launch before a varahf/varafm connect session.
+# Blank = assume modem is already running.
+# modem_cmd = "varahf"
+# modem_wait_s = 10
+
+# -- MeshCore ----------------------------------------------------------------
+# [transports.meshcore]
+# Default serial device for the MeshCore companion. Varies by OS/packaging.
+# port = "/dev/ttyACM0"

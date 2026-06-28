@@ -359,6 +359,87 @@ def test_mercury_is_reachable_via_varahf_method():
     assert "varahf" in CONNECT_METHODS
 
 
+def test_winlink_auto_launches_modem_when_varahf_port_closed():
+    """_start_modem_if_needed spawns modem_cmd when vara_port is not reachable."""
+    from unittest.mock import AsyncMock, MagicMock, patch
+
+    fake_proc = MagicMock()
+    fake_proc.returncode = None
+
+    async def run():
+        t = WinlinkTransport(
+            {
+                "pat_url": "http://127.0.0.1:8080",
+                "callsign": "N0CALL",
+                "vara_port": 8300,
+                "modem_cmd": "mercury",
+                "modem_wait_s": 0.1,
+            }
+        )
+        with (
+            patch(
+                "radio_app.transports.winlink_transport.probe_tcp",
+                new=AsyncMock(
+                    side_effect=[
+                        ReachabilityStatus.DOWN,  # initial port probe -> not running
+                        ReachabilityStatus.OK,    # post-spawn poll -> now up
+                    ]
+                ),
+            ),
+            patch(
+                "asyncio.create_subprocess_exec",
+                new=AsyncMock(return_value=fake_proc),
+            ),
+        ):
+            result = await t._start_modem_if_needed("varahf")
+
+        assert result is True
+        assert t._modem_proc is fake_proc
+
+    asyncio.run(run())
+
+
+def test_winlink_modem_skipped_when_no_modem_cmd():
+    """_start_modem_if_needed returns False immediately when modem_cmd is blank."""
+    from unittest.mock import AsyncMock, patch
+
+    async def run():
+        t = WinlinkTransport(
+            {
+                "pat_url": "http://127.0.0.1:8080",
+                "callsign": "N0CALL",
+                "vara_port": 8300,
+            }
+        )
+        with patch(
+            "radio_app.transports.winlink_transport.probe_tcp",
+            new=AsyncMock(return_value=ReachabilityStatus.DOWN),
+        ):
+            result = await t._start_modem_if_needed("varahf")
+
+        assert result is False
+        assert t._modem_proc is None
+
+    asyncio.run(run())
+
+
+def test_winlink_modem_skipped_for_telnet_method():
+    """_start_modem_if_needed is a no-op for non-RF methods (telnet)."""
+    async def run():
+        t = WinlinkTransport(
+            {
+                "pat_url": "http://127.0.0.1:8080",
+                "callsign": "N0CALL",
+                "modem_cmd": "mercury",
+            }
+        )
+        result = await t._start_modem_if_needed("telnet")
+        assert result is True
+        assert t._modem_proc is None
+
+    asyncio.run(run())
+
+
 # -- reachability -------------------------------------------------------------
 
 def test_check_reachable_ok_when_pat_answers(fake_pat):
@@ -925,7 +1006,6 @@ def test_tui_forms_flow_queues_to_outbox(fake_pat, tmp_path):
     )
 
     state, url = fake_pat
-    TRANSPORT_REGISTRY.pop("mercury", None)
     cfg = tmp_path / "config.toml"
     cfg.write_text(
         "[general]\ndisplay_name = 'T'\n[logging]\nfile = ''\n"

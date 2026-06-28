@@ -20,7 +20,6 @@ from radio_app.core.message import (  # noqa: E402,E501
     DeliveryStatus,
     UnifiedMessage,
 )
-from radio_app.transports.base import TRANSPORT_REGISTRY  # noqa: E402
 from radio_app.ui.tui import RadioTUI  # noqa: E402
 
 CONFIG = """\
@@ -43,7 +42,6 @@ connect = "telnet"
 def config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -356,7 +354,6 @@ def test_attach_works_and_injects_in_reticulum_mode(tmp_path):
     the test exercises the TUI's capability-driven gating without starting a real
     RNS instance.
     """
-    TRANSPORT_REGISTRY.pop("mercury", None)
     f = tmp_path / "pic.bin"
     f.write_bytes(b"\x00\x01\x02")
 

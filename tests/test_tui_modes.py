@@ -18,7 +18,6 @@ pytest.importorskip("textual")
 from textual.widgets import Button  # noqa: E402
 
 from radio_app.core.message import AddressType, UnifiedMessage  # noqa: E402
-from radio_app.transports.base import TRANSPORT_REGISTRY  # noqa: E402
 from radio_app.ui.tui import RadioTUI  # noqa: E402
 
 CONFIG = """\
@@ -33,9 +32,6 @@ port = 2442
 enabled = true
 connection = "tcp"
 tcp_port = 5000
-[transports.mercury]
-enabled = true
-port = 7373
 """
 
 
@@ -43,11 +39,6 @@ port = 7373
 def config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG)
-    # Mercury is intentionally not registered (its import is commented out in
-    # transports/__init__). Other test modules import the mercury module
-    # directly, which would re-register it globally, so drop it here to mirror
-    # the production import graph where the mode does not exist.
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -1239,7 +1230,6 @@ transports = ["js8call"]
 def groups_config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG_WITH_GROUPS)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -1689,7 +1679,6 @@ def _home_config_path(tmp_path, home):
     )
     p = tmp_path / "config.toml"
     p.write_text(cfg)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -2104,7 +2093,6 @@ def test_cmd_history_via_submit(tmp_path):
         "[station]\ncallsign = 'W1TEST'\n"
         "[transports.js8call]\nenabled = true\nport = 2442\n"
     )
-    TRANSPORT_REGISTRY.pop("mercury", None)
 
     async def run():
         app = RadioTUI(str(cfg))
