@@ -509,23 +509,47 @@ def _run(coro):
     return asyncio.run(coro)
 
 
-async def _with_app(config_path, func):
+import contextlib as _contextlib
+import os as _os
+
+
+@_contextlib.contextmanager
+def _silence_stderr():
+    """Redirect stderr to /dev/null at the file-descriptor level.
+
+    Suppresses both Python logging output and direct C-level writes (e.g.
+    Reticulum's own [Notice]/[Error] lines) without touching sys.stderr.
+    """
+    devnull = _os.open(_os.devnull, _os.O_WRONLY)
+    saved = _os.dup(2)
+    _os.dup2(devnull, 2)
+    _os.close(devnull)
+    try:
+        yield
+    finally:
+        _os.dup2(saved, 2)
+        _os.close(saved)
+
+
+async def _with_app(config_path, func, *, quiet: bool = False):
     app = App.from_config_path(config_path)
     # Install logging early so transport startup messages are captured.
     from .logging_setup import configure_logging
 
-    configure_logging(app.config, stderr=True)
-    await app.start()
+    configure_logging(app.config, stderr=not quiet)
+    with _silence_stderr() if quiet else _contextlib.nullcontext():
+        await app.start()
     try:
         return await func(app)
     finally:
-        await app.stop()
+        with _silence_stderr() if quiet else _contextlib.nullcontext():
+            await app.stop()
 
 
 # -- commands ----------------------------------------------------------------
 
 
-def _cli_sender(cfg: "Config", transport_name: str | None) -> str:
+def _cli_sender(cfg: Config, transport_name: str | None) -> str:
     """Return the sender label for a CLI-originated message.
 
     Resolves from the target transport's own identity (callsign for HF,
@@ -1336,6 +1360,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
         enc = "ALLOWED" if app.config.allow_encrypted_on_hf() else "blocked"
         print(f"encrypt-on-HF: {enc}")
         print(f"database     : {app.config.database_path()}")
+        print(f"download dir : {app.config.download_dir()}")
         print("transports   :")
         from .transports.base import ReachabilityStatus
 
@@ -1391,7 +1416,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
             )
         return 0
 
-    return _run(_with_app(args.config, run))
+    return _run(_with_app(args.config, run, quiet=True))
 
 
 def _cmd_transports(args: argparse.Namespace) -> int:
@@ -1782,7 +1807,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
                 f"grid={js8_info.grid or '-'}"
             )
         else:
-            print("  (JS8Call did not answer — start it, then run setup again if needed)")
+            print("  (JS8Call did not answer — start it, then run setup again)")
         js8["callsign"] = _ask(
             "JS8Call callsign", js8.get("callsign", "") or station.callsign
         )

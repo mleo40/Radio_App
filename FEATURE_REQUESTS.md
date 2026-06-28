@@ -2,6 +2,90 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Database merge (`radioapp db merge`)
+
+**Requested:** 2026-06-27
+**Status:** Backlog
+**Area:** `cli.py`, `core/store.py`
+
+Reconcile two diverged databases after field use. Operator takes a backup to the
+field, accumulates offline activity, returns home and merges both copies into one.
+
+**Use case:** Base station runs 24/7 capturing all HF/Reticulum traffic. Operator
+copies the database to a field device at departure. Both continue accumulating data
+independently. On return, `radioapp db merge field-backup.zip` absorbs the field
+copy into the home database without losing anything from either side.
+
+**Design notes:**
+- `INSERT OR IGNORE INTO messages SELECT * FROM field.messages` — `msg_id` (UUID
+  primary key) handles duplicates automatically; messages present on both sides are
+  skipped, unique messages from either side are absorbed
+- Merge order across tables (dependency-safe): groups → group_members → group_tags
+  → messages → favorites → scheduled_messages
+- FTS5 index rebuild required after merge:
+  `INSERT INTO messages_fts(messages_fts) VALUES('rebuild')`
+- Report after merge: "absorbed N new messages from field copy (M already present)"
+- Favorites and group membership: union-merge (add entries not already present;
+  never delete existing entries from either side)
+- Scheduled messages: deduplicate by `msg_id`; if a scheduled send fired on the
+  field device it will already be in the messages table, so the scheduled entry can
+  be dropped on merge
+- Input: accepts same formats as `radioapp db restore` (a `.zip` backup archive or
+  a raw `.db` file)
+
+**Command:**
+```bash
+radioapp db merge field-backup.zip          # merge into current config's database
+radioapp db merge field.db --dry-run        # show what would be absorbed, don't write
+```
+
+---
+
+## Server-side message forwarding via LoRa/Reticulum
+
+**Requested:** 2026-06-27
+**Status:** Backlog
+**Area:** `core/router.py`, `transports/reticulum_transport.py`, `config.py`, `cli.py`
+
+A 24/7 base-station instance receives traffic on any transport (JS8Call, Winlink,
+WSJT-X, MeshCore, etc.) and automatically forwards matching messages to a field
+operator's Reticulum/LoRa node, enabling real-time alerts without internet or SSH.
+
+**Use case:** Server sits at home/EOC with all HF transports running. Operator is
+in the field with only an RNode (LoRa). When the server hears traffic addressed to
+the operator (or matching a configured filter — group, keyword, sender), it pushes
+a compact summary to the field RNS identity over LoRa.
+
+**Design notes:**
+- Config: `[forwarding]` section with `enabled`, `destination` (RNS hash of field
+  device), `filter` (same filter syntax as existing `[[filters]]` rules), and
+  `transport = "reticulum"` (initially Reticulum-only, since it's the only
+  anonymous/routed transport)
+- Trigger: hook into `Router`'s existing `add_ui_callback()` path — every inbound
+  `UnifiedMessage` that passes the filter gets forwarded via the Reticulum transport
+- Forwarding message: compact LXMF direct message containing transport source,
+  sender callsign, group (if any), and a truncated content preview (≤200 chars to
+  fit a LoRa packet budget)
+- Field device just needs `radioapp tui` running against its own Reticulum identity
+  — forwarded messages arrive as normal direct messages
+- No new transport needed; reuses `ReticululTransport.send()` with a synthetic
+  `UnifiedMessage.direct(server_name, field_rns_hash, summary)`
+- Daemon/headless mode (separate feature) is a prerequisite for clean 24/7
+  operation without a TUI
+
+**UX sketch (config):**
+```toml
+[forwarding]
+enabled = true
+destination = "aabbccddeeff..."   # field device RNS hash
+transport = "reticulum"
+# Forward everything, or scope it:
+# filter = { group = "EMS" }
+# filter = { to = "KC1QKM" }
+```
+
+---
+
 ## On-demand transport app launcher (`/start` command)
 
 **Requested:** 2026-06-27
