@@ -88,6 +88,9 @@ _DEFAULTS: dict[str, Any] = {
         # in-memory scrollback, bounded so a long session on a busy band can't
         # grow without limit. 0 = unbounded (not recommended on small devices).
         "watch_buffer_limit": 1000,
+        # Number of previously-submitted messages/commands to remember per mode.
+        # Up/Down in the composer navigates the history for the active mode.
+        "command_history_limit": 100,
     },
 }
 

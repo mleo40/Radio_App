@@ -2012,6 +2012,125 @@ def test_cycle_watch_group_action_only_on_watch(groups_config_path):
     asyncio.run(run())
 
 
+def test_cmd_history_separate_per_mode(config_path):
+    """Up/Down in the composer navigates per-mode history independently."""
+    from textual.widgets import Input
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+
+            # Push history for js8call mode.
+            app._select_mode("js8call")
+            await pilot.pause()
+            app._push_cmd_history("hello js8")
+            app._push_cmd_history("second js8")
+
+            # Push different history for meshcore mode.
+            app._select_mode("meshcore")
+            await pilot.pause()
+            app._push_cmd_history("hello mesh")
+
+            # Back in js8call: Up should recall "second js8" (most recent).
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer.focus()
+            composer.value = ""
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "second js8"
+
+            # Up again: older entry.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello js8"
+
+            # Up at oldest: stays put.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello js8"
+
+            # Down: forward to "second js8".
+            app._navigate_cmd_history(back=False)
+            assert composer.value == "second js8"
+
+            # Down again: back to draft (empty).
+            app._navigate_cmd_history(back=False)
+            assert composer.value == ""
+
+            # meshcore history is untouched.
+            app._select_mode("meshcore")
+            await pilot.pause()
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello mesh"
+
+    asyncio.run(run())
+
+
+def test_cmd_history_draft_restored_on_down(config_path):
+    """Navigating back saves the current draft; Down all the way restores it."""
+    from textual.widgets import Input
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+
+            app._push_cmd_history("old entry")
+            composer.value = "draft text"
+
+            # Up saves draft and shows old entry.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "old entry"
+
+            # Down restores the draft.
+            app._navigate_cmd_history(back=False)
+            assert composer.value == "draft text"
+
+    asyncio.run(run())
+
+
+def test_cmd_history_via_submit(tmp_path):
+    """Submitting text via Enter pushes it to the mode's history."""
+    from textual.widgets import Input
+
+    # Needs a callsign so the setup wizard doesn't appear and steal focus.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[general]\ndisplay_name = 'T'\n[logging]\nfile = ''\n"
+        "[station]\ncallsign = 'W1TEST'\n"
+        "[transports.js8call]\nenabled = true\nport = 2442\n"
+    )
+    TRANSPORT_REGISTRY.pop("mercury", None)
+
+    async def run():
+        app = RadioTUI(str(cfg))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+
+            # Submit a slash-command — it should land in history even though it
+            # routes through _handle_command rather than _send.
+            composer.value = "/help"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0)
+                if "js8call" in app._cmd_history:
+                    break
+
+            assert "js8call" in app._cmd_history
+            assert "/help" in app._cmd_history["js8call"]
+
+    asyncio.run(run())
+
+
 
 
 

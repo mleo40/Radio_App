@@ -933,9 +933,10 @@ def test_tui_forms_flow_queues_to_outbox(fake_pat, tmp_path):
         f'pat_url = "{url}"\ncallsign = "N0CALL"\nconnect = "telnet"\n'
     )
 
-    async def _wait(pilot, pred, tries=150):
+    async def _wait(pilot, pred, tries=200):
         for _ in range(tries):
             await pilot.pause()
+            await asyncio.sleep(0)  # drain thread-pool callbacks before checking
             if pred():
                 return True
         return False

@@ -1013,6 +1013,15 @@ class RadioTUI(App):
         # without new lines pushing the view.
         self._logs_min_level = logging.INFO
         self._logs_paused = False
+        # Per-mode command history. Keyed by active_transport name when in a
+        # transport mode, or by view name otherwise (e.g. "nomadnet").
+        # Up/Down in the composer navigates backwards/forwards within the
+        # history for the current mode. Cap set from [ui].command_history_limit
+        # in on_mount.
+        self._cmd_history: dict[str, deque] = {}
+        self._cmd_hist_pos: dict[str, int] = {}   # -1 = not browsing
+        self._cmd_hist_draft: dict[str, str] = {} # saved partial input while browsing
+        self._cmd_hist_limit: int = 100
 
     # -- layout ---------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -1199,6 +1208,12 @@ class RadioTUI(App):
         limit = max(0, limit)
         self._watch_buffer_limit = limit
         self._monitor_msgs = deque(maxlen=limit if limit > 0 else None)
+        try:
+            self._cmd_hist_limit = max(
+                0, int(cfg.ui.get("command_history_limit", 100))
+            )
+        except (TypeError, ValueError):
+            self._cmd_hist_limit = 100
         # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
@@ -4714,8 +4729,70 @@ class RadioTUI(App):
         touch = " touch" if self._touch_layout else ""
         ind.update(f"{glyph}{touch}")
 
+    # -- per-mode command history ---------------------------------------------
+    def _hist_key(self) -> str:
+        """History bucket for the current mode."""
+        if self.view == "active" and self.active_transport:
+            return self.active_transport
+        return self.view or "active"
+
+    def _push_cmd_history(self, text: str) -> None:
+        if not text or not self._cmd_hist_limit:
+            return
+        key = self._hist_key()
+        hist = self._cmd_history.get(key)
+        if hist is None:
+            hist = deque(maxlen=self._cmd_hist_limit)
+            self._cmd_history[key] = hist
+        if not hist or hist[-1] != text:
+            hist.append(text)
+        self._cmd_hist_pos[key] = -1
+        self._cmd_hist_draft.pop(key, None)
+
+    def _navigate_cmd_history(self, back: bool) -> None:
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        key = self._hist_key()
+        hist = self._cmd_history.get(key)
+        if not hist:
+            return
+        pos = self._cmd_hist_pos.get(key, -1)
+        if back:
+            if pos == -1:
+                self._cmd_hist_draft[key] = composer.value
+                pos = len(hist) - 1
+            elif pos > 0:
+                pos -= 1
+            else:
+                return  # already at oldest entry
+        else:
+            if pos == -1:
+                return  # nothing to go forward to
+            if pos < len(hist) - 1:
+                pos += 1
+            else:
+                pos = -1
+                composer.value = self._cmd_hist_draft.pop(key, "")
+                composer.cursor_position = len(composer.value)
+                self._cmd_hist_pos[key] = pos
+                return
+        self._cmd_hist_pos[key] = pos
+        composer.value = hist[pos]
+        composer.cursor_position = len(composer.value)
+
     def on_key(self, event) -> None:  # noqa: ANN001 - Textual event
         self._note_input("key")
+        if event.key in ("up", "down"):
+            try:
+                composer = self.query_one("#composer", Input)
+            except Exception:  # noqa: BLE001
+                return
+            if composer.has_focus:
+                self._navigate_cmd_history(event.key == "up")
+                event.prevent_default()
+                event.stop()
 
     def on_click(self, event) -> None:  # noqa: ANN001 - Textual event
         self._note_input("pointer")
@@ -5826,6 +5903,7 @@ class RadioTUI(App):
             event.input.value = ""
             if not addr:
                 return
+            self._push_cmd_history(addr)
             dest, path, fields = parse_address(addr)
             if not dest:
                 self._log_system("usage: <node hash>[:/page/x.mu]")
@@ -5838,12 +5916,14 @@ class RadioTUI(App):
             raw = event.value.strip()
             event.input.value = ""
             if raw:
+                self._push_cmd_history(raw)
                 self._add_favorite_from_input(raw)
             return
         text = event.value.strip()
         event.input.value = ""
         if not text:
             return
+        self._push_cmd_history(text)
         # Hidden easter egg: the classic adventure magic word opens the About
         # screen instead of sending. (Undocumented; see also the Ctrl+G chord.)
         if text.lower() == "xyzzy":
