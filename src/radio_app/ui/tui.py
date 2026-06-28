@@ -2576,6 +2576,7 @@ class RadioTUI(App):
             )
             src_label = {
                 "gps": "GPS",
+                "wsjtx_ft8": "WSJT-X/JS8Call DT",
                 "local_ntp": "local NTP",
                 "ntp": "NTP",
                 "system": "system",
@@ -4546,6 +4547,7 @@ class RadioTUI(App):
                     gpsd_host=pos_cfg.get("gpsd_host", "127.0.0.1"),
                     gpsd_port=int(pos_cfg.get("gpsd_port", 2947)),
                     timeout=1.5,
+                    wsjtx_monitor=self.core.wsjtx_monitor if self.core else None,
                 )
                 self._time_reading = await _asyncio.wait_for(
                     loop.run_in_executor(None, tc.best_reading),

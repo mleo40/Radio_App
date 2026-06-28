@@ -19,6 +19,7 @@ from .core.nomad_cache import NomadPageCache
 from .core.nomadnet import NomadnetBrowser
 from .core.radio_interlock import RadioInterlock
 from .core.router import Router
+from .core.timesource import WSJTXDTMonitor
 from .core.selector import SelectionMode
 from .core.station import Station
 from .core.store import MessageStore
@@ -69,6 +70,7 @@ class App:
             station=self.station,
             compliance=self.compliance,
         )
+        self.wsjtx_monitor = WSJTXDTMonitor()
         self._started = False
 
     @classmethod
@@ -142,6 +144,7 @@ class App:
 
         if self.transports:
             await asyncio.gather(*(_start_one(t) for t in self.transports))
+        await self.wsjtx_monitor.start()
         # Apply retention policy on startup.
         days = int(self.config.general.get("history_retention_days", 0) or 0)
         if days > 0:
@@ -162,6 +165,7 @@ class App:
                 await transport.stop()
             except Exception:  # noqa: BLE001
                 log.exception("failed to stop transport %s", transport.name)
+        await self.wsjtx_monitor.stop()
         self.store.close()
         self.nomad_cache.close()
         self._started = False

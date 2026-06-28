@@ -294,3 +294,162 @@ def test_query_gpsd_time_with_fix():
     assert isinstance(result, float)
     # Local clock is ahead of a timestamp 50ms in the past → positive offset ~50ms
     assert result > 0
+
+
+# --- WSJTXDTMonitor / _parse_wsjtx_decode ------------------------------------
+
+from radio_app.core.timesource import WSJTXDTMonitor, _parse_wsjtx_decode
+
+
+def _make_wsjtx_decode(dt: float, uid: str = "WSJT-X") -> bytes:
+    """Build a minimal WSJT-X schema-2 Decode packet with the given DT."""
+    magic = 0xADBCCBDA
+    schema = 2
+    msg_id = 2
+    header = struct.pack(">III", magic, schema, msg_id)
+    uid_bytes = uid.encode("ascii")
+    uid_field = struct.pack(">I", len(uid_bytes)) + uid_bytes
+    # New bool (1) + Time uint32 (4) + SNR int32 (4) + DT double (8)
+    body = struct.pack(">BIid", 0, 0, 0, dt)
+    return header + uid_field + body
+
+
+def test_parse_wsjtx_decode_basic():
+    pkt = _make_wsjtx_decode(0.25)
+    result = _parse_wsjtx_decode(pkt)
+    assert result == pytest.approx(0.25)
+
+
+def test_parse_wsjtx_decode_negative_dt():
+    pkt = _make_wsjtx_decode(-0.8)
+    result = _parse_wsjtx_decode(pkt)
+    assert result == pytest.approx(-0.8)
+
+
+def test_parse_wsjtx_decode_js8call_uid():
+    pkt = _make_wsjtx_decode(0.1, uid="JS8Call")
+    result = _parse_wsjtx_decode(pkt)
+    assert result == pytest.approx(0.1)
+
+
+def test_parse_wsjtx_decode_wrong_magic():
+    pkt = bytearray(_make_wsjtx_decode(0.1))
+    pkt[0] = 0xFF  # corrupt magic
+    assert _parse_wsjtx_decode(bytes(pkt)) is None
+
+
+def test_parse_wsjtx_decode_wrong_schema():
+    pkt = bytearray(_make_wsjtx_decode(0.1))
+    # schema is bytes 4-7; set to 3
+    struct.pack_into(">I", pkt, 4, 3)
+    assert _parse_wsjtx_decode(bytes(pkt)) is None
+
+
+def test_parse_wsjtx_decode_wrong_msg_id():
+    pkt = bytearray(_make_wsjtx_decode(0.1))
+    struct.pack_into(">I", pkt, 8, 5)  # not a Decode message
+    assert _parse_wsjtx_decode(bytes(pkt)) is None
+
+
+def test_parse_wsjtx_decode_unknown_uid():
+    pkt = _make_wsjtx_decode(0.1, uid="JTDX")
+    assert _parse_wsjtx_decode(pkt) is None
+
+
+def test_parse_wsjtx_decode_too_short():
+    assert _parse_wsjtx_decode(b"\x00" * 10) is None
+
+
+# --- WSJTXDTMonitor sample accumulation --------------------------------------
+
+
+def test_wsjtx_monitor_no_offset_before_min_samples():
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=10)
+    # Feed 3 packets (below min_samples=4)
+    for _ in range(3):
+        mon._on_packet(_make_wsjtx_decode(0.1))
+    assert mon.get_offset_ms() is None
+    assert mon.sample_count == 3
+
+
+def test_wsjtx_monitor_returns_offset_at_min_samples():
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=10)
+    for _ in range(4):
+        mon._on_packet(_make_wsjtx_decode(0.2))
+    offset = mon.get_offset_ms()
+    assert offset is not None
+    # DT=0.2 → offset = -0.2 * 1000 = -200 ms
+    assert offset == pytest.approx(-200.0, abs=1.0)
+
+
+def test_wsjtx_monitor_outlier_filtering():
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=10)
+    # 9 samples near 0.1 and one extreme outlier
+    for _ in range(9):
+        mon._on_packet(_make_wsjtx_decode(0.1))
+    mon._on_packet(_make_wsjtx_decode(99.0))  # outlier
+    offset = mon.get_offset_ms()
+    assert offset is not None
+    # Should be close to -100 ms, not pulled toward the outlier
+    assert abs(offset - (-100.0)) < 20.0
+
+
+def test_wsjtx_monitor_rolling_window():
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=5)
+    # Fill with 0.1 samples
+    for _ in range(5):
+        mon._on_packet(_make_wsjtx_decode(0.1))
+    # Now push 5 samples of 0.5 (rolling deque evicts old ones)
+    for _ in range(5):
+        mon._on_packet(_make_wsjtx_decode(0.5))
+    offset = mon.get_offset_ms()
+    assert offset is not None
+    assert abs(offset - (-500.0)) < 20.0
+
+
+def test_wsjtx_monitor_ignores_invalid_packets():
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=10)
+    mon._on_packet(b"\x00" * 20)  # garbage
+    mon._on_packet(_make_wsjtx_decode(0.1, uid="JTDX"))  # unknown uid
+    assert mon.sample_count == 0
+    assert mon.get_offset_ms() is None
+
+
+# --- TimeConsensus with wsjtx_monitor ----------------------------------------
+
+
+def test_time_consensus_uses_wsjtx_before_local_ntp(monkeypatch):
+    monkeypatch.setattr("radio_app.core.timesource.query_gpsd_time", lambda *a, **kw: None)
+    monkeypatch.setattr("radio_app.core.timesource.query_ntp", lambda *a, **kw: None)
+    mon = WSJTXDTMonitor(min_samples=1, max_samples=10)
+    mon._on_packet(_make_wsjtx_decode(0.3))
+    tc = TimeConsensus(wsjtx_monitor=mon)
+    r = tc.best_reading()
+    assert r.source is TimeSourceKind.WSJTX
+    assert r.offset_ms == pytest.approx(-300.0, abs=1.0)
+
+
+def test_time_consensus_skips_wsjtx_when_no_samples(monkeypatch):
+    monkeypatch.setattr("radio_app.core.timesource.query_gpsd_time", lambda *a, **kw: None)
+    monkeypatch.setattr("radio_app.core.timesource.query_ntp", lambda *a, **kw: None)
+    monkeypatch.setattr("radio_app.core.timesource.query_chronyc", lambda **kw: 5.0)
+    mon = WSJTXDTMonitor(min_samples=4, max_samples=10)  # no packets fed
+    tc = TimeConsensus(wsjtx_monitor=mon)
+    r = tc.best_reading()
+    assert r.source is TimeSourceKind.LOCAL_NTP
+
+
+def test_time_consensus_wsjtx_beats_local_ntp(monkeypatch):
+    monkeypatch.setattr("radio_app.core.timesource.query_gpsd_time", lambda *a, **kw: None)
+    monkeypatch.setattr("radio_app.core.timesource.query_ntp", lambda *a, **kw: None)
+    called = []
+    monkeypatch.setattr(
+        "radio_app.core.timesource.query_chronyc",
+        lambda **kw: called.append("chrony") or 5.0,
+    )
+    mon = WSJTXDTMonitor(min_samples=1, max_samples=10)
+    mon._on_packet(_make_wsjtx_decode(0.05))
+    tc = TimeConsensus(wsjtx_monitor=mon)
+    r = tc.best_reading()
+    assert r.source is TimeSourceKind.WSJTX
+    assert "chrony" not in called  # never reached

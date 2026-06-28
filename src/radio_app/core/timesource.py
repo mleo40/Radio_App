@@ -11,11 +11,16 @@ unavailable.
 """
 from __future__ import annotations
 
+import asyncio
+import collections
 import json
+import logging
+import math
 import re
 import socket
 import struct
 import subprocess
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime
@@ -23,12 +28,15 @@ from enum import Enum
 
 from .._compat import UTC
 
+log = logging.getLogger(__name__)
+
 
 class TimeSourceKind(str, Enum):
     SYSTEM = "system"        # local clock only, no external sync
     NTP = "ntp"              # internet NTP (pool.ntp.org or configured host)
     LOCAL_NTP = "local_ntp"  # chrony or ntpd daemon running on the host
     GPS = "gps"              # gpsd daemon running on the host
+    WSJTX = "wsjtx_ft8"     # WSJT-X / JS8Call DT field via UDP port 2237
 
 
 @dataclass
@@ -180,10 +188,167 @@ def query_ntpd(timeout: float = 3.0) -> float | None:
     return None
 
 
+def _parse_wsjtx_decode(data: bytes) -> float | None:
+    """Extract the DT field from a WSJT-X schema-2 Decode (msg_id=2) UDP packet.
+
+    Returns DT in seconds, or None if the packet is not a valid Decode message.
+    Byte layout mirrors jtxsync/source/main.c exactly.
+
+    After the 12-byte header (magic + schema + msg_id):
+      uid_len (uint32) + uid bytes
+      New bool (1 byte)
+      Time uint32 / 4 bytes (ms since midnight, skipped)
+      SNR int32 / 4 bytes (skipped)
+      Delta time double / 8 bytes  ← what we want
+    """
+    if len(data) < 36:
+        return None
+    magic, schema, msg_id = struct.unpack_from(">III", data, 0)
+    if magic != 0xADBCCBDA or schema != 2 or msg_id != 2:
+        return None
+
+    count = 12
+    if count + 4 > len(data):
+        return None
+    uid_len = struct.unpack_from(">I", data, count)[0]
+    count += 4
+
+    if uid_len > 32 or count + uid_len > len(data):
+        return None
+    uid = data[count: count + uid_len].decode("ascii", errors="ignore")
+    count += uid_len
+
+    if uid not in ("WSJT-X", "JS8Call"):
+        return None
+
+    # New bool (1) + Time uint32 (4) + SNR int32 (4) = 9 bytes to skip
+    count += 9
+    if count + 8 > len(data):
+        return None
+    return struct.unpack_from(">d", data, count)[0]
+
+
+class _WSJTXProtocol(asyncio.DatagramProtocol):
+    """asyncio datagram handler that forwards raw packets to a callback."""
+
+    def __init__(self, on_packet):
+        self._on_packet = on_packet
+
+    def datagram_received(self, data: bytes, addr: tuple) -> None:
+        self._on_packet(data)
+
+    def error_received(self, exc: Exception) -> None:
+        log.debug("WSJTXDTMonitor socket error: %s", exc)
+
+    def connection_lost(self, exc: Exception | None) -> None:
+        pass
+
+
+class WSJTXDTMonitor:
+    """Background asyncio UDP listener that accumulates DT samples from WSJT-X
+    or JS8Call and exposes a filtered clock-offset estimate.
+
+    Binds to UDP port 2237 (configurable) with SO_REUSEPORT so it can share
+    the port alongside a running WSJT-X or JS8Call instance. Degrades
+    gracefully — ``get_offset_ms()`` returns None until ``min_samples`` have
+    been collected, and the whole monitor silently no-ops if the port is
+    unavailable.
+
+    ``get_offset_ms()`` is thread-safe and may be called from any thread.
+    """
+
+    def __init__(
+        self,
+        port: int = 2237,
+        max_samples: int = 10,
+        min_samples: int = 4,
+    ) -> None:
+        self._port = port
+        self._max_samples = max(min_samples, max_samples)
+        self._min_samples = min_samples
+        self._samples: collections.deque[float] = collections.deque(
+            maxlen=self._max_samples
+        )
+        self._lock = threading.Lock()
+        self._cached_offset_ms: float | None = None
+        self._transport: asyncio.BaseTransport | None = None
+        self._task: asyncio.Task | None = None
+
+    # -- public API -----------------------------------------------------------
+
+    def get_offset_ms(self) -> float | None:
+        """Return the current filtered clock offset in milliseconds, or None.
+
+        Positive = local clock is ahead of the FT8/JS8 reference.
+        Returns None until ``min_samples`` Decode messages have been received.
+        Thread-safe.
+        """
+        with self._lock:
+            return self._cached_offset_ms
+
+    @property
+    def sample_count(self) -> int:
+        with self._lock:
+            return len(self._samples)
+
+    # -- lifecycle ------------------------------------------------------------
+
+    async def start(self) -> None:
+        loop = asyncio.get_event_loop()
+        try:
+            self._transport, _ = await loop.create_datagram_endpoint(
+                lambda: _WSJTXProtocol(self._on_packet),
+                local_addr=("0.0.0.0", self._port),
+                reuse_port=True,
+            )
+            log.debug("WSJTXDTMonitor listening on UDP :%d", self._port)
+        except OSError as exc:
+            log.debug("WSJTXDTMonitor could not bind UDP :%d — %s", self._port, exc)
+
+    async def stop(self) -> None:
+        if self._transport is not None:
+            self._transport.close()
+            self._transport = None
+
+    # -- internals ------------------------------------------------------------
+
+    def _on_packet(self, data: bytes) -> None:
+        dt = _parse_wsjtx_decode(data)
+        if dt is None:
+            return
+        with self._lock:
+            self._samples.append(dt)
+            self._cached_offset_ms = self._compute_offset()
+
+    def _compute_offset(self) -> float | None:
+        """Compute filtered mean DT and convert to a clock offset in ms.
+
+        Mirrors jtxsync's algorithm: filter outliers beyond ±1 std dev,
+        then take the mean of what remains. Returns None if not enough
+        samples yet. Caller must hold self._lock.
+        """
+        samples = list(self._samples)
+        if len(samples) < self._min_samples:
+            return None
+        mean = sum(samples) / len(samples)
+        if len(samples) > 1:
+            variance = sum((s - mean) ** 2 for s in samples) / (len(samples) - 1)
+            stdev = math.sqrt(variance)
+        else:
+            stdev = 0.0
+        filtered = [s for s in samples if mean - stdev <= s <= mean + stdev]
+        if not filtered:
+            return None
+        filtered_mean = sum(filtered) / len(filtered)
+        # Negate: positive DT means signals arrived early → our clock is behind
+        # → offset (local − reference) is negative.
+        return -filtered_mean * 1000.0
+
+
 class TimeConsensus:
     """Query time sources in priority order and return the best available reading.
 
-    Priority: GPS (gpsd) → local NTP daemon (chronyc/ntpq) → internet NTP → system.
+    Priority: GPS (gpsd) → WSJT-X/JS8Call DT → local NTP daemon → internet NTP → system.
 
     Radio_App never starts or manages any of these daemons — it polls
     whatever is already running on the host. Each source is tried in order;
@@ -200,6 +365,7 @@ class TimeConsensus:
         skip_gps: bool = False,
         skip_local_ntp: bool = False,
         skip_internet_ntp: bool = False,
+        wsjtx_monitor: WSJTXDTMonitor | None = None,
     ) -> None:
         self.gpsd_host = gpsd_host
         self.gpsd_port = gpsd_port
@@ -208,6 +374,7 @@ class TimeConsensus:
         self.skip_gps = skip_gps
         self.skip_local_ntp = skip_local_ntp
         self.skip_internet_ntp = skip_internet_ntp
+        self.wsjtx_monitor = wsjtx_monitor
 
     def best_reading(self) -> TimeReading:
         """Return the best available time reading.
@@ -229,7 +396,18 @@ class TimeConsensus:
                     error=None,
                 )
 
-        # 2. Local NTP daemon (chronyc first, then ntpq)
+        # 2. WSJT-X / JS8Call DT (passive background monitor — no I/O here)
+        if self.wsjtx_monitor is not None:
+            offset = self.wsjtx_monitor.get_offset_ms()
+            if offset is not None:
+                return TimeReading(
+                    utc=datetime.now(UTC),
+                    source=TimeSourceKind.WSJTX,
+                    offset_ms=offset,
+                    error=None,
+                )
+
+        # 3. Local NTP daemon (chronyc first, then ntpq)
         if not self.skip_local_ntp:
             offset = query_chronyc(timeout=self.timeout)
             if offset is None:
@@ -242,7 +420,7 @@ class TimeConsensus:
                     error=None,
                 )
 
-        # 3. Internet NTP
+        # 4. Internet NTP
         if not self.skip_internet_ntp and self.ntp_host:
             offset = query_ntp(self.ntp_host, timeout=self.timeout)
             if offset is not None:
@@ -253,7 +431,7 @@ class TimeConsensus:
                     error=None,
                 )
 
-        # 4. System clock fallback
+        # 5. System clock fallback
         all_skipped = self.skip_gps and self.skip_local_ntp and self.skip_internet_ntp
         error = None if all_skipped else "all time sources unavailable"
         return TimeReading(
