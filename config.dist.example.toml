@@ -57,3 +57,21 @@ launch_wait_s = 15
 # [transports.meshcore]
 # Default serial device for the MeshCore companion. Varies by OS/packaging.
 # port = "/dev/ttyACM0"
+
+# -- TUI branding ------------------------------------------------------------
+# Terminal UIs cannot render raster images. The banner is displayed in muted
+# text above the active-mode panel. Use ASCII or Unicode block characters.
+# Leave blank (or omit entirely) for no branding — the app runs identically.
+[ui.branding]
+# Replaces "Radio_App" in the TUI header bar.
+# app_title = "EmComm Station"
+
+# Multi-line ASCII/block art shown above the message panels, in muted color.
+# Keep it short (2-4 lines) so it doesn't crowd the workspace.
+# banner = """
+#   ██████ ███████  ██████
+#   ██     ██      ██
+#   █████  ██      ██
+#   ██     ██      ██
+#   ██████ ███████  ██████   EmComm Group
+# """

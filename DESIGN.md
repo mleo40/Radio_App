@@ -53,7 +53,6 @@ Announce/advert traffic appears only in **Watch**.
 |------------|--------------------------------------------------------------|
 | Reticulum  | RNS attached to shared instance / has interfaces; rnsd reachable |
 | JS8        | TCP connect to JS8Call API holds                             |
-| Mercury    | Control-socket connect                                       |
 | MeshCore   | USB serial opens / TCP socket connects                       |
 | NomadNet   | N/A (rides Reticulum)                                        |
 

@@ -5,17 +5,21 @@ Messages are normalized into one format regardless of the medium that carried th
 so to the user it doesn't matter whether a message travelled via **Reticulum**
 (internet / LoRa / serial), **JS8Call** (HF weak-signal radio), **MeshCore**
 (license-free ISM LoRa mesh), **Winlink** (store-and-forward email over radio,
-via Pat), or the **Mercury** HF modem.
+via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 
 > Status: **working core + transports + field utilities**. The core (unified
 > message model, router, best-transport selection, group handling, inbound
 > filtering, SQLite persistence with FTS5, config, CLI, Textual TUI) is
-> implemented and tested. The **Reticulum**, **JS8Call**, **MeshCore** and
-> **Winlink** transports are functional; the **Mercury** adapter still has its
-> wire-level translation marked `TODO`. A full suite of **field/EmComm utilities**
-> is now built in: message export, canned templates, UTC time widget with
+> implemented and tested. The **Reticulum**, **JS8Call**, **MeshCore**,
+> **Winlink**, and **WSJT-X** transports are all functional. **ProcManager**
+> adds on-demand process lifecycle — ⚡ Start buttons in the TUI and a
+> `radioapp start <transport>` CLI command spawn JS8Call, WSJT-X, or Pat on
+> demand without leaving the app. A distributor-config layer (`config.dist.toml`,
+> baked into the package) lets packagers pre-configure launch commands while
+> leaving user identity to the operator. A full suite of **field/EmComm
+> utilities** is built in: message export, canned templates, UTC time widget with
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
-> awareness, offline band-plan, scheduled sends, and a presence roster. 676 tests
+> awareness, offline band-plan, scheduled sends, and a presence roster. ~738 tests
 > pass; the whole suite runs without radio hardware.
 
 ## Key ideas
@@ -29,18 +33,24 @@ via Pat), or the **Mercury** HF modem.
   what you receive.
 - **Saved conversations** — every message (any transport) persists to one SQLite
   store, giving uniform, searchable, cross-transport history.
-- **Single config file** — all user configuration lives in one TOML file that is
-  both hand-editable text and the exact file a future GUI reads/writes.
+- **Two-file config, one file for operators** — user configuration lives in one
+  hand-editable TOML file (`~/.config/radio_app/config.toml`) that is the exact
+  file a future GUI reads/writes. An optional distributor layer (`config.dist.toml`,
+  baked into the package) sits below it — user config always wins. Operators never
+  touch the dist file; it is invisible unless a packager ships one.
 
 ## Station identity, privacy & compliance
 
 - **Setup wizard** — run `radioapp setup` to capture **all** user settings in one
   pass (display name, Reticulum/`rnsd` location, JS8Call connection, MeshCore
-  connection, Winlink/Pat connection, callsign, grid square) and write them to the
-  single config file. If JS8Call is enabled and running, the wizard **asks JS8Call
-  for your callsign and grid** so you don't retype them (you can still override).
-  The radio itself is driven by the transport app (JS8Call), so there is **no
-  rig/CAT configuration** in Radio_App.
+  connection, Winlink/Pat connection, WSJT-X connection, callsign, grid square)
+  and write them to the user config file. If JS8Call is enabled and running, the
+  wizard **asks JS8Call for your callsign and grid** so you don't retype them (you
+  can still override). For each enabled transport the wizard also asks for a
+  `launch_cmd` (pre-filled from the distribution config if one is present), so
+  the **⚡ Start** button works immediately after setup. The radio itself is driven
+  by the transport app (JS8Call), so there is **no rig/CAT configuration** in
+  Radio_App.
 - **Privacy separation** — your callsign/grid are attached only on **HF transports**
   (where identifying on the air is required). On the **Reticulum** transport the
   sender is replaced with an anonymous cryptographic identity and any operator PII
@@ -75,16 +85,16 @@ via Pat), or the **Mercury** HF modem.
               ┌──────┴──────┐
               │   Router    │  selection · fallback · dedup · filtering · persist
               └──────┬──────┘
-       ┌──────────┬──────────┬──────────┬──────────┐
-  Reticulum   JS8Call   MeshCore   Winlink    Mercury   (+ plugin transports)
- internet/LoRa   HF     ISM LoRa   email/RF   HF modem
+       ┌──────────┬──────────┬──────────┬──────────┬──────────┐
+  Reticulum   JS8Call   MeshCore   Winlink    WSJT-X    (+ plugin transports)
+ internet/LoRa   HF     ISM LoRa   email/RF   FT8/FT4
 ```
 
 Source layout (`src/` layout, PEP 8):
 
 ```
 src/radio_app/
-├── config.py              # single-file TOML config (text + GUI source of truth)
+├── config.py              # TOML config (text + GUI source of truth; 3-layer merge)
 ├── app.py                 # wires config -> store/groups/filters/transports/router
 ├── cli.py                 # argparse CLI (stdlib only)
 ├── core/
@@ -99,7 +109,8 @@ src/radio_app/
 │   ├── position.py        # GPS position, Maidenhead grid, GPSReader (gpsd)
 │   ├── power.py           # host battery state (Linux sysfs)
 │   ├── bandplan.py        # offline band-plan + EmComm frequency reference
-│   └── roster.py          # presence roster (recently-heard callsigns, SQL-derived)
+│   ├── roster.py          # presence roster (recently-heard callsigns, SQL-derived)
+│   └── proc_manager.py    # on-demand lifecycle for JS8Call/WSJT-X/Pat (pgrep-based)
 ├── ui/                    # Textual TUI (single pane of glass)
 └── transports/
     ├── base.py            # Transport ABC + TransportCapabilities + auto-registry
@@ -107,12 +118,12 @@ src/radio_app/
     ├── js8call_transport.py
     ├── meshcore_transport.py
     ├── winlink_transport.py   # wraps a user-installed Pat client over HTTP
-    └── mercury_transport.py
+    └── wsjt_x_transport.py    # FT8/FT4 decodes via UDP datagrams from WSJT-X
 ```
 
 ## Installation
 
-Requires **Python 3.11+**.
+Requires **Python 3.10+**. On Python 3.10, `tomli` is installed automatically as a backport for `tomllib`; on 3.11+ it uses the stdlib module.
 
 ```bash
 # Core + CLI only (no radio deps; great for trying the model)
@@ -128,13 +139,18 @@ pip install -e ".[all]"
 pip install -e ".[dev]"
 ```
 
-External programs (not pip packages) are required for the HF transports:
+External programs (not pip packages) are required for the HF/SDR transports:
 
 - **JS8Call** running with its TCP/JSON API enabled (default port 2442) + radio.
-- **Mercury** modem running with its control socket + radio.
+- **WSJT-X** running and configured to send UDP packets to port 2237 (Settings →
+  Reporting → UDP Server).
 - **Pat** (Winlink client) running its HTTP API (`pat http`, default port 8080)
   for the **Winlink** transport. Pat is **user-installed and never bundled** —
   this app only talks to it over HTTP (see *Winlink* below).
+
+The **⚡ Start** buttons (and `radioapp start <transport>`) can launch these
+programs for you — set `launch_cmd` in the transport's config block or let the
+setup wizard ask for it.
 
 ## Reticulum / RNode (working today)
 
@@ -223,15 +239,10 @@ Pat** — nothing in this app changes:
 |---|---|---|
 | `telnet` | internet → CMS | nothing (works out of the box) |
 | `ardop` | RF | ARDOP soundcard modem |
-| `varahf` | RF | VARA HF — **including Mercury** (VARA-compatible TNC) |
+| `varahf` | RF | VARA HF or any VARA-compatible modem |
 | `varafm` | RF | VARA FM |
 | `pactor` | RF | SCS Pactor hardware TNC |
 | `ax25` | RF | packet TNC / Direwolf |
-
-Because Mercury presents a VARA-compatible TNC, it can serve as the open-source
-RF modem under Pat via `connect = "varahf"` — no Wine or closed binaries needed.
-The modem, audio routing and PTT all live inside Pat (outside this app), exactly
-like the rig does for JS8Call.
 
 **Automatic fallback (recommended).** Set `connect = "auto"` and Winlink tries
 each path in `connect_order` (default `telnet → varahf → ardop`), probing each
@@ -242,9 +253,9 @@ they share that slot.) Force a single path any time with `connect = "telnet"`
 (etc.), and a picked RMS gateway still overrides everything.
 
 On the **Health** tab, the `winlink` row shows Pat's reachability plus a line per
-connection path (telnet, varahf/Mercury, ardop) with an up/down dot from a
-passive port probe — so you can see, for example, that the VARA modem is down
-even while Pat itself is reachable.
+connection path (telnet, varahf, ardop) with an up/down dot from a passive port
+probe — so you can see, for example, that the VARA modem is down even while Pat
+itself is reachable.
 
 In the TUI, **Winlink is its own mode** — select the `winlink` chip (or F3 to
 it). The mode shows a **Winlink action bar** summarising the connection method
@@ -305,12 +316,12 @@ Notes:
 
 ### Sharing one radio: the interlock
 
-JS8Call and Pat/Winlink **over an RF modem** (VARA/ARDOP/Mercury) both drive the
+JS8Call and Pat/Winlink **over an RF modem** (VARA/ARDOP) both drive the
 *same* physical HF station — one sound card, one CAT port, one PTT line — so they
 must not transmit at once. Radio_App gates this with a **radio interlock**: only
 one radio-using mode "holds" the radio at a time.
 
-- Switching into JS8Call (or Mercury) **claims** the radio for that mode; leaving
+- Switching into JS8Call **claims** the radio for that mode; leaving
   it frees the radio. Starting a **Winlink RF session** claims it for the session
   and releases it when the session ends.
 - The app **refuses to key the radio** on one mode while another holds it (e.g. a
@@ -327,17 +338,41 @@ The interlock only applies to transports that report `uses_shared_radio`; intern
 
 ## Configuration
 
-All settings live in one TOML file (see [`config.example.toml`](config.example.toml)).
+Settings are loaded from two TOML files, merged in order — later layers override
+earlier ones (see [`config.example.toml`](config.example.toml) and
+[`config.dist.example.toml`](config.dist.example.toml)).
 
 ```bash
 radioapp config init     # copy the example to your user config dir
-radioapp config path     # show where the app looks
+radioapp config path     # show where the app looks (user + dist paths)
 radioapp config show     # print the active config
 radioapp setup           # interactive wizard: all user settings, one file
 ```
 
-Default location: `~/.config/radio_app/config.toml`
-(override with `RADIO_APP_CONFIG=/path/to/config.toml`).
+### Two-file configuration: which file wins
+
+| Layer | File | Who writes it | Wins over |
+|---|---|---|---|
+| 1. Built-in defaults | (code) | hardcoded | — |
+| 2. Distribution config | `config.dist.toml` inside the package | distributor | layer 1 |
+| 3. User config | `~/.config/radio_app/config.toml` | you / `setup` | layers 1–2 |
+
+**The user config always wins.** If you set a key in your `config.toml`, it
+overrides anything in the distribution layer. If a key is absent from your file,
+the distribution config's value is used; if that's also absent, the built-in
+default applies.
+
+**The distribution layer is optional.** A stock install has no `config.dist.toml`
+— behaviour is identical to before. The file only appears when a distributor
+(a custom installer, a fork, an OS package) ships one baked into the package to
+pre-configure launch commands (`launch_cmd`, `modem_cmd`) or platform-specific
+defaults for their target system.
+
+**As an operator you only ever edit one file** — your
+`~/.config/radio_app/config.toml`. The distribution layer is invisible unless you
+go looking for it (`radioapp config path` shows both paths).
+
+Override the user config location with `RADIO_APP_CONFIG=/path/to/config.toml`.
 
 ### Landing surface (`[ui].home`)
 
@@ -368,6 +403,7 @@ radioapp listen --group EMS       # stream incoming EMS messages
 radioapp groups                   # list configured groups (+ subscription mark)
 radioapp sub add EMSNE            # subscribe to a group
 radioapp transports               # list transports + capabilities
+radioapp start js8call            # spawn JS8Call (or WSJT-X / winlink) on demand
 radioapp status                   # what's up / connected
 radioapp nodes                    # discovered NomadNet sites
 radioapp peers                    # discovered LXMF peers
@@ -472,6 +508,17 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     your device's node name when sharing a channel with stock MeshCore devices
     that expect the prefix. Off by default so bare message content is sent.
     (Messages with no embedded name show as anonymous and aren't clickable.)
+- **⚡ Start (process lifecycle).** The JS8Call, WSJT-X, and Winlink mode bars each
+  have a **⚡ Start** button (also `/start [transport]` from the composer or
+  `radioapp start <transport>` from the CLI). Clicking it spawns the backing app
+  if it isn't running, waits for it to become reachable (up to `launch_wait_s`
+  seconds), then connects the transport — no manual terminal juggling. The app
+  queries the OS process table (`pgrep`) as its source of truth and **never kills
+  externally-started processes** (if JS8Call was already running when the app
+  launched, Start just reconnects). The launch command comes from
+  `[transports.X].launch_cmd` in your config; if not set, a prompt asks for it
+  and saves the answer. For Winlink, `modem_cmd` additionally auto-launches the RF
+  modem (VARA or any VARA-compatible modem) before a varahf/varafm session.
 - **Watch (observe):** select the **Watch** tab for a unified, **read-only** live stream of
   **all** messages across **every** transport — both the traffic you **receive**
   and the messages you **send** (e.g. both sides of a MeshCore channel) —
@@ -603,7 +650,6 @@ The router, message model, selection, filtering, persistence and UI are untouche
 
 ## Roadmap (not yet implemented)
 
-- Wire-level translation in the Mercury adapter (marked `TODO`).
 - RNS `Link`-based **live keyboard-to-keyboard** session path.
 - **NomadNet node hosting** (publishing pages). Read-only **page viewing is
   implemented** — see below.
@@ -827,7 +873,7 @@ the user, and only your own MIT code is distributed here. For reference:
 |---|---|---|
 | **Pat** | Winlink client (wrapped over HTTP) | MIT |
 | **JS8Call** | HF weak-signal app (TCP/JSON API) | GPL-3.0 |
-| **Mercury** | HF modem / VARA-compatible TNC (TCP) | GPL-3.0 |
+| **WSJT-X** | FT8/FT4 SDR app (UDP datagrams) | GPL-3.0 |
 | **Reticulum (RNS/LXMF)** | networking stack (pip extra) | MIT/Reticulum |
 
 Talking to these programs over their sockets/APIs is mere aggregation, so no

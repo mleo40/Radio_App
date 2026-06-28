@@ -816,6 +816,7 @@ class RadioTUI(App):
     #main { height: 1fr; }
     #active-view { height: 1fr; }
     #active-banner { height: auto; color: $warning; padding: 0 1; }
+    #brand-banner { height: auto; color: $text-muted; padding: 0 1; display: none; }
     #mesh-bar { height: 1; padding: 0 1; display: none; }
     #mesh-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
     #mesh-bar-label { width: auto; color: $accent; }
@@ -1090,6 +1091,7 @@ class RadioTUI(App):
         with ContentSwitcher(initial="active-view", id="main"):
             with Vertical(id="active-view"):
                 yield Static("", id="active-banner")
+                yield Static("", id="brand-banner")
                 with Horizontal(id="mesh-bar"):
                     yield Static("MeshCore", id="mesh-bar-label")
                     yield Static("", id="mesh-spacer")
@@ -1282,7 +1284,14 @@ class RadioTUI(App):
         # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
-        self.title = "Radio_App"
+        branding = cfg.branding
+        app_title = str(branding.get("app_title", "") or "").strip()
+        self.title = app_title if app_title else "Radio_App"
+        brand_banner = str(branding.get("banner", "") or "").strip()
+        if brand_banner:
+            bb = self.query_one("#brand-banner", Static)
+            bb.update(brand_banner)
+            bb.display = True
         self._build_mode_selector()
         self._update_modebar()
         self._update_status()

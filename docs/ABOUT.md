@@ -12,18 +12,18 @@ of glass* for radio comms.
 
 | Layer | Technology |
 |---|---|
-| Application code (~12k lines) | **Python 3.11+**, fully type-hinted, async (`asyncio`) |
+| Application code (~12k lines) | **Python 3.10+**, fully type-hinted, async (`asyncio`) |
 | TUI | **Textual** (optional extra) |
 | Config | **TOML** (`tomllib` reads, `tomli-w` writes — the only hard dependency) |
 | Persistence | **SQLite** (stdlib `sqlite3`) |
 | Reticulum transport | `rns` + `lxmf` (optional extra) |
 | MeshCore transport | `meshcore` companion library (optional extra) |
-| Tests | `pytest` (347) · `ruff` · `mypy` |
-| Interop targets vendored for reference (not built or shipped) | **Pat** = Go; **Mercury** = C |
+| Tests | `pytest` (~738) · `ruff` · `mypy` |
+| Interop targets vendored for reference (not built or shipped) | **Pat** = Go |
 
-The app's own code is **100% Python**. The Go (`pat/`) and C (`mercury-src/`)
-trees are the external programs it talks to over their network APIs — installed
-and run by the user, not compiled or bundled here. The core + CLI run on the
+The app's own code is **100% Python**. The Go (`pat/`) tree is the external
+program it talks to over its network API — installed and run by the user, not
+compiled or bundled here. The core + CLI run on the
 **standard library alone** (plus `tomli-w`); every transport and the TUI are
 opt-in extras.
 
@@ -41,6 +41,7 @@ test/demo scripts.
 | **JS8Call** | `127.0.0.1:2442` | TCP/JSON API |
 | **Pat** (Winlink) | `http://127.0.0.1:8080` | HTTP/JSON |
 | **MeshCore companion** | USB serial (`/dev/ttyACM0`) or `127.0.0.1:5000` | serial / TCP |
+| **WSJT-X** | `0.0.0.0:2237` (inbound) | UDP datagrams |
 
 Within Pat it drives **~10 distinct HTTP routes** (`/api/status`, `/api/connect`,
 `/api/mailbox/in`, `/api/mailbox/out`, `/{mid}`, `/{mid}/{attachment}`,
@@ -57,10 +58,12 @@ Within Pat it drives **~10 distinct HTTP routes** (`/api/status`, `/api/connect`
 status, transports, config, tui, setup, reticulum, winlink, js8, fav, browse,
 nodes, peers`).
 
-**Transports:** 4 active built-ins (Reticulum, JS8Call, MeshCore, Winlink),
-Mercury present but dormant (wire protocol `TODO`), plus a plugin mechanism —
-third-party transports load via the `radio_app.transports` entry-point group with
-zero core changes.
+**Transports:** 5 active built-ins (Reticulum, JS8Call, MeshCore, Winlink,
+WSJT-X), plus a plugin mechanism — third-party transports load via the
+`radio_app.transports` entry-point group with zero core changes.
+**ProcManager** (`core/proc_manager.py`) handles on-demand process lifecycle
+(spawn/stop for JS8Call, WSJT-X, Pat) via ⚡ Start buttons in the TUI and
+`radioapp start <transport>` in the CLI.
 
 ## Author's intent
 
@@ -121,10 +124,12 @@ composition, and that's the whole point.
 
 ## Simplicity of end-user configuration
 
-**One hand-editable TOML file** holds all settings (default
-`~/.config/radio_app/config.toml`, overridable via `RADIO_APP_CONFIG`). Three
-on-ramps: `radioapp setup` (interactive wizard), `radioapp config init` (copy the
-example), or hand-edit the TOML.
+**Two TOML files, one for operators.** A distributor-level `config.dist.toml`
+(baked into the package, optional) and the operator's
+`~/.config/radio_app/config.toml` merge in order — the user file always wins. As
+an operator you only ever touch one file (overridable via `RADIO_APP_CONFIG`).
+Three on-ramps: `radioapp setup` (interactive wizard), `radioapp config init`
+(copy the example), or hand-edit the TOML.
 
 - **Identity entered once** under `[station]`, auto-pushed into every transport
   that needs it — no per-transport duplication.

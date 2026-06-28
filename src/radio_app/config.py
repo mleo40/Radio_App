@@ -109,6 +109,14 @@ _DEFAULTS: dict[str, Any] = {
         # Number of previously-submitted messages/commands to remember per mode.
         # Up/Down in the composer navigates the history for the active mode.
         "command_history_limit": 100,
+        # Distributor branding — set via config.dist.toml, not by the end-user.
+        # app_title replaces "Radio_App" in the TUI header; banner is a short
+        # ASCII/Unicode art string shown above the active-mode panel in muted color.
+        # Terminal UIs cannot render raster images; block/text art only.
+        "branding": {
+            "app_title": "",
+            "banner": "",
+        },
     },
 }
 
@@ -208,6 +216,10 @@ class Config:
     @property
     def ui(self) -> dict[str, Any]:
         return self._data.get("ui", {})
+
+    @property
+    def branding(self) -> dict[str, Any]:
+        return self._data.get("ui", {}).get("branding", {})
 
     @property
     def templates(self) -> dict[str, str]:
