@@ -70,6 +70,11 @@ port = "/dev/ttyACM0"
 baud = 115200
 host = "127.0.0.1"
 tcp_port = 5000
+# Prepend your node name to outbound channel messages ("Name: message").
+# Off by default — bare message content is sent and other MeshCore nodes
+# will not see a sender name. Enable if you share a channel with stock
+# MeshCore devices that rely on the name prefix for attribution.
+# prepend_name = false
 
 # Winlink (store-and-forward email over radio) via a separately-installed Pat
 # client (https://github.com/la5nta/pat). Pat is NOT bundled — install it

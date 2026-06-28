@@ -404,3 +404,46 @@ Reticulum `send()` path only forwarded `msg.content` (text) into the
 **Notes:** Group/broadcast Reticulum sends remain text-only (single packet
 capped at 383 bytes, `_GROUP_PAYLOAD_MAX`), so file transfer is DIRECT-only.
 
+---
+
+## WSJT-X transport
+
+**Requested:** 2026-06-27
+**Status:** Backlog
+**Area:** `transports/wsjtx_transport.py` (new), `transports/base.py`, `ui/tui.py`
+
+Add WSJT-X as a transport, enabling FT8/FT4/MSK144/Q65 weak-signal digital
+modes alongside the existing JS8Call HF mode.
+
+**Architecture:** WSJT-X exposes a UDP-based API (port 2237 by default) using
+a binary protocol (`QDataStream`-encoded). Key messages: `Heartbeat`,
+`Status`, `Decode`, `QSOLogged`, `Clear`, `Reply`, `Close`, `Halt Tx`,
+`Free Text`. The transport would:
+
+- Open a UDP socket and listen for `Decode` messages (received contacts) →
+  emit `UnifiedMessage` with `transport="wsjtx"`, `kind="decode"`.
+- Send `Free Text` / `Reply` datagrams for outbound messages (FT8 free-text
+  is limited to 13 chars; longer messages need multi-transmission sequencing).
+- Use `Status` heartbeats to populate the Health board (frequency, mode, DX
+  call, TX/RX state, grid).
+- New `TransportCapabilities`: `supports_addressing=True`,
+  `supports_broadcast=True` (CQ), `supports_groups=False`,
+  `max_content_bytes=13` (FT8 free-text limit per frame).
+
+**Constraints:**
+- FT8/FT4 operate on strict 15-second/7.5-second TX windows — the transport
+  must queue outbound messages and transmit only at the next window boundary.
+  Radio_App must never preempt an in-progress TX cycle.
+- Free-text payloads are 13 printable ASCII characters. Structured contacts
+  (callsign + grid + signal report) use a different message type and do not
+  map cleanly to arbitrary text; the transport should expose decodes as
+  read-only received messages and allow CQ / directed free-text replies.
+- WSJT-X does not expose a password or callsign API — identity is read from
+  `Status` heartbeats (`de_call`, `de_grid`).
+
+**Value:** FT8 is by far the most-used HF digital mode globally and is
+purpose-built for weak-signal / marginal-propagation contacts — exactly the
+grid-down, low-power scenario Radio_App targets. Receiving FT8 decodes in the
+Watch surface and sending short welfare messages or check-ins over FT8 would
+be a meaningful addition alongside JS8Call.
+

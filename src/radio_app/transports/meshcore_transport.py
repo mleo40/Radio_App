@@ -491,14 +491,15 @@ class MeshCoreTransport(Transport):
         )
 
     def _channel_wire_text(self, content: str) -> str:
-        """Prepend our node name so channel peers see 'Name: message'.
+        """Optionally prepend our node name so channel peers see 'Name: message'.
 
-        MeshCore channels carry no per-sender identity on the wire, so the
-        convention is for the sender to embed its name in the text. Doing this
-        on send means other nodes (and our own second station) can attribute —
-        and reply to — our channel messages instead of seeing an anonymous
-        'chanN'. When our node name is unknown the content is sent as-is.
+        MeshCore channels carry no per-sender identity on the wire; the
+        convention is to embed the sender's name in the text. Enabled via
+        ``[transports.meshcore] prepend_name = true``; defaults to off so the
+        bare message is sent and the receiving node sees content only.
         """
+        if not self.config.get("prepend_name", False):
+            return content
         name = (self._self_info().get("name") or "").strip()
         return f"{name}: {content}" if name else content
 

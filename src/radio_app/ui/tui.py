@@ -744,7 +744,7 @@ class RadioTUI(App):
     CSS = """
     #modebar { height: 3; background: $boost; padding: 0 1; }
     #modebar Button {
-        height: 1; min-width: 6; margin: 0 1 0 0; border: none;
+        height: 1; min-width: 6; margin: 0; border: none;
         padding: 0 1;
     }
     #modebar Button.-active { text-style: bold reverse; }

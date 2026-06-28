@@ -671,6 +671,26 @@ Pat's config file lives at `~/.config/pat/config.json` (Linux) or
 `~/Library/Application Support/pat/config.json` (macOS). See
 `pat --help` for full options.
 
+**Winlink credentials:** Radio_App never sees or stores your Winlink password —
+Pat owns it. If connections fail silently, make sure Pat is configured with your
+callsign and secure-login password:
+
+```bash
+pat configure   # interactive wizard; sets callsign + password inside Pat
+```
+
+Or edit `~/.config/pat/config.json` directly:
+
+```json
+{
+  "mycall": "N0CALL",
+  "secure_login_password": "your-winlink-password"
+}
+```
+
+Radio_App's `radioapp setup` only asks for the callsign used to label
+outbound messages — it does not prompt for or store the Winlink password.
+
 ---
 
 ### Reticulum — config file location
