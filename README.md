@@ -15,7 +15,7 @@ via Pat), or the **Mercury** HF modem.
 > wire-level translation marked `TODO`. A full suite of **field/EmComm utilities**
 > is now built in: message export, canned templates, UTC time widget with
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
-> awareness, offline band-plan, scheduled sends, and a presence roster. 659 tests
+> awareness, offline band-plan, scheduled sends, and a presence roster. 676 tests
 > pass; the whole suite runs without radio hardware.
 
 ## Key ideas
@@ -466,10 +466,12 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     shows the current channels; `/channel rm <index>` drops a saved name.
   - **Channel sender names:** MeshCore channels carry no per-sender identity on
     the wire, so the convention is for each node to prefix its name (`Name: …`).
-    Radio_App does this automatically on send (using your device's node name) and
-    parses it on receive, so channel messages show **who** sent them and their
-    names stay clickable for a direct reply. (Messages with no embedded name show
-    as an anonymous channel sender and aren't clickable.)
+    Radio_App parses this on receive so channel messages show **who** sent them
+    and names stay clickable for a direct reply. Outbound name-prefixing is
+    **opt-in** — set `prepend_name = true` in `[transports.meshcore]` to prepend
+    your device's node name when sharing a channel with stock MeshCore devices
+    that expect the prefix. Off by default so bare message content is sent.
+    (Messages with no embedded name show as anonymous and aren't clickable.)
 - **Watch (observe):** select the **Watch** tab for a unified, **read-only** live stream of
   **all** messages across **every** transport — both the traffic you **receive**
   and the messages you **send** (e.g. both sides of a MeshCore channel) —
@@ -485,8 +487,8 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   clock-offset from the best available source (GPS via gpsd → local
   chrony/ntpd daemon → internet NTP), the station's Maidenhead grid position,
   and host battery level with estimated runtime.
-- **Favorites (recall):** press **F5** to cycle into it (Watch → Health →
-  Favorites) for a saved list of **NomadNet servers, callsigns, JS8Call groups,
+- **Favorites (recall):** press **F5** to cycle into it (Watch → Health → Logs →
+  Chats → Favorites) for a saved list of **NomadNet servers, callsigns, JS8Call groups,
   MeshCore channels, MeshCore contacts and hashes**, grouped by type. Add entries
   **without the peer being online first** — type
   `[node|peer|call|group|channel|contact] <id> [label]` in the bar and press
@@ -524,7 +526,7 @@ radioapp tui              # launch it
 ```
 
 Keys: **F3** choose mode · **F4** favorites-only (Watch + every mode) ·
-**F5** cycle Watch/Health/Favorites · **Ctrl+R** refresh · **Ctrl+C** quit. The
+**F5** cycle Watch/Health/Logs/Chats/Favorites · **Ctrl+R** refresh · **Ctrl+C** quit. The
 mode chips are tappable on a touchscreen; tap the **⌨/☞** glyph to toggle a
 larger touch layout.
 In-composer commands:

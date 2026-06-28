@@ -384,7 +384,7 @@ class JS8CallTransport(Transport):
             supports_encryption=False,    # prohibited on amateur bands
             supports_delivery_confirmation=False,
             supports_chunking=True,       # router splits long messages into frames
-            supports_position=True,       # STATION.SET_GRID broadcasts Maidenhead locator
+            supports_position=True,       # STATION.SET_GRID → Maidenhead locator
             is_realtime=False,            # slow turn-taking
             typical_latency_s=30.0,
             needs_internet=False,

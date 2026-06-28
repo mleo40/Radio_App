@@ -74,7 +74,6 @@ from ..transports.js8call_transport import (
 )
 from .about import ABOUT_MD
 
-
 # Default cap for the in-memory Watch scrollback (rows). Overridable via
 # [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
 _WATCH_BUFFER_DEFAULT = 1000
@@ -959,8 +958,8 @@ class RadioTUI(App):
         # battery + radio params), shown on the Health board. Updated by the
         # same passive probe timer as the reachability dots.
         self._device_telemetry: dict[str, dict] = {}
-        # Time-consensus state: best reading from GPS → local NTP → internet NTP → system.
-        # Updated in _refresh_health (run in a thread); read by _render_system_health.
+        # Time-consensus state: best reading from GPS → local NTP → internet NTP →
+        # system. Updated in _refresh_health (thread); read by _render_system_health.
         self._time_reading = None  # TimeReading | None
         self._time_queried: bool = False
         self._last_time_check: float = -999.0
@@ -2431,7 +2430,7 @@ class RadioTUI(App):
         return out
 
     def _warn_radio_contention(self, name: str) -> None:
-        """Warn when another running radio transport could fight ``name`` for the radio."""
+        """Warn when another radio transport could fight ``name`` for the radio."""
         if self.core is None or not self.core.radio_interlock.is_contender(name):
             return
         others = self._running_radio_contenders(exclude=name)
@@ -2565,12 +2564,15 @@ class RadioTUI(App):
         log.write("[b]System[/b] (host resources)")
 
         # UTC clock + time-source consensus (GPS → local NTP → internet NTP → system).
-        from datetime import UTC, datetime as _dt
-        ts = _dt.now(UTC).strftime("%H:%M:%S UTC")
+        ts = datetime.now(UTC).strftime("%H:%M:%S UTC")
         tr = self._time_reading
         if tr is not None and tr.offset_ms is not None:
             off = tr.offset_ms
-            colour = "red" if abs(off) > 1000 else "yellow" if abs(off) > 100 else "green"
+            colour = (
+                "red" if abs(off) > 1000
+                else "yellow" if abs(off) > 100
+                else "green"
+            )
             src_label = {
                 "gps": "GPS",
                 "local_ntp": "local NTP",
@@ -3856,7 +3858,7 @@ class RadioTUI(App):
         caps = t.capabilities() if t is not None else None
         if not (caps and caps.supports_attachments):
             self._log_system(
-                f"attachments aren't supported on '{self.active_transport or '(none)'}'."
+                f"no attachment support on '{self.active_transport or '(none)'}'."
             )
             return
         if not arg:
@@ -4100,7 +4102,7 @@ class RadioTUI(App):
         try:
             # Stay within Pat's 60s prompt window; decline if it elapses.
             return await asyncio.wait_for(future, timeout=55)
-        except (TimeoutError, asyncio.TimeoutError):
+        except TimeoutError:
             self._log_system("Winlink: password prompt timed out.")
             return None
 
@@ -4579,7 +4581,6 @@ class RadioTUI(App):
         """Fire any messages whose scheduled send time has arrived."""
         if self.core is None:
             return
-        from datetime import UTC, datetime
         now = datetime.now(UTC)
         try:
             pending = self.core.store.schedule_pending(up_to=now)
@@ -5239,7 +5240,8 @@ class RadioTUI(App):
                     '  welfare = "Welfare check — all OK"'
                 )
             else:
-                self._log_system("Templates: " + "  ".join(f"[b]{n}[/b]" for n in names))
+                joined = "  ".join(f"[b]{n}[/b]" for n in names)
+                self._log_system("Templates: " + joined)
             return
         text = tmpls.get(arg.strip())
         if text is None:
@@ -5281,7 +5283,6 @@ class RadioTUI(App):
 
         Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
         """
-        from datetime import UTC, datetime, timedelta
         from ..core.message import UnifiedMessage
 
         parts = arg.strip().split(None, 1)
@@ -5332,7 +5333,10 @@ class RadioTUI(App):
         if self.core is None:
             return
 
-        thread = getattr(self, "_active_thread", None) or getattr(self, "_watch_thread", None)
+        thread = (
+            getattr(self, "_active_thread", None)
+            or getattr(self, "_watch_thread", None)
+        )
         name = (self.core.station.callsign if self.core.station else None) or "unknown"
         if thread and thread.startswith("@"):
             msg = UnifiedMessage.to_group(name, thread[1:], content)
@@ -5350,7 +5354,6 @@ class RadioTUI(App):
 
     def _handle_roster_command(self, arg: str) -> None:
         """Show the presence roster (recently-heard callsigns)."""
-        from datetime import UTC, datetime, timedelta
         from ..core.roster import get_roster
 
         if self.core is None:
@@ -5532,7 +5535,11 @@ class RadioTUI(App):
         name = msg.transport or "?"
         color = self._mode_color(name)
         mode_tag = f"[{color}]{name:<9}[/{color}]"
-        who = "[cyan]you[/cyan]" if msg.status is not DeliveryStatus.RECEIVED else msg.sender
+        who = (
+            "[cyan]you[/cyan]"
+            if msg.status is not DeliveryStatus.RECEIVED
+            else msg.sender
+        )
         snippet = self._render_snippet(hit.snippet)
         return f"[dim]{ts}[/dim] {mode_tag} {who}: {snippet}"
 

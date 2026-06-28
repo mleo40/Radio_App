@@ -22,7 +22,7 @@ class Templates:
         self._data = {str(k): str(v) for k, v in data.items()}
 
     @classmethod
-    def from_config(cls, cfg: "Config") -> "Templates":
+    def from_config(cls, cfg: Config) -> Templates:
         raw = cfg.data.get("templates", {})
         return cls(raw if isinstance(raw, dict) else {})
 

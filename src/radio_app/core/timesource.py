@@ -35,7 +35,7 @@ class TimeReading:
 
     utc: datetime
     source: TimeSourceKind
-    offset_ms: float | None   # local clock offset vs reference in ms; None if unavailable
+    offset_ms: float | None   # clock offset vs reference in ms; None if unavailable
     error: str | None         # non-None when sync failed / unavailable
 
 
@@ -216,7 +216,9 @@ class TimeConsensus:
         """
         # 1. GPS via gpsd
         if not self.skip_gps:
-            offset = query_gpsd_time(self.gpsd_host, self.gpsd_port, timeout=self.timeout)
+            offset = query_gpsd_time(
+                self.gpsd_host, self.gpsd_port, timeout=self.timeout
+            )
             if offset is not None:
                 return TimeReading(
                     utc=datetime.now(UTC),

@@ -648,7 +648,8 @@ class MessageStore:
     ) -> str:
         """Persist a scheduled message; return its id."""
         self._conn.execute(
-            "INSERT INTO scheduled_messages (id, fire_at, msg_json, transport, created_at) "
+            "INSERT INTO scheduled_messages "
+            "(id, fire_at, msg_json, transport, created_at) "
             "VALUES (?, ?, ?, ?, ?)",
             (
                 msg.msg_id,

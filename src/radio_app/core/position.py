@@ -61,7 +61,7 @@ def lat_lon_to_grid(lat: float, lon: float, precision: int = 4) -> str:
     return grid
 
 
-def position_from_config(cfg: "Config") -> "Position | None":
+def position_from_config(cfg: Config) -> Position | None:
     """Read a manually-configured position from [position] in config.toml.
 
     Returns None when neither lat/lon nor a grid override is set.

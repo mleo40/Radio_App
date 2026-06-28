@@ -45,8 +45,8 @@ _EMCOMM_US = [
     FrequencyEntry("60m",    4_724.0, "SSB", "US", None, "SHARES primary"),
     FrequencyEntry("60m",    6_804.0, "SSB", "US", None, "SHARES alternate"),
     FrequencyEntry("2m",   146_520.0, "FM",  "US", None, "national FM simplex calling"),
-    FrequencyEntry("2m",   146_550.0, "FM",  "US", None, "ARES/RACES simplex alternate"),
-    FrequencyEntry("70cm", 446_000.0, "FM",  "US", None, "national 70cm simplex calling"),
+    FrequencyEntry("2m",   146_550.0, "FM",  "US", None, "ARES/RACES alternate"),
+    FrequencyEntry("70cm", 446_000.0, "FM",  "US", None, "70cm simplex calling"),
 ]
 
 # Select Winlink P2P/RMS spot frequencies (regional starting guide only)

@@ -25,7 +25,7 @@ class PresenceEntry:
 
 
 def get_roster(
-    store: "MessageStore",
+    store: MessageStore,
     *,
     since: datetime | None = None,
     transport: str | None = None,

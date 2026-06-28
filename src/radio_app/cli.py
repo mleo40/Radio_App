@@ -12,7 +12,7 @@ import asyncio
 import json
 import shutil
 import sys
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from . import __version__
@@ -455,16 +455,16 @@ def _build_parser() -> argparse.ArgumentParser:
     p_time = sub.add_parser("time", help="show current UTC and NTP clock offset")
     p_time.set_defaults(func=_cmd_time)
 
-    p_bands = sub.add_parser("bands", help="offline band-plan and EmComm frequency reference")
+    p_bands = sub.add_parser("bands", help="band-plan and EmComm frequency reference")
     p_bands.add_argument("--band", metavar="BAND", help="filter by band, e.g. 40m")
-    p_bands.add_argument("--mode", metavar="MODE", help="filter by mode: JS8, SSB, WINLINK, FM, CW")
+    p_bands.add_argument("--mode", metavar="MODE", help="JS8, SSB, WINLINK, FM or CW")
     p_bands.add_argument("--region", metavar="REGION", default="US",
                          help="US (default) or INTL")
     p_bands.add_argument("--transport", metavar="TRANSPORT",
                          help="filter by transport: js8call, winlink")
     p_bands.set_defaults(func=_cmd_bands)
 
-    p_sched = sub.add_parser("schedule", help="manage scheduled / windowed message sends")
+    p_sched = sub.add_parser("schedule", help="manage scheduled / deferred sends")
     sched_sub = p_sched.add_subparsers(dest="sched_action")
 
     p_sched_add = sched_sub.add_parser("add", help="schedule a message for later")
@@ -489,13 +489,13 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_sched.set_defaults(func=_cmd_schedule)
 
-    p_roster = sub.add_parser("roster", help="show recently-heard callsigns across all transports")
+    p_roster = sub.add_parser("roster", help="show recently-heard stations")
     p_roster.add_argument("--transport", help="filter to a specific transport")
     p_roster.add_argument(
         "--since", metavar="Nh", default="24h",
         help="look back N hours (default: 24h)",
     )
-    p_roster.add_argument("--limit", type=int, default=50, help="max entries (default 50)")
+    p_roster.add_argument("--limit", type=int, default=50, help="max rows (default 50)")
     p_roster.set_defaults(func=_cmd_roster)
 
     return parser
@@ -858,7 +858,8 @@ def _cmd_templates(args: argparse.Namespace) -> int:
     if text is None:
         names = tmpls.names()
         hint = ", ".join(names) if names else "(none configured)"
-        print(f"error: template '{args.name}' not found. Available: {hint}", file=sys.stderr)
+        msg = f"error: template '{args.name}' not found. Available: {hint}"
+        print(msg, file=sys.stderr)
         return 1
 
     if not args.to and not args.group:
@@ -995,8 +996,6 @@ def _cmd_bands(args: argparse.Namespace) -> int:
 
 def _cmd_schedule(args: argparse.Namespace) -> int:
     """Manage scheduled / windowed message sends."""
-    from datetime import UTC, datetime, timedelta
-
     from .config import Config
     from .core.message import UnifiedMessage
     from .core.store import MessageStore
@@ -1031,7 +1030,10 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                     try:
                         fire_at = datetime.fromisoformat(raw).astimezone(UTC)
                     except ValueError:
-                        print("error: --at must be HH:MM or ISO datetime", file=sys.stderr)
+                        print(
+                            "error: --at must be HH:MM or ISO datetime",
+                            file=sys.stderr,
+                        )
                         return 2
                 else:
                     try:
@@ -1084,8 +1086,6 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
 def _cmd_roster(args: argparse.Namespace) -> int:
     """Show recently-heard callsigns (presence roster)."""
-    from datetime import UTC, datetime, timedelta
-
     from .config import Config
     from .core.roster import get_roster
     from .core.store import MessageStore
