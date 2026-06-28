@@ -436,15 +436,17 @@ def test_f3_cycles_modes(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # Cycle order = transports (js8call, meshcore) then virtual nomadnet.
+            # Cycle order follows _MODE_ORDER: meshcore, reticulum, nomadnet,
+            # js8call, winlink, wsjt_x — only configured transports appear.
+            # The test config enables meshcore and js8call.
             seen = []
             for _ in range(6):
                 app.action_choose_mode()
                 await pilot.pause()
                 seen.append(app._current_mode_key())
             assert seen == [
-                "js8call", "meshcore", "nomadnet",
-                "js8call", "meshcore", "nomadnet",
+                "meshcore", "nomadnet", "js8call",
+                "meshcore", "nomadnet", "js8call",
             ]
 
     asyncio.run(run())

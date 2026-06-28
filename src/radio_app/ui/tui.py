@@ -2016,11 +2016,17 @@ class RadioTUI(App):
             nxt = keys[0]
         self._activate_mode_key(nxt)
 
+    # Canonical display order for mode chips and F3 cycling.
+    _MODE_ORDER = ["meshcore", "reticulum", "nomadnet", "js8call", "winlink", "wsjt_x"]
+
     def _mode_keys(self) -> list[str]:
         """Ordered selectable operating modes, matching the selector chips."""
-        keys = [t.name for t in self.core.transports] if self.core else []
-        keys.append("nomadnet")
-        return keys
+        if not self.core:
+            return []
+        transport_names = {t.name for t in self.core.transports}
+        ordered = [n for n in self._MODE_ORDER if n == "nomadnet" or n in transport_names]
+        ordered += [t.name for t in self.core.transports if t.name not in self._MODE_ORDER]
+        return ordered
 
     def _current_mode_key(self) -> str | None:
         if self.view == "nomadnet":
@@ -4525,21 +4531,14 @@ class RadioTUI(App):
         if self.core is None:
             return
         bar = self.query_one("#modebar", Horizontal)
-        # Preferred display order for transport chips.
-        _ORDER = ["meshcore", "reticulum", "js8call", "winlink", "wsjt_x"]
         by_name = {t.name: t for t in self.core.transports}
-        ordered = [by_name[n] for n in _ORDER if n in by_name]
-        ordered += [t for t in self.core.transports if t.name not in _ORDER]
-        nomad_inserted = False
-        for t in ordered:
-            label = t.display_name or t.name
-            bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
-            # NomadNet sits immediately after Reticulum (virtual mode over it).
-            if t.name == "reticulum" and not nomad_inserted:
+        for key in self._mode_keys():
+            if key == "nomadnet":
                 bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
-                nomad_inserted = True
-        if not nomad_inserted:
-            bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+            else:
+                t = by_name[key]
+                label = t.display_name or t.name
+                bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
