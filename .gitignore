@@ -37,4 +37,5 @@ NEXT_STEPS.local.md
 # of this repo). No trailing slash so the symlinks themselves are ignored too.
 mercury-src
 pat
+jtdxsync
 
