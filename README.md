@@ -690,13 +690,15 @@ viewer: type a link number to follow it, enter a new address, `Ctrl+B` back,
 ## External app tips
 
 > Radio_App connects to these programs over their existing APIs — it does not
-> install, update, or manage them. These are field tips for common setups, not
-> official documentation.
+> install or update them, but it **can launch and stop them** via ⚡ Start /
+> `radioapp start <transport>`. These are field tips for common setups and for
+> cases where you prefer to manage the processes yourself.
 
 ### Pat (Winlink) — start the HTTP API
 
-Radio_App talks to Pat over its built-in HTTP API. Start Pat in HTTP-server
-mode before launching the app:
+Radio_App talks to Pat over its built-in HTTP API. The easiest way is to let
+Radio_App launch it for you: click **⚡ Start** in the Winlink mode bar or run
+`radioapp start winlink`. If you prefer to start it manually:
 
 ```bash
 pat http
@@ -768,9 +770,11 @@ Full Reticulum documentation: <https://reticulum.network/manual/>
 
 ### JS8Call — connecting from a remote machine
 
-JS8Call exposes a TCP/JSON API on port 2442 (loopback only by default). If
-JS8Call is running on a different machine (e.g. a Pi connected to the radio),
-you have two options:
+When JS8Call runs on the **same machine**, use **⚡ Start** in the JS8Call mode
+bar or `radioapp start js8call` — Radio_App spawns it and connects automatically.
+
+If JS8Call is running on a **different machine** (e.g. a Pi connected to the
+radio), you have two options:
 
 **Option 1 — SSH tunnel (recommended, no firewall changes needed):**
 
