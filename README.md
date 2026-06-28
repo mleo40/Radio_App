@@ -457,6 +457,8 @@ selector** along the top is the primary control: each configured transport is on
 operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
 [`DESIGN.md`](DESIGN.md) for the full model and roadmap.
 
+![Radio_App TUI — JS8Call mode with mock traffic](docs/tui_screenshot.svg)
+
 - **Operating modes (interact):** tap a mode chip (or **F3**) to choose a
   transport. Sending is **bound to that mode** — no auto-selection. The
   conversation list is scoped to it; the status bar shows capability detail
