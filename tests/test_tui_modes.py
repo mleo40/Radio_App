@@ -455,7 +455,7 @@ def test_f5_cycles_watch_health_logs_chats_favorites(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # From a chat mode, F5 enters the cycle at Watch.
+            # From a chat mode, F5 enters the cycle at Stream.
             app._select_mode("js8call")
             app.action_cycle_utility()
             await pilot.pause()
@@ -463,16 +463,16 @@ def test_f5_cycles_watch_health_logs_chats_favorites(config_path):
             app.action_cycle_utility()  # -> Health
             await pilot.pause()
             assert app.query_one("#main").current == "health-view"
-            app.action_cycle_utility()  # -> Logs
-            await pilot.pause()
-            assert app.query_one("#main").current == "logs-view"
-            app.action_cycle_utility()  # -> Chats (All chats archive)
+            app.action_cycle_utility()  # -> History (archive)
             await pilot.pause()
             assert app.query_one("#main").current == "archive-view"
             app.action_cycle_utility()  # -> Favorites
             await pilot.pause()
             assert app.query_one("#main").current == "favorites-view"
-            app.action_cycle_utility()  # -> back to Watch
+            app.action_cycle_utility()  # -> Logs
+            await pilot.pause()
+            assert app.query_one("#main").current == "logs-view"
+            app.action_cycle_utility()  # -> back to Stream
             await pilot.pause()
             assert app.query_one("#main").current == "monitor-view"
 

@@ -24,8 +24,8 @@ Surfaces:
 
 Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ unknown.
 
-Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
-       F5 = cycle Watch/Health/Logs/Chats/Favorites   Ctrl+R = refresh
+Keys:  F3 = cycle mode   F4 = Fav-only (Stream + every mode)
+       F5 = cycle Stream/Health/History/Favorites/Logs   Ctrl+R = refresh
        Ctrl+F = search history   Ctrl+C / Ctrl+Q / q = quit
 Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
   /favorites,  /logs,  /loglevel <level>,  /search <text>,  /chats,
@@ -838,7 +838,7 @@ class RadioTUI(App):
         Binding("q", "quit", "Quit"),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
-        ("f5", "cycle_utility", "Watch/Health/Fav"),
+        ("f5", "cycle_utility", "Stream/Health/Fav"),
         ("f", "toggle_nomad_favorite", "Save node"),
         ("s", "sync_nomad", "Sync favs"),
         ("g", "cycle_watch_group", "Group filter"),
@@ -2157,14 +2157,14 @@ class RadioTUI(App):
         self._update_status()
 
     def action_cycle_utility(self) -> None:
-        """Cycle the utility surfaces with F5: Watch -> Health -> Logs -> Chats
-        -> Favorites.
+        """Cycle the utility surfaces with F5: Stream -> Health -> History
+        -> Favorites -> Logs.
 
         From an operating (chat/NomadNet) mode, F5 jumps into the cycle at
-        Watch, then advances Watch -> Health -> Logs -> Chats -> Favorites
-        -> Watch.
+        Stream, then advances Stream -> Health -> History -> Favorites -> Logs
+        -> Stream.
         """
-        order = ["monitor", "health", "logs", "archive", "favorites"]
+        order = ["monitor", "health", "archive", "favorites", "logs"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -4521,22 +4521,31 @@ class RadioTUI(App):
         self._js8_switch_band(arg.strip())
 
     def _build_mode_selector(self) -> None:
-        """Create one button per transport (mode) plus Watch/Health controls."""
+        """Create one button per transport (mode) plus Stream/Health controls."""
         if self.core is None:
             return
         bar = self.query_one("#modebar", Horizontal)
-        # One chip per configured transport = one operating mode.
-        for t in self.core.transports:
+        # Preferred display order for transport chips.
+        _ORDER = ["meshcore", "reticulum", "js8call", "winlink", "wsjt_x"]
+        by_name = {t.name: t for t in self.core.transports}
+        ordered = [by_name[n] for n in _ORDER if n in by_name]
+        ordered += [t for t in self.core.transports if t.name not in _ORDER]
+        nomad_inserted = False
+        for t in ordered:
             label = t.display_name or t.name
             bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
-        # NomadNet is a virtual mode (read-only page browsing over Reticulum).
-        bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+            # NomadNet sits immediately after Reticulum (virtual mode over it).
+            if t.name == "reticulum" and not nomad_inserted:
+                bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+                nomad_inserted = True
+        if not nomad_inserted:
+            bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
-        bar.mount(Button("\u25f7 Watch", id="view-watch", classes="modebtn"))
+        bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
-        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
-        bar.mount(Button("\U0001f5c2 Chats", id="view-archive", classes="modebtn"))
+        bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
+        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
     def _health_dot(self, name: str) -> str:
