@@ -1640,7 +1640,7 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     and writes it to the single TOML config. The radio is driven by the transport
     app (JS8Call), so there are no rig/CAT questions here.
     """
-    from .core.js8call_query import query_groups, query_station
+    from .core.js8call_query import query_station
     from .core.station import Station
 
     cfg = Config.load(args.config)
@@ -1702,7 +1702,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     js8 = dict(cfg.transports.get("js8call", {}))
     js8_enabled = _ask_bool("Enable JS8Call?", js8.get("enabled", False))
     js8_info = None
-    import_groups = False
     if js8_enabled:
         js8["host"] = _ask("JS8Call API host", js8.get("host", "127.0.0.1"))
         js8["port"] = int(_ask("JS8Call API port", str(js8.get("port", 2442))))
@@ -1716,10 +1715,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             )
         else:
             print("  (JS8Call did not answer; you can enter these manually)")
-        # Offer to import the operator's JS8Call @groups as favorites now.
-        import_groups = _ask_bool(
-            "Import your JS8Call groups as favorites now?", True
-        )
     js8["enabled"] = js8_enabled
 
     # -- MeshCore ------------------------------------------------------------
@@ -1827,30 +1822,6 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     ]
     print(f"  transports: {', '.join(enabled) or '(none enabled)'}")
 
-    # Import JS8Call groups as favorites if the operator asked us to.
-    if import_groups:
-        from .core.favorites import Favorites
-
-        print("  querying JS8Call for your groups...")
-        groups = query_groups(js8["host"], js8["port"])
-        if groups:
-            favs = Favorites.from_config(cfg)
-            added = sum(
-                1 for g in groups if not favs.is_favorite(f"@{g}")
-            )
-            for g in groups:
-                favs.add(f"@{g}", kind="group")
-            favs.save(cfg)
-            joined = ", ".join(f"@{g}" for g in groups)
-            print(
-                f"  favorites : imported {len(groups)} group(s) "
-                f"({added} new): {joined}"
-            )
-        else:
-            print(
-                "  favorites : no JS8Call groups found "
-                "(is JS8Call running with the API enabled?)"
-            )
 
     print("  Run 'radioapp status' to check, or 'radioapp tui' to start.")
     return 0
