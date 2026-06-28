@@ -20,6 +20,7 @@ import struct
 from unittest.mock import MagicMock
 
 from radio_app.core.message import AddressType, UnifiedMessage
+from radio_app.transports.base import ReachabilityStatus
 from radio_app.transports.wsjt_x_transport import (
     _MSG_DECODE,
     _MSG_FREETEXT,
@@ -377,6 +378,35 @@ def test_send_empty_content_returns_false():
     t = _fake_transport()
     msg = UnifiedMessage.broadcast("N0CALL", "   ")
     assert asyncio.run(t.send(msg)) is False
+
+
+def test_check_reachable_down_when_no_datagrams_received():
+    # Socket is bound but WSJT-X hasn't sent anything — should be DOWN.
+    t = _fake_transport()
+    assert asyncio.run(t.check_reachable()) is ReachabilityStatus.DOWN
+
+
+def test_check_reachable_ok_after_receiving_datagram():
+    t = _fake_transport()
+    data = _status_datagram()
+    asyncio.run(_run_datagram(t, data))
+    assert asyncio.run(t.check_reachable()) is ReachabilityStatus.OK
+
+
+def test_check_reachable_down_after_timeout(monkeypatch):
+    import time as _time
+    t = _fake_transport()
+    data = _status_datagram()
+    asyncio.run(_run_datagram(t, data))
+    # Simulate 61 seconds elapsing since last datagram
+    monkeypatch.setattr(_time, "monotonic", lambda: t._last_rx + 61.0)
+    assert asyncio.run(t.check_reachable()) is ReachabilityStatus.DOWN
+
+
+def test_check_reachable_down_when_not_running():
+    t = WsjtXTransport({})
+    t._last_rx = 1.0  # has received data but transport not started
+    assert asyncio.run(t.check_reachable()) is ReachabilityStatus.DOWN
 
 
 def test_capabilities_prohibits_encryption():

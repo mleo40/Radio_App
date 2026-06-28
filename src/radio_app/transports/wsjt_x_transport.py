@@ -20,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import struct
+import time
 from dataclasses import dataclass
 
 from ..core.message import AddressType, UnifiedMessage
@@ -388,6 +389,7 @@ class WsjtXTransport(Transport):
         self._instance_id: str = ""
         self._status: StatusEvent | None = None
         self._udp_transport: asyncio.DatagramTransport | None = None
+        self._last_rx: float = 0.0  # monotonic time of last datagram from WSJT-X
 
     async def start(self) -> None:
         loop = asyncio.get_running_loop()
@@ -430,6 +432,7 @@ class WsjtXTransport(Transport):
         if header is None:
             return
         msg_type, instance_id = header
+        self._last_rx = time.monotonic()  # heard from WSJT-X
         if instance_id:
             self._instance_id = instance_id
 
@@ -495,7 +498,11 @@ class WsjtXTransport(Transport):
         )
 
     async def check_reachable(self) -> ReachabilityStatus:
-        if self._running and self._udp_transport is not None:
+        if not self._running or self._udp_transport is None:
+            return ReachabilityStatus.DOWN
+        # Reachable only if we've received a valid datagram from WSJT-X recently.
+        # A bound socket is not enough — it just means we're listening.
+        if self._last_rx > 0 and (time.monotonic() - self._last_rx) < 60.0:
             return ReachabilityStatus.OK
         return ReachabilityStatus.DOWN
 
