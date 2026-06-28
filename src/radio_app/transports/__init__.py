@@ -20,6 +20,7 @@ from . import (
     # mercury_transport,  # noqa: F401,E402  # TODO: re-enable mercury mode later
     reticulum_transport,  # noqa: F401,E402
     winlink_transport,  # noqa: F401,E402
+    wsjt_x_transport,  # noqa: F401,E402
 )
 from .base import TRANSPORT_REGISTRY, Transport, TransportCapabilities
 

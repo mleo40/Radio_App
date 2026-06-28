@@ -115,6 +115,20 @@ auto_connect = false
 # (dialing/connected, per-message transfer progress) plus a final summary.
 verbose_session_log = false
 
+[transports.wsjt_x]
+enabled = false
+# UDP host to bind (0.0.0.0 listens on all interfaces; use 127.0.0.1 for
+# loopback-only if WSJT-X runs on the same machine).
+host = "0.0.0.0"
+# UDP port WSJT-X broadcasts on (default 2237; must match WSJT-X Settings →
+# Reporting → UDP Server port number).
+port = 2237
+# Host where WSJT-X is running (used when sending free-text back to WSJT-X).
+wsjtx_host = "127.0.0.1"
+# Your callsign, if you want Radio_App to identify traffic addressed to you.
+# Leave blank to learn it automatically from WSJT-X Status datagrams.
+callsign = "N0CALL"
+
 [groups.EMS]
 display_name = "EMS Net"
 transports = [
