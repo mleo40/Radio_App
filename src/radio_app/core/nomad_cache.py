@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
+
+from .._compat import UTC
 
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS nomad_pages (

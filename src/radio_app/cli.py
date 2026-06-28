@@ -12,10 +12,11 @@ import asyncio
 import json
 import shutil
 import sys
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from pathlib import Path
 
 from . import __version__
+from ._compat import UTC
 from .app import App
 from .config import Config, default_config_path
 from .core.message import UnifiedMessage

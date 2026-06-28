@@ -40,8 +40,9 @@ import urllib.request
 import uuid
 from collections.abc import Callable
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 
+from .._compat import UTC
 from ..core.message import AddressType, DeliveryStatus, UnifiedMessage
 from .base import ReachabilityStatus, Transport, TransportCapabilities, probe_tcp
 

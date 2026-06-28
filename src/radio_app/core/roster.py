@@ -7,8 +7,10 @@ activity from a given (callsign, transport) pair.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 from typing import TYPE_CHECKING
+
+from .._compat import UTC
 
 if TYPE_CHECKING:
     from .store import MessageStore

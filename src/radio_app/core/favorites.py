@@ -22,8 +22,9 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 
+from .._compat import UTC
 from ..config import Config
 
 _HEX_RE = re.compile(r"^[0-9a-fA-F]+$")

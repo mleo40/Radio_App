@@ -9,8 +9,12 @@ diverge.
 from __future__ import annotations
 
 import os
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-reuse-stubs]
 from typing import Any
 
 try:

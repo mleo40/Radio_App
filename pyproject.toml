@@ -7,7 +7,7 @@ name = "radio-app"
 version = "0.1.0"
 description = "Unified multi-transport messaging over radio, internet and LoRa (Reticulum, JS8Call, MeshCore, Mercury)."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Radio_App contributors" }]
 keywords = ["reticulum", "js8call", "meshcore", "mercury", "lora", "ham-radio", "messaging"]
@@ -16,6 +16,7 @@ keywords = ["reticulum", "js8call", "meshcore", "mercury", "lora", "ham-radio", 
 # standard library alone; only the Reticulum transport needs third-party code.
 dependencies = [
     "tomli-w>=1.0",  # write the single TOML config file (tomllib reads, stdlib)
+    "tomli>=2.0; python_version < '3.11'",  # tomllib backport for Python 3.10
 ]
 
 [project.optional-dependencies]

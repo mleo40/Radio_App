@@ -38,7 +38,7 @@ import asyncio
 import logging
 import os
 from collections import deque
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -60,6 +60,7 @@ from textual.widgets import (
     Static,
 )
 
+from .._compat import UTC
 from ..app import App as CoreApp
 from ..config import Config
 from ..core.favorites import Favorite

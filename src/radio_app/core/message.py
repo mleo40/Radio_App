@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
+
+from .._compat import UTC
 
 
 def _utcnow() -> datetime:

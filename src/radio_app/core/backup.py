@@ -18,8 +18,10 @@ import sqlite3
 import tarfile
 import tempfile
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from pathlib import Path
+
+from .._compat import UTC
 
 _MANIFEST = "manifest.json"
 _CONFIG_NAME = "config.toml"

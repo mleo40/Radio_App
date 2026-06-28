@@ -18,8 +18,9 @@ import json
 import logging
 import os
 import signal
-from datetime import UTC, datetime
+from datetime import datetime
 
+from .._compat import UTC
 from ..core.message import AddressType, UnifiedMessage
 from .base import ReachabilityStatus, Transport, TransportCapabilities
 

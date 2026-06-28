@@ -18,8 +18,10 @@ import struct
 import subprocess
 import time
 from dataclasses import dataclass
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
+
+from .._compat import UTC
 
 
 class TimeSourceKind(str, Enum):
