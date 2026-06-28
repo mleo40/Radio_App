@@ -142,13 +142,14 @@ class MeshCoreTransport(Transport):
         return self._self_info().get("public_key") or None
 
     def local_display_name(self) -> str:
-        """Our MeshCore node name (as configured on the companion device).
+        """Our MeshCore node name.
 
-        Surfaced in the TUI status bar's ``id:`` fragment so the operator can
-        see which named node they're transmitting as. Blank until the device
-        reports its self-info.
+        Prefers the live device self-info (name the device broadcasts); falls
+        back to ``display_name`` from config so the name shows even when the
+        companion is offline.
         """
-        return str(self._self_info().get("name") or "")
+        device_name = str(self._self_info().get("name") or "")
+        return device_name or str(self.config.get("display_name") or "")
 
     def channels(self) -> list[dict]:
         """Configured group channels as ``[{"index": int, "name": str}]``.

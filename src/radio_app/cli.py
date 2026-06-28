@@ -1328,7 +1328,17 @@ def _cmd_status(args: argparse.Namespace) -> int:
                         anon = getter()
                     except Exception:  # noqa: BLE001
                         anon = None
-                ident = f"anon={anon}" if anon else "anon"
+                display = ""
+                display_getter = getattr(t, "local_display_name", None)
+                if callable(display_getter):
+                    try:
+                        display = display_getter() or ""
+                    except Exception:  # noqa: BLE001
+                        display = ""
+                if display:
+                    ident = f"name={display}" + (f" anon={anon}" if anon else "")
+                else:
+                    ident = f"anon={anon}" if anon else "anon"
             print(
                 f"  - {t.name:<12} {state:<5} {reach_txt:<11} {ident}"
             )
@@ -1742,6 +1752,10 @@ def _cmd_setup(args: argparse.Namespace) -> int:
             mc["tcp_port"] = int(
                 _ask("Companion TCP port", str(mc.get("tcp_port", 5000)))
             )
+        mc["display_name"] = _ask(
+            "MeshCore display name (shown when device is offline)",
+            mc.get("display_name", ""),
+        )
     mc["enabled"] = mc_enabled
 
     # -- station identity (prefilled from JS8Call when available) ------------
@@ -1793,6 +1807,26 @@ def _cmd_setup(args: argparse.Namespace) -> int:
         )
     wl["enabled"] = wl_enabled
 
+    # -- WSJT-X (FT8/FT4 weak-signal via UDP) ----------------------------------
+    print("\nWSJT-X / JS8Call (FT8/FT4 weak-signal; listens for UDP datagrams"
+          " on port 2237)")
+    wsjtx = dict(cfg.transports.get("wsjt_x", {}))
+    wsjtx_enabled = _ask_bool("Enable WSJT-X?", wsjtx.get("enabled", False))
+    if wsjtx_enabled:
+        wsjtx["host"] = _ask(
+            "UDP bind address (0.0.0.0 = all interfaces)", wsjtx.get("host", "0.0.0.0")
+        )
+        wsjtx["port"] = int(_ask("UDP port", str(wsjtx.get("port", 2237))))
+        wsjtx["wsjtx_host"] = _ask(
+            "WSJT-X host (for outbound free-text)", wsjtx.get("wsjtx_host", "127.0.0.1")
+        )
+        wsjtx["callsign"] = _ask(
+            "Your callsign (blank = auto-learn from WSJT-X Status)",
+            wsjtx.get("callsign", "") or station.callsign,
+        )
+        print("  note: WSJT-X must be configured to send UDP packets to this machine.")
+    wsjtx["enabled"] = wsjtx_enabled
+
     # -- compliance (advanced) ----------------------------------------------
     allow_enc = _ask_bool(
         "\nAllow encrypted payloads on HF? (advanced; usually NO)",
@@ -1811,13 +1845,14 @@ def _cmd_setup(args: argparse.Namespace) -> int:
     transports["js8call"] = js8
     transports["meshcore"] = mc
     transports["winlink"] = wl
+    transports["wsjt_x"] = wsjtx
     cfg.data["transports"] = transports
     cfg.save()
 
     print(f"\nSaved configuration to {cfg.path}")
     print(f"  station   : {station.callsign or '(none)'}  {station.grid_square}")
     enabled = [
-        n for n in ("reticulum", "js8call", "meshcore", "winlink")
+        n for n in ("reticulum", "js8call", "meshcore", "winlink", "wsjt_x")
         if transports[n].get("enabled")
     ]
     print(f"  transports: {', '.join(enabled) or '(none enabled)'}")

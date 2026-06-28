@@ -70,6 +70,10 @@ port = "/dev/ttyACM0"
 baud = 115200
 host = "127.0.0.1"
 tcp_port = 5000
+# Display name shown in the Health board and radioapp status when the companion
+# device is offline. When the device is connected, its own reported node name
+# takes precedence. Set this to avoid showing "anon" before the device connects.
+# display_name = "MikeNode"
 # Prepend your node name to outbound channel messages ("Name: message").
 # Off by default — bare message content is sent and other MeshCore nodes
 # will not see a sender name. Enable if you share a channel with stock
