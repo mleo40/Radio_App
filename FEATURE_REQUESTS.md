@@ -545,126 +545,97 @@ capped at 383 bytes, `_GROUP_PAYLOAD_MAX`), so file transfer is DIRECT-only.
 
 ## Weather & Environmental Data
 
-Four paths for pulling weather data over radio, ranked by practicality.
-All four share a common `metadata["kind"] = "weather_bulletin"` convention so
-the Watch live-feed and a future Weather tab can filter across transports uniformly.
+**Status:** Done (core WX view + all four transport paths)
+**Area:** `ui/tui.py`, `transports/`, `core/wx_internet.py`, `core/maidenhead.py`
+
+Four paths for pulling weather data over radio, all implemented. Every bulletin
+from any source is stamped `metadata["kind"] = "weather_bulletin"` so the WX
+view and the Watch live-feed can filter across transports uniformly.
+
+**WX view (⛅)** — a dedicated weather surface in the TUI (select the ⛅ chip or
+press the weather key). It shows a scrollback feed of received weather bulletins
+from all active sources, plus an internet fetch for the current grid square (NWS
+point forecast with automatic fallback to Open-Meteo when NWS is unreachable).
+A grid picker shows the current grid square with `◀ ▶` buttons to cycle through
+saved grids when multiple are configured.
+
+**⛅ Setup dialog (`WXSetupScreen`)** — opened via the ⛅ / Setup button in the
+WX view. Three sections:
+
+1. **Grid squares** — shown as a scrollable `ListView` (arrow keys to navigate).
+   Type a grid square in the input field (auto-uppercased) and press Enter or
+   `+ Add`; select an entry and press `Remove selected` to delete it. Grid
+   squares are saved under `[ui] wx_grids = "FN42,FN31"` in `config.toml`.
+
+2. **Passive radio sources** (checkboxes — toggling does NOT close the dialog):
+   - **MeshCore #weather channel** — creates a `#weather` channel on your
+     MeshCore device; saved to the MeshCore channel table.
+   - **Reticulum #weather / #nws_alerts groups** — joins those groups on the
+     Reticulum mesh; saved to the groups config.
+
+3. **Cancel / Save** — the only buttons that dismiss the dialog.
 
 ---
 
 ### JS8Call — APRS weather relay
 
 **Requested:** 2026-06-28
-**Status:** Backlog
+**Status:** Done
 **Area:** `transports/js8call_transport.py`, `ui/tui.py`
 
-JS8Call exposes an `@APRSIS` gateway that routes APRS messages onto APRS-IS
-(the internet APRS backbone). NWS weather queries can be sent through it: the
-operator sends a directed message to `@APRSIS` containing a standard APRS
-weather-query packet, and the NWS point forecast comes back as a normal directed
-JS8 message from the relay. Works entirely over HF RF — the relay node handles
-the internet leg.
+JS8Call exposes an `@APRSIS` gateway that routes APRS messages onto APRS-IS.
+`send_wx_query(grid)` sends `@APRSIS NWS FN42` via `TX.SEND_MESSAGE`; the NWS
+point forecast arrives back as a directed message from `@APRSIS` and is stamped
+`metadata["kind"] = "weather_bulletin"`. The WX view issues this query for each
+saved grid square using the `_wx_js8_query` worker.
 
-**Design notes:**
-- A `/wx [grid]` command composes and sends the APRS query; grid square
-  auto-populated from `[station].grid_square` or the most recently heard
-  `GRID:` heartbeat.
-- Response arrives as `RX.DIRECTED`; detect by sender/command pattern and stamp
-  `metadata["kind"] = "weather_bulletin"` so it surfaces distinctly.
-- Grid square metadata already parsed by the transport (`GRID:` fields in
-  `RX.DIRECTED` params) — useful for contextualising whose observation is whose.
-- The existing Watch live-feed is the natural rendering surface.
-
-**UX sketch:**
-```
-/wx              → NWS point forecast for your configured grid square
-/wx EM72         → explicit grid override
-→ pinned message: "NWS EM72 — Tonight: Partly cloudy. Low 64°F. SE wind 8 mph."
-```
+**What shipped:**
+- `JS8CallTransport.send_wx_query(grid)` — transmits the APRS NWS query.
+- `_JS8_WX_RE` regex — detects incoming NWS forecast text and stamps kind.
+- WX view grid picker with internet fallback (NWS → Open-Meteo).
 
 ---
 
 ### Winlink — NWS bulletin detection
 
 **Requested:** 2026-06-28
-**Status:** Backlog
+**Status:** Done
 **Area:** `transports/winlink_transport.py`, `ui/tui.py`
 
-Winlink is often the only internet-connected path in a grid-down deployment.
-NWS provides free email alert subscriptions (forecast.weather.gov); bulletins
-arrive in the Pat inbox as regular email with recognisable subject patterns
-(`NWS-BULLETIN`, `FPUS51 KWNO`, `MARINE FORECAST`, `CONVECTIVE OUTLOOK`, etc.).
-Detecting these and surfacing them separately from operator email is the whole
-feature — no new protocol work.
-
-**Design notes:**
-- Subject-line pattern match on ingest; stamp `metadata["kind"] =
-  "weather_bulletin"` and optionally `metadata["nws_office"]` from the WMO
-  header (e.g. `KWNO`, `KBOX`).
-- Works over any Winlink connect path: telnet, VARA HF, ARDOP, Pactor, AX.25.
-- Secondary: adapt the ICS-213 form template as a **weather observation form**
-  (fields: temp, wind speed/direction, sky cover, remarks) for operator-sourced
-  field reports.
-- GRIB or CSV attachments already saved by the transport; a co-located tool
-  could render them later.
-
-**UX sketch:**
-```
-Winlink inbox → [Weather] tab  (filtered by metadata kind)
-NWS-BULLETIN  "MARINE FORECAST CAPE COD BAY"   2026-06-28 06:15
-FPUS51 KBOX   "AREA FORECAST DISCUSSION"        2026-06-28 05:44
-```
+Winlink NWS bulletins are detected on ingest via `_NWS_SUBJECT_RE` (matches
+`NWS-BULLETIN`, `ZONE FORECAST`, `FLASH FLOOD WARNING`, `TORNADO WARNING`,
+`MARINE FORECAST`, etc.) and stamped `metadata["kind"] = "weather_bulletin"` so
+they surface in the WX feed separately from operator email. Works over any
+Winlink connect path (telnet, VARA HF, ARDOP, Pactor, AX.25).
 
 ---
 
 ### Reticulum — #weather group broadcast
 
 **Requested:** 2026-06-28
-**Status:** Backlog
-**Area:** `transports/reticulum_transport.py`, `ui/tui.py`, `config.example.toml`
+**Status:** Done (join-side; broadcast-side requires an internet-connected relay node)
+**Area:** `transports/reticulum_transport.py`, `ui/tui.py`
 
-A Reticulum GROUP destination (symmetric key derived from group name) lets a
-single internet-connected mesh node pull NWS feeds and re-broadcast them
-encrypted to all local RNS nodes over LoRa — no internet required at the
-receiving end. The well-known group names `#weather` and `#nws_alerts` become
-the convention so deployments interoperate without coordination.
-
-**Design notes:**
-- GROUP destinations already used for cross-mode group aggregation; no new
-  protocol primitives needed.
-- LXMF file attachments (JSON/CSV/GRIB) already saved by the transport; full
-  NWS text forecasts fit easily within the 1 MB LXMF payload limit.
-- `#nws_alerts` as an urgent-only sub-group is worth documenting as a convention
-  alongside `#weather`.
-- Stamp `metadata["kind"] = "weather_bulletin"` on receipt for uniform Watch
-  filtering.
-
-**UX sketch:**
-```toml
-# config.toml — join the well-known weather groups
-[groups.WX]
-display_name = "Weather"
-transports   = ["reticulum"]
-tags         = ["weather", "nws_alerts"]
-```
+The WXSetupScreen Reticulum checkbox joins the `#weather` and `#nws_alerts`
+GROUP destinations on the Reticulum mesh (symmetric keys derived from the group
+names). Any node that re-broadcasts NWS content on these groups is received
+automatically and stamped `kind=weather_bulletin`. No extra config required
+beyond enabling in the setup dialog.
 
 ---
 
 ### MeshCore — #weather channel convention
 
 **Requested:** 2026-06-28
-**Status:** Deferred — usage pattern only, no code change needed
-**Area:** `transports/meshcore_transport.py`
+**Status:** Done (via WXSetupScreen)
+**Area:** `transports/meshcore_transport.py`, `ui/tui.py`
 
-MeshCore channels carry plaintext up to 134 bytes/frame. A `#weather` hashtag
-channel for operator-entered observations works today with no app changes.
-Document as a usage convention in operator guides rather than a distinct feature.
+The WXSetupScreen MeshCore checkbox creates a `#weather` channel on the
+companion device (first available slot above channel 0). Operator-entered
+observations on that channel are received by all nodes on the channel.
+Convention: prefix observation text with `"WX: "` so nodes that parse it can
+stamp `kind=weather_bulletin`.
 
-**Design notes:**
-- Convention: sender prepends `"WX: "` to observation text (e.g. `"Node1: WX:
-  18C, 15kt E, partly cloudy"`).
-- Revisit if a structured sensor-data frame standard emerges in MeshCore
-  firmware (e.g. BME280 nodes broadcasting temp/humidity/pressure in a parseable
-  format); at that point parse into `metadata["kind"] = "weather_observation"`
-  and surface on the Health board.
-- WSJT-X excluded: 13-char FT8 limit makes weather payloads impractical.
+**Deferred:** structured sensor-data frames (BME280 temp/humidity/pressure) —
+revisit if a parseable format emerges in MeshCore firmware.
 

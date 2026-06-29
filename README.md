@@ -525,6 +525,17 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   `[transports.X].launch_cmd` in your config; if not set, a prompt asks for it
   and saves the answer. For Winlink, `modem_cmd` additionally auto-launches the RF
   modem (VARA or any VARA-compatible modem) before a varahf/varafm session.
+- **⛅ Weather (WX):** a dedicated weather surface that aggregates bulletins from
+  all active sources (JS8Call APRS relay, Winlink NWS inbox, Reticulum #weather
+  group, MeshCore #weather channel) plus an internet fetch for the current grid
+  square (NWS point forecast → Open-Meteo fallback). A grid picker shows the
+  active grid with `◀ ▶` to cycle through saved squares. The **Setup** button
+  opens the **WX Setup dialog**: manage saved grid squares in a list (add by
+  typing + Enter, delete with Remove selected; auto-uppercased; saved to
+  `[ui] wx_grids` in `config.toml`), and check **MeshCore #weather** and/or
+  **Reticulum #weather / #nws_alerts** to join those passive sources — the dialog
+  stays open until you press **Save**, so you can configure multiple options in
+  one visit.
 - **Watch (observe):** select the **Watch** tab for a unified, **read-only** live stream of
   **all** messages across **every** transport — both the traffic you **receive**
   and the messages you **send** (e.g. both sides of a MeshCore channel) —
