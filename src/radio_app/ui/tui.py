@@ -5525,6 +5525,7 @@ class RadioTUI(App):
         self._update_mesh_bar()
         self._update_js8_bar()
         self._update_winlink_bar()
+        self._update_wx_bar()
         # View changed -> re-evaluate context bindings (e.g. F4 only on Watch)
         # so the footer shows/hides them correctly.
         self.refresh_bindings()
@@ -5684,6 +5685,15 @@ class RadioTUI(App):
             "Nothing sent yet; press Connect to transmit."
         )
         self._refresh_active_pane()
+
+    def _update_wx_bar(self) -> None:
+        """Dim the JS8 WX query button when JS8Call is not running."""
+        try:
+            btn = self.query_one("#wx-query", Button)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        down = self._health.get("js8call") is ReachabilityStatus.DOWN
+        btn.disabled = down
 
     @work
     async def _winlink_email_compose(self) -> None:
