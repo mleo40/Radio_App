@@ -1190,6 +1190,351 @@ class WXSetupScreen(ModalScreen[dict | None]):
         self.dismiss(None)
 
 
+class SettingsScreen(ModalScreen["dict | None"]):
+    """Three-tab settings modal: Favorites, Weather, Backup."""
+
+    CSS = """
+    SettingsScreen { align: center middle; }
+    #settings-box {
+        width: 76; height: auto; max-height: 95vh;
+        padding: 1 2; border: thick $accent; background: $surface;
+    }
+    #settings-title     { height: auto; margin-bottom: 1; }
+    #settings-tabs      { height: 3; }
+    #settings-tabs Button {
+        height: 1; border: none; padding: 0 2; margin: 0 1 0 0;
+    }
+    #settings-tabs Button.-active { text-style: bold reverse; }
+    #settings-content   { height: auto; }
+    /* Favorites pane */
+    #stab-fav-pane      { height: auto; }
+    #stab-fav-list      { height: 8; margin-bottom: 0; }
+    #stab-fav-rm        { height: 3; width: auto; margin-bottom: 1; }
+    #stab-fav-kinds     { height: 3; margin-bottom: 0; }
+    #stab-fav-kinds Button { height: 1; min-width: 8; border: none; padding: 0 1; margin: 0 1 0 0; }
+    #stab-fav-kinds Button.-active { text-style: bold reverse; }
+    #stab-fav-add-row   { height: 3; margin-top: 1; }
+    #stab-fav-id        { width: 1fr; }
+    #stab-fav-label     { width: 20; }
+    #stab-fav-add       { width: 7; min-width: 7; }
+    /* Weather pane */
+    #stab-wx-pane       { height: auto; }
+    #stab-wx-list       { height: 5; margin-bottom: 0; }
+    #stab-wx-rm         { height: 3; width: auto; margin-bottom: 1; }
+    #stab-wx-add-row    { height: 3; margin-bottom: 1; }
+    #stab-wx-grid-input { width: 1fr; }
+    #stab-wx-grid-add   { width: 7; min-width: 7; }
+    #stab-wx-sources-l  { height: auto; margin-top: 1; }
+    /* Backup pane */
+    #stab-bak-pane      { height: auto; }
+    #stab-bak-status    { height: auto; margin-bottom: 1; color: $text-muted; }
+    #stab-bak-btns      { height: 3; margin-bottom: 1; }
+    #stab-bak-restore-l { height: auto; margin-bottom: 0; }
+    #stab-bak-restore-row { height: 3; margin-bottom: 1; }
+    #stab-bak-path      { width: 1fr; }
+    #stab-bak-do        { width: 10; min-width: 10; }
+    #stab-bak-log       { height: auto; color: $text-muted; }
+    /* Footer */
+    #settings-footer    { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+
+    BINDINGS = [("escape", "close_settings", "Close")]
+
+    def __init__(self, core) -> None:
+        super().__init__()
+        self._core = core
+        self._add_kind: str = "callsign"
+        self._wx_grids: list[str] = [
+            g.strip().upper()
+            for g in str(core.config.ui.get("wx_grids", "") or "").split(",")
+            if g.strip()
+        ]
+        self._has_mc = any(t.name == "meshcore" for t in core.transports)
+        self._has_rns = any(t.name == "reticulum" for t in core.transports)
+
+    def compose(self) -> ComposeResult:
+        mc_note = "" if self._has_mc else " [dim](when MC connects)[/dim]"
+        rns_note = "" if self._has_rns else " [dim](when RNS connects)[/dim]"
+        with Vertical(id="settings-box"):
+            yield Static("[b]⚙ Settings[/b]", id="settings-title")
+            with Horizontal(id="settings-tabs"):
+                yield Button("Favorites", id="stab-fav", classes="stab")
+                yield Button("Weather", id="stab-wx", classes="stab")
+                yield Button("Backup", id="stab-bak", classes="stab")
+            with ContentSwitcher(initial="stab-fav-pane", id="settings-content"):
+                with Vertical(id="stab-fav-pane"):
+                    yield Static("Saved contacts (arrow keys to select):")
+                    yield ListView(id="stab-fav-list")
+                    yield Button("Remove selected", id="stab-fav-rm", variant="warning")
+                    yield Static("Type:")
+                    with Horizontal(id="stab-fav-kinds"):
+                        yield Button("User", id="stab-kind-user", classes="stab-kind")
+                        yield Button("Group", id="stab-kind-group", classes="stab-kind")
+                        yield Button("Room", id="stab-kind-room", classes="stab-kind")
+                    with Horizontal(id="stab-fav-add-row"):
+                        yield Input(
+                            placeholder="ID (callsign / @group / #room)",
+                            id="stab-fav-id",
+                        )
+                        yield Input(
+                            placeholder="Label (opt.)",
+                            id="stab-fav-label",
+                            max_length=40,
+                        )
+                        yield Button("+ Add", id="stab-fav-add", variant="default")
+                with Vertical(id="stab-wx-pane"):
+                    yield Static("Grid squares (arrow keys to select):", id="stab-wx-l")
+                    yield ListView(id="stab-wx-list")
+                    yield Button("Remove selected", id="stab-wx-rm", variant="warning")
+                    with Horizontal(id="stab-wx-add-row"):
+                        yield Input(
+                            placeholder="FN42",
+                            id="stab-wx-grid-input",
+                            max_length=6,
+                        )
+                        yield Button("+ Add", id="stab-wx-grid-add", variant="default")
+                    yield Static(
+                        "\n[b]Passive radio sources[/b]", id="stab-wx-sources-l"
+                    )
+                    yield Checkbox(
+                        f"MeshCore #weather channel{mc_note}",
+                        id="stab-wx-mc",
+                    )
+                    yield Checkbox(
+                        f"Reticulum #weather / #nws_alerts{rns_note}",
+                        id="stab-wx-rns",
+                    )
+                with Vertical(id="stab-bak-pane"):
+                    yield Static("", id="stab-bak-status")
+                    with Horizontal(id="stab-bak-btns"):
+                        yield Button("Backup Now", id="stab-bak-backup", variant="primary")
+                    yield Static("Restore from archive:", id="stab-bak-restore-l")
+                    with Horizontal(id="stab-bak-restore-row"):
+                        yield Input(
+                            placeholder="/path/to/radio_app-backup-*.tar.gz",
+                            id="stab-bak-path",
+                        )
+                        yield Button("Restore…", id="stab-bak-do", variant="warning")
+                    yield Static("", id="stab-bak-log")
+            with Horizontal(id="settings-footer"):
+                yield Button("Close", id="settings-close", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#stab-fav", Button).add_class("-active")
+        self.query_one("#stab-kind-user", Button).add_class("-active")
+        self._refresh_fav_list()
+        wx_lst = self.query_one("#stab-wx-list", ListView)
+        for grid in self._wx_grids:
+            wx_lst.append(ListItem(Label(grid)))
+        self._refresh_backup_status()
+
+    def _refresh_fav_list(self) -> None:
+        lst = self.query_one("#stab-fav-list", ListView)
+        lst.clear()
+        for fav in self._core.favorites.all():
+            k = getattr(fav, "kind", "") or ""
+            fid = fav.id or ""
+            if k == "node":
+                badge = "[dim]Node[/dim]"
+            elif k == "mc_channel" or fid.startswith("#"):
+                badge = "[dim]Room[/dim]"
+            elif k == "group" or fid.startswith("@"):
+                badge = "[dim]Grp [/dim]"
+            elif k == "mc_peer":
+                badge = "[dim]MC  [/dim]"
+            else:
+                badge = "[dim]User[/dim]"
+            label_str = f'  "{fav.label}"' if fav.label else ""
+            lst.append(ListItem(Label(f"{badge}  {fid}{label_str}")))
+
+    def _refresh_backup_status(self) -> None:
+        cfg_dir = self._core.config.path.parent
+        backups = sorted(cfg_dir.glob("radio_app-backup-*.tar.gz"))
+        status = self.query_one("#stab-bak-status", Static)
+        if backups:
+            latest = backups[-1]
+            size_kb = latest.stat().st_size // 1024
+            status.update(f"Last backup: {latest.name} ({size_kb} KB)")
+        else:
+            status.update("No backup found in config directory.")
+
+    def _set_active_tab(self, tab_id: str) -> None:
+        for tid in ("stab-fav", "stab-wx", "stab-bak"):
+            try:
+                self.query_one(f"#{tid}", Button).set_class(tid == tab_id, "-active")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in ("stab-fav-id", "stab-wx-grid-input"):
+            upper = event.value.upper()
+            if upper != event.value:
+                event.input.value = upper
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in ("stab-fav-id", "stab-fav-label"):
+            self._do_add_fav()
+            event.stop()
+        elif event.input.id == "stab-wx-grid-input":
+            self._do_add_wx_grid()
+            event.stop()
+
+    def _do_add_fav(self) -> None:
+        fid = self.query_one("#stab-fav-id", Input).value.strip()
+        label = self.query_one("#stab-fav-label", Input).value.strip()
+        if not fid:
+            return
+        if self._add_kind == "group" and not fid.startswith("@"):
+            fid = f"@{fid}"
+        elif self._add_kind == "mc_channel" and not fid.startswith("#"):
+            fid = f"#{fid}"
+        self._core.favorites.add(fid, label, kind=self._add_kind)
+        self._core.favorites.save(self._core.config)
+        self.query_one("#stab-fav-id", Input).value = ""
+        self.query_one("#stab-fav-label", Input).value = ""
+        self._refresh_fav_list()
+
+    def _do_add_wx_grid(self) -> None:
+        inp = self.query_one("#stab-wx-grid-input", Input)
+        grid = inp.value.strip().upper()
+        if grid and grid not in self._wx_grids:
+            self._wx_grids.append(grid)
+            self.query_one("#stab-wx-list", ListView).append(ListItem(Label(grid)))
+        inp.value = ""
+        inp.focus()
+
+    def _build_wx_result(self) -> dict:
+        mc = self.query_one("#stab-wx-mc", Checkbox).value
+        rns = self.query_one("#stab-wx-rns", Checkbox).value
+        return {"meshcore": mc, "reticulum": rns, "grids": ",".join(self._wx_grids)}
+
+    @work(thread=True)
+    def _do_backup(self) -> None:
+        from ..core import backup as bk
+        try:
+            result = bk.create_backup(
+                self._core.config.path,
+                self._core.config.database_path(),
+            )
+            size_kb = result.size_bytes // 1024
+            self.app.call_from_thread(
+                self._set_bak_log,
+                f"✓ Backup written: {result.path.name} ({size_kb} KB)",
+            )
+            self.app.call_from_thread(self._refresh_backup_status)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(
+                self._set_bak_log, f"✗ Backup failed: {exc}"
+            )
+
+    @work(thread=True)
+    def _do_restore(self, path_str: str) -> None:
+        from pathlib import Path as _Path
+        from ..core import backup as bk
+        archive = _Path(path_str).expanduser()
+        if not archive.exists():
+            self.app.call_from_thread(
+                self._set_bak_log, f"File not found: {path_str}"
+            )
+            return
+        try:
+            result = bk.restore_backup(
+                archive,
+                self._core.config.path,
+                self._core.config.database_path(),
+            )
+            msg = (
+                f"✓ Restored — config: {result.config_restored}, "
+                f"db: {result.db_restored}. Restart the app to apply."
+            )
+            self.app.call_from_thread(self._set_bak_log, msg)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(
+                self._set_bak_log, f"✗ Restore failed: {exc}"
+            )
+
+    def _set_bak_log(self, msg: str) -> None:
+        try:
+            self.query_one("#stab-bak-log", Static).update(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        # Tab switching
+        if bid == "stab-fav":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-fav-pane"
+            self._set_active_tab("stab-fav")
+            event.stop()
+        elif bid == "stab-wx":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-wx-pane"
+            self._set_active_tab("stab-wx")
+            event.stop()
+        elif bid == "stab-bak":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-bak-pane"
+            self._set_active_tab("stab-bak")
+            event.stop()
+        # Kind selector
+        elif bid in ("stab-kind-user", "stab-kind-group", "stab-kind-room"):
+            kind_map = {
+                "stab-kind-user": "callsign",
+                "stab-kind-group": "group",
+                "stab-kind-room": "mc_channel",
+            }
+            self._add_kind = kind_map[bid]
+            for k in kind_map:
+                try:
+                    self.query_one(f"#{k}", Button).set_class(k == bid, "-active")
+                except Exception:  # noqa: BLE001
+                    pass
+            event.stop()
+        # Favorites actions
+        elif bid == "stab-fav-add":
+            self._do_add_fav()
+            event.stop()
+        elif bid == "stab-fav-rm":
+            lst = self.query_one("#stab-fav-list", ListView)
+            idx = lst.index
+            if idx is not None:
+                favs = self._core.favorites.all()
+                if 0 <= idx < len(favs):
+                    self._core.favorites.remove(favs[idx].id)
+                    self._core.favorites.save(self._core.config)
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
+            event.stop()
+        # WX grid actions
+        elif bid == "stab-wx-grid-add":
+            self._do_add_wx_grid()
+            event.stop()
+        elif bid == "stab-wx-rm":
+            lst = self.query_one("#stab-wx-list", ListView)
+            idx = lst.index
+            if idx is not None and 0 <= idx < len(self._wx_grids):
+                del self._wx_grids[idx]
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
+            event.stop()
+        # Backup actions
+        elif bid == "stab-bak-backup":
+            self._do_backup()
+            event.stop()
+        elif bid == "stab-bak-do":
+            path_str = self.query_one("#stab-bak-path", Input).value.strip()
+            if path_str:
+                self._do_restore(path_str)
+            else:
+                self._set_bak_log("Enter a backup archive path first.")
+            event.stop()
+        # Close
+        elif bid == "settings-close":
+            self.action_close_settings()
+            event.stop()
+
+    def action_close_settings(self) -> None:
+        self.dismiss({"wx": self._build_wx_result()})
+
+
 class AboutScreen(ModalScreen[None]):
     """Hidden "about" easter egg: a scrollable technical overview of the app.
 
@@ -1422,6 +1767,7 @@ class RadioTUI(App):
         # Hidden easter egg: technical "about" overview. show=False keeps it out
         # of the footer; priority lets it fire even while the composer is focused.
         Binding("ctrl+g", "about", "About", show=False, priority=True),
+        Binding("ctrl+comma", "settings", "Settings", show=False, priority=True),
     ]
 
     def check_action(
@@ -2226,6 +2572,20 @@ class RadioTUI(App):
             self._refresh_threads()
         self._update_status()
 
+    @work
+    async def action_settings(self) -> None:
+        """Open the Settings modal (Favorites / Weather / Backup)."""
+        if self.core is None:
+            return
+        if isinstance(self.screen, SettingsScreen):
+            return
+        result = await self.push_screen_wait(SettingsScreen(self.core))
+        if result is None:
+            return
+        wx_result = result.get("wx")
+        if wx_result is not None:
+            await self._apply_wx_result(wx_result)
+
     def action_about(self) -> None:
         """Hidden easter egg: show the technical 'about' overview.
 
@@ -2697,8 +3057,8 @@ class RadioTUI(App):
             self._show_watch()
         elif bid == "view-health":
             self.action_health()
-        elif bid == "view-favorites":
-            self._show_favorites()
+        elif bid == "view-settings":
+            self.action_settings()
         elif bid == "view-logs":
             self.action_logs()
         elif bid == "view-archive":
@@ -3226,16 +3586,16 @@ class RadioTUI(App):
                 if status is ReachabilityStatus.OK
                 else ""
             )
-            log.write(f"  {dot} [b]{t.name}[/b]  {word}{vol}")
+            log.write(f" {dot} [b]{t.name}[/b] {word}{vol}")
             # Show the actual on-air identity this transport uses (callsign for
             # HF media, an anonymous address for Reticulum/MeshCore) so it's
             # obvious which callsign goes out — matching `radioapp status`.
-            log.write(f"       {self._transport_identity(t)}")
+            log.write(f"    {self._transport_identity(t)}")
             # Show the configured control endpoint (host:port / URL) even when
             # the transport is down, so the operator can confirm *where* we dial.
             endpoint = self._transport_endpoint(t)
             if endpoint:
-                log.write(f"       {endpoint}")
+                log.write(f"    {endpoint}")
             if (
                 t.name == "reticulum"
                 and status is ReachabilityStatus.OK
@@ -3258,8 +3618,8 @@ class RadioTUI(App):
                 if self.core is not None:
                     bstats = self.core.store.band_stats(transport=t.name)
                     if bstats:
-                        parts = "  ".join(f"{b} {c}" for b, c in bstats.items())
-                        log.write(f"      [dim]band log: {parts}[/dim]")
+                        parts = " ".join(f"{b} {c}" for b, c in bstats.items())
+                        log.write(f"    [dim]band log: {parts}[/dim]")
             # MeshCore (and any transport exposing device_telemetry) shows its
             # device health: battery + radio parameters.
             if (
@@ -3472,7 +3832,7 @@ class RadioTUI(App):
         """
         paths = self._winlink_paths
         if not paths:
-            log.write("      [dim](connection paths not probed yet)[/dim]")
+            log.write("    [dim](connection paths not probed yet)[/dim]")
             return
         for p in paths:
             reachable = p.get("reachable")
@@ -3484,7 +3844,7 @@ class RadioTUI(App):
                 dot, word = "[dim]\u00b7[/dim]", "[dim]n/a[/dim]"
             label = p.get("label", p.get("name", "?"))
             detail = p.get("detail", "")
-            log.write(f"      {dot} {label}  {word}  [dim]{detail}[/dim]")
+            log.write(f"    {dot} {label} {word} [dim]{detail}[/dim]")
 
     def _render_js8_status(self, log: RichLog, snap: dict | None) -> None:
         """Render the JS8Call rig operating state under its status line.
@@ -3496,7 +3856,7 @@ class RadioTUI(App):
         """
         if not snap or not snap.get("cat"):
             log.write(
-                "      [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
+                "    [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
             )
             return
         bits: list[str] = []
@@ -3515,7 +3875,7 @@ class RadioTUI(App):
         if sel:
             bits.append(f"selected {sel}")
         if bits:
-            log.write(f"      [dim]{'  ·  '.join(bits)}[/dim]")
+            log.write(f"    [dim]{' · '.join(bits)}[/dim]")
 
     def _render_device_telemetry(self, log: RichLog, tel: dict | None) -> None:
         """Render a MeshCore companion's device telemetry under its status line.
@@ -3526,12 +3886,12 @@ class RadioTUI(App):
         """
         if not tel:
             log.write(
-                "      [dim](no device telemetry — companion not responding)[/dim]"
+                "    [dim](no device telemetry — companion not responding)[/dim]"
             )
             return
         name = tel.get("name") or "(unnamed)"
         pk = (tel.get("public_key") or "")[:12]
-        head = f"      [b]{name}[/b]"
+        head = f"    [b]{name}[/b]"
         if pk:
             head += f"  [dim]<{pk}>[/dim]"
         batt = tel.get("battery")
@@ -3555,7 +3915,7 @@ class RadioTUI(App):
         if txp is not None:
             radio_bits.append(f"{txp} dBm")
         if radio_bits:
-            log.write(f"         [dim]{'  ·  '.join(radio_bits)}[/dim]")
+            log.write(f"       [dim]{' · '.join(radio_bits)}[/dim]")
 
     @staticmethod
     def _format_mesh_battery(level: object) -> str:
@@ -3582,16 +3942,16 @@ class RadioTUI(App):
         when present - RNode-specific health (RSSI, SNR, battery, frequency).
         """
         if not stats:
-            log.write("      [dim](no rnsd RPC reply - is rnsd running?)[/dim]")
+            log.write("    [dim](no rnsd RPC reply - is rnsd running?)[/dim]")
             return
         ifs = stats.get("interfaces") or []
         if not ifs:
-            log.write("      [dim](no RNS interfaces reported)[/dim]")
+            log.write("    [dim](no RNS interfaces reported)[/dim]")
             return
         uptime = stats.get("transport_uptime")
         if uptime:
             log.write(
-                f"      [dim]rnsd uptime: {self._format_duration(uptime)}  "
+                f"    [dim]rnsd uptime: {self._format_duration(uptime)} "
                 f"rx {self._format_bytes(stats.get('rxb', 0))} / "
                 f"tx {self._format_bytes(stats.get('txb', 0))}[/dim]"
             )
@@ -3603,8 +3963,8 @@ class RadioTUI(App):
             rxb = ifs_row.get("rxb", 0)
             txb = ifs_row.get("txb", 0)
             line = (
-                f"      {up_dot} [b]{name}[/b]  "
-                f"{self._format_bitrate(br)}  "
+                f"    {up_dot} [b]{name}[/b] "
+                f"{self._format_bitrate(br)} "
                 f"rx {self._format_bytes(rxb)} / tx {self._format_bytes(txb)}"
             )
             log.write(line)
@@ -3625,7 +3985,7 @@ class RadioTUI(App):
             if "clients" in ifs_row and ifs_row["clients"] is not None:
                 extras.append(f"clients {ifs_row['clients']}")
             if extras:
-                log.write(f"         [dim]{'  ·  '.join(extras)}[/dim]")
+                log.write(f"       [dim]{' · '.join(extras)}[/dim]")
 
     @staticmethod
     def _format_bytes(n: int | float | None) -> str:
@@ -4421,6 +4781,12 @@ class RadioTUI(App):
         )
         if result is None:
             return
+        await self._apply_wx_result(result)
+
+    async def _apply_wx_result(self, result: dict) -> None:
+        """Apply a WX setup result dict (grids + meshcore/reticulum flags) to config."""
+        if self.core is None:
+            return
 
         # Save grid squares to config and reload the picker (always write, even
         # when empty, so the user can clear a previously saved list).
@@ -5052,8 +5418,8 @@ class RadioTUI(App):
                 btn.set_class(self.view == "logs", "-active")
             elif bid == "view-archive":
                 btn.set_class(self.view == "archive", "-active")
-            elif bid == "view-favorites":
-                btn.set_class(self.view == "favorites", "-active")
+            elif bid == "view-settings":
+                btn.set_class(False, "-active")
             elif bid == "view-net":
                 btn.set_class(self.view == "net", "-active")
             elif bid == "view-weather":
@@ -5921,7 +6287,7 @@ class RadioTUI(App):
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
-        bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
+        bar.mount(Button("\u2699", id="view-settings", classes="modebtn"))
         bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
         bar.mount(Button("\u26c5 WX", id="view-weather", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))

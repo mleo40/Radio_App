@@ -63,7 +63,7 @@ def test_mode_selector_has_nomadnet_and_no_mercury(config_path):
             assert "mode-nomadnet" in ids       # virtual mode present
             assert "mode-mercury" not in ids    # mercury disabled
             assert "view-watch" in ids and "view-health" in ids
-            assert "view-favorites" in ids       # favorites page chip
+            assert "view-settings" in ids       # settings button (replaces favorites chip)
 
     asyncio.run(run())
 
