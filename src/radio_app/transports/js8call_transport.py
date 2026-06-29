@@ -637,7 +637,9 @@ class JS8CallTransport(Transport):
         and will be stamped as kind=weather_bulletin by message_from_event().
         """
         grid4 = grid[:4].upper()
-        return await self.send_directed(JS8_APRS_GATEWAY, f"NWS {grid4}")
+        return await self._send_api(
+            {"type": "TX.SEND_MESSAGE", "value": f"{JS8_APRS_GATEWAY} NWS {grid4}"}
+        )
 
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
