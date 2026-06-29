@@ -1063,7 +1063,8 @@ class WinlinkWXSubscribeScreen(ModalScreen[bool]):
 class WXSetupScreen(ModalScreen[dict | None]):
     """Weather setup: manage grid squares and passive radio source subscriptions.
 
-    Grid squares are shown as a deletable list; the add field forces uppercase.
+    Grid squares are shown in a ListView (arrow keys to navigate, Remove to
+    delete the highlighted entry).  The add field forces uppercase as you type.
     MeshCore and Reticulum checkboxes stay open until the user explicitly saves.
 
     Returns ``{"meshcore": bool, "reticulum": bool, "grids": str}`` on save,
@@ -1078,14 +1079,8 @@ class WXSetupScreen(ModalScreen[dict | None]):
     }
     #wxsetup-title      { height: auto; margin-bottom: 1; }
     #wxsetup-grids-l    { height: auto; }
-    #wxsetup-grid-list  { height: 6; margin-bottom: 0; }
-    .wxsetup-grid-row   { height: 1; }
-    .wxsetup-grid-label { width: 1fr; }
-    .wxsetup-del-btn    {
-        width: 3; min-width: 3; height: 1;
-        border: none; padding: 0; margin: 0;
-        background: transparent; color: $error;
-    }
+    #wxsetup-grid-list  { height: 5; margin-bottom: 0; }
+    #wxsetup-grid-rm    { height: 3; width: auto; margin-bottom: 1; }
     #wxsetup-add-row    { height: 3; margin-bottom: 1; }
     #wxsetup-grid-input { width: 1fr; }
     #wxsetup-grid-add   { width: 7; min-width: 7; }
@@ -1114,8 +1109,12 @@ class WXSetupScreen(ModalScreen[dict | None]):
         rns_note = "" if self._has_rns else " [dim](when Reticulum connects)[/dim]"
         with Vertical(id="wxsetup-box"):
             yield Static("[b]⛅ Weather Setup[/b]", id="wxsetup-title")
-            yield Static("Grid squares:", id="wxsetup-grids-l")
-            yield VerticalScroll(id="wxsetup-grid-list")
+            yield Static(
+                "Grid squares (↑↓ to select, Remove to delete):",
+                id="wxsetup-grids-l",
+            )
+            yield ListView(id="wxsetup-grid-list")
+            yield Button("Remove selected", id="wxsetup-grid-rm", variant="warning")
             with Horizontal(id="wxsetup-add-row"):
                 yield Input(placeholder="FN42", id="wxsetup-grid-input", max_length=6)
                 yield Button("+ Add", id="wxsetup-grid-add", variant="default")
@@ -1138,19 +1137,10 @@ class WXSetupScreen(ModalScreen[dict | None]):
                 yield Button("Save", id="wxsetup-both", variant="primary")
 
     def on_mount(self) -> None:
+        lst = self.query_one("#wxsetup-grid-list", ListView)
         for grid in self._grids:
-            self._mount_grid_row(grid)
+            lst.append(ListItem(Label(grid)))
         self.query_one("#wxsetup-grid-input", Input).focus()
-
-    def _mount_grid_row(self, grid: str) -> None:
-        container = self.query_one("#wxsetup-grid-list", VerticalScroll)
-        container.mount(
-            Horizontal(
-                Label(grid, classes="wxsetup-grid-label"),
-                Button("×", id=f"wxsetup-del-{grid}", classes="wxsetup-del-btn"),
-                classes="wxsetup-grid-row",
-            )
-        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "wxsetup-grid-input":
@@ -1167,7 +1157,9 @@ class WXSetupScreen(ModalScreen[dict | None]):
         grid = inp.value.strip().upper()
         if grid and grid not in self._grids:
             self._grids.append(grid)
-            self._mount_grid_row(grid)
+            self.query_one("#wxsetup-grid-list", ListView).append(
+                ListItem(Label(grid))
+            )
         inp.value = ""
         inp.focus()
 
@@ -1185,12 +1177,13 @@ class WXSetupScreen(ModalScreen[dict | None]):
         elif bid == "wxsetup-grid-add":
             self._do_add_grid()
             event.stop()
-        elif bid.startswith("wxsetup-del-"):
-            grid = bid[len("wxsetup-del-"):]
-            if grid in self._grids:
-                self._grids.remove(grid)
-            if event.button.parent is not None:
-                event.button.parent.remove()
+        elif bid == "wxsetup-grid-rm":
+            lst = self.query_one("#wxsetup-grid-list", ListView)
+            idx = lst.index
+            if idx is not None and 0 <= idx < len(self._grids):
+                del self._grids[idx]
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
             event.stop()
 
     def action_cancel(self) -> None:
@@ -4429,19 +4422,22 @@ class RadioTUI(App):
         if result is None:
             return
 
-        # Save grid squares to config and reload the picker.
+        # Save grid squares to config and reload the picker (always write, even
+        # when empty, so the user can clear a previously saved list).
         grids_str = result.get("grids", "").strip()
-        if grids_str:
-            ui = dict(self.core.config.ui)
-            ui["wx_grids"] = grids_str
-            self.core.config.data["ui"] = ui
-            try:
-                self.core.config.save()
-            except Exception as exc:  # noqa: BLE001
-                self._log_system(f"Could not save WX grids: {exc}")
-            self._wx_load_grids()
-            n = len([g for g in grids_str.split(",") if g.strip()])
+        ui = dict(self.core.config.ui)
+        ui["wx_grids"] = grids_str
+        self.core.config.data["ui"] = ui
+        try:
+            self.core.config.save()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Could not save WX grids: {exc}")
+        self._wx_load_grids()
+        n = len([g for g in grids_str.split(",") if g.strip()])
+        if n:
             self._log_system(f"Saved {n} grid square(s) for WX picker.")
+        else:
+            self._log_system("WX grid list cleared.")
 
         if result.get("meshcore"):
             t = self._meshcore_transport()
