@@ -97,6 +97,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/bands [<band>|activity [<band>]], "
     "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
     "/subs [add|rm @GROUP], "
+    "/groups [@NAME|new|delete|add|rm|tag|untag], "
     "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
@@ -2764,6 +2765,7 @@ class RadioTUI(App):
         self.current_target = None
         if self.view == "active" and self.active_transport:
             self._show_all_messages()
+        self._update_composer_placeholder()
 
     def action_close_chat(self) -> None:
         """Close (delete) the open conversation, removing it from the list."""
@@ -5488,6 +5490,7 @@ class RadioTUI(App):
             # No conversation selected: show every message for this mode so the
             # window isn't empty (e.g. the JS8Call firehose).
             self._show_all_messages()
+        self._update_composer_placeholder()
 
     def _default_channel_target(self) -> str | None:
         """Default conversation for the active mode, or None.
@@ -7828,6 +7831,176 @@ class RadioTUI(App):
         )
         self._log_system("\n".join(lines))
 
+    def _handle_groups_command(self, arg: str) -> None:
+        """Manage group routing configuration from the TUI.
+
+        /groups                              — list all groups
+        /groups @EMS                         — show group details
+        /groups new @EMS [transport ...]     — create group
+        /groups delete @EMS                  — delete group
+        /groups add @EMS transport:id        — add incoming member
+        /groups rm @EMS transport:id         — remove incoming member
+        /groups tag @EMS @tag                — add incoming tag
+        /groups untag @EMS @tag              — remove incoming tag
+        """
+        from ..core.groups import GroupRegistry
+
+        if self.core is None:
+            return
+
+        reg = GroupRegistry.from_config(self.core.config)
+        parts = arg.strip().split(None, 2)
+
+        if not parts:
+            self._groups_list(reg)
+            return
+
+        first = parts[0].lower()
+        _ACTIONS = {"new", "delete", "add", "rm", "remove", "tag", "untag"}
+
+        if first.startswith("@") or first not in _ACTIONS:
+            self._groups_show(reg, parts[0])
+            return
+
+        action = first
+
+        if action == "new":
+            if len(parts) < 2:
+                self._log_system("usage: /groups new @NAME [transport ...]")
+                return
+            name = parts[1].lstrip("@")
+            transports = parts[2].split() if len(parts) > 2 else []
+            g = reg.ensure_group(name)
+            if transports:
+                g.transports = transports
+                reg._dirty = True  # noqa: SLF001
+            reg.save(self.core.config)
+            note = f" on {', '.join(transports)}" if transports else ""
+            self._log_system(f"Created group @{name}{note}.")
+            return
+
+        if action == "delete":
+            if len(parts) < 2:
+                self._log_system("usage: /groups delete @EMS")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_group(name):
+                reg.save(self.core.config)
+                self._log_system(f"Deleted group @{name}.")
+            else:
+                self._log_system(f"No such group @{name}.")
+            return
+
+        if action == "add":
+            if len(parts) < 3:
+                self._log_system("usage: /groups add @EMS transport:identifier")
+                return
+            name = parts[1].lstrip("@")
+            try:
+                m = reg.add_member(name, parts[2])
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: added member {m.spec}.")
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+            return
+
+        if action in ("rm", "remove"):
+            if len(parts) < 3:
+                self._log_system("usage: /groups rm @EMS transport:identifier")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_member(name, parts[2]):
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: removed member {parts[2]}.")
+            else:
+                self._log_system(f"@{name}: '{parts[2]}' is not a member.")
+            return
+
+        if action == "tag":
+            if len(parts) < 3:
+                self._log_system("usage: /groups tag @EMS @tag")
+                return
+            name = parts[1].lstrip("@")
+            try:
+                t = reg.add_tag(name, parts[2])
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: now claims tag @{t}.")
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+            return
+
+        if action == "untag":
+            if len(parts) < 3:
+                self._log_system("usage: /groups untag @EMS @tag")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_tag(name, parts[2]):
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: removed tag @{parts[2].lstrip('@')}.")
+            else:
+                self._log_system(f"@{name}: no such tag '{parts[2]}'.")
+            return
+
+        self._log_system(
+            f"unknown /groups action '{action}'  ·  "
+            "try: new | delete | add | rm | tag | untag"
+        )
+
+    def _groups_list(self, reg: object) -> None:
+        from ..core.groups import GroupRegistry
+        assert isinstance(reg, GroupRegistry)
+        groups = reg.all()
+        if not groups:
+            self._log_system(
+                "No groups configured. Use /groups new @NAME to create one."
+            )
+            return
+        lines = ["[b]Groups:[/b]"]
+        for g in sorted(groups, key=lambda g: g.name):
+            marker = "[green]✓[/green]" if reg.is_subscribed(g.name) else "[dim]○[/dim]"
+            where = ", ".join(g.transports) or "-"
+            extras = []
+            if g.members:
+                extras.append(f"{len(g.members)} member(s)")
+            if g.tags:
+                extras.append(f"tags: {', '.join('@' + t for t in g.tags)}")
+            suffix = f"  [dim]{'; '.join(extras)}[/dim]" if extras else ""
+            lines.append(f"  {marker}  [b]@{g.name}[/b]  via {where}{suffix}")
+        lines.append(
+            "[dim]/groups @NAME for details  ·  /groups new @NAME to create[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _groups_show(self, reg: object, name_arg: str) -> None:
+        from ..core.groups import GroupRegistry
+        assert isinstance(reg, GroupRegistry)
+        name = name_arg.lstrip("@")
+        g = reg.get(name)
+        if g is None:
+            self._log_system(
+                f"No such group @{name}.  Use /groups new @{name} to create it."
+            )
+            return
+        lines = [f"[b]@{g.name}[/b]  ({g.display_name})"]
+        lines.append(
+            f"  outbound transports: {', '.join(g.transports) or '(none)'}"
+        )
+        lines.append(
+            f"  subscribed: {'[green]yes[/green]' if reg.is_subscribed(g.name) else '[dim]no[/dim]'}"
+        )
+        if g.members:
+            lines.append("  incoming members:")
+            for m in g.members:
+                who = m.transport or "any"
+                lines.append(f"    [dim]{m.identifier}  [{who}][/dim]")
+        else:
+            lines.append("  incoming members: (none)")
+        lines.append(
+            "  incoming tags: "
+            + (", ".join("@" + t for t in g.tags) if g.tags else "(none)")
+        )
+        self._log_system("\n".join(lines))
+
     def _handle_position_command(self, arg: str) -> None:
         """Show or set the station position.
 
@@ -8254,6 +8427,21 @@ class RadioTUI(App):
             else "Read-only view - tap the Watch tab, or pick a mode"
         )
 
+    def _update_composer_placeholder(self) -> None:
+        """Update the composer hint text to match the current mode and target."""
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        if composer.disabled:
+            return
+        if self.active_transport == "meshcore" and not self.current_target:
+            composer.placeholder = (
+                "click a channel to chat  ·  /to @0 for public channel"
+            )
+        else:
+            composer.placeholder = "Type a message or /help ..."
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         # The dedicated search box drives the history palette; Enter just keeps
         # the results (selection opens a thread). Route it before view logic.
@@ -8447,6 +8635,8 @@ class RadioTUI(App):
             self._handle_roster_command(arg)
         elif cmd in ("/subs", "/subscriptions"):
             self._handle_subs_command(arg)
+        elif cmd in ("/groups", "/group"):
+            self._handle_groups_command(arg)
         elif cmd in ("/position", "/pos", "/grid"):
             self._handle_position_command(arg)
         elif cmd == "/start":
