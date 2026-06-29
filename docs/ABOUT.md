@@ -12,13 +12,13 @@ of glass* for radio comms.
 
 | Layer | Technology |
 |---|---|
-| Application code (~12k lines) | **Python 3.10+**, fully type-hinted, async (`asyncio`) |
+| Application code (~15k lines) | **Python 3.10+**, fully type-hinted, async (`asyncio`) |
 | TUI | **Textual** (optional extra) |
 | Config | **TOML** (`tomllib` reads, `tomli-w` writes — the only hard dependency) |
 | Persistence | **SQLite** (stdlib `sqlite3`) |
 | Reticulum transport | `rns` + `lxmf` (optional extra) |
 | MeshCore transport | `meshcore` companion library (optional extra) |
-| Tests | `pytest` (834) · `ruff` · `mypy` |
+| Tests | `pytest` (867) · `ruff` · `mypy` |
 | Interop targets vendored for reference (not built or shipped) | **Pat** = Go |
 
 The app's own code is **100% Python**. The Go (`pat/`) tree is the external
