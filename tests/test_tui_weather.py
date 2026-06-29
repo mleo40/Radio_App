@@ -379,7 +379,10 @@ def test_wx_setup_screen_both(config_path):
             await pilot.pause()
             app.screen.query_one("#wxsetup-both").press()
             await pilot.pause()
-            assert picked.get("result") == {"meshcore": True, "reticulum": True}
+            r = picked.get("result") or {}
+            assert r.get("meshcore") is True
+            assert r.get("reticulum") is True
+            assert "grids" in r
 
     asyncio.run(run())
 

@@ -1079,41 +1079,65 @@ class WXSetupScreen(ModalScreen[dict | None]):
     """
     BINDINGS = [("escape", "cancel", "Cancel")]
 
-    def __init__(self, has_meshcore: bool = False, has_reticulum: bool = False) -> None:
+    def __init__(
+        self,
+        has_meshcore: bool = False,
+        has_reticulum: bool = False,
+        current_grids: str = "",
+    ) -> None:
         super().__init__()
         self._has_mc = has_meshcore
         self._has_rns = has_reticulum
+        self._current_grids = current_grids
 
     def compose(self) -> ComposeResult:
-        mc_note = " (MeshCore not active — will configure for when it starts)" if not self._has_mc else ""
-        rns_note = " (Reticulum not active — will configure for when it starts)" if not self._has_rns else ""
+        mc_note = "" if self._has_mc else " [dim](applies when MeshCore connects)[/dim]"
+        rns_note = "" if self._has_rns else " [dim](applies when Reticulum connects)[/dim]"
         with Vertical(id="wxsetup-box"):
-            yield Static("[b]⛅ Weather Setup — Passive Sources[/b]", id="wxsetup-title")
+            yield Static("[b]⛅ Weather Setup[/b]", id="wxsetup-title")
             yield Static(
-                "These transports can receive weather passively (no transmission):\n\n"
+                "Grid squares for the WX picker (comma-separated):",
+                id="wxsetup-grids-l",
+            )
+            yield Input(
+                value=self._current_grids,
+                placeholder="e.g. FN42, FN31, EM50",
+                id="wxsetup-grids",
+            )
+            yield Static(
+                f"\n[b]Passive radio sources[/b]\n\n"
                 f"[b]MeshCore #weather channel[/b]{mc_note}\n"
-                "  Receives weather posts from other mesh nodes that share conditions.\n\n"
+                "  Receives weather from nearby mesh nodes automatically.\n\n"
                 f"[b]Reticulum #weather and #nws_alerts groups[/b]{rns_note}\n"
-                "  Subscribes to weather relays on the Reticulum mesh.\n\n"
-                "Add these now so weather data appears automatically in the WX view?",
+                "  Joins weather relay groups on the Reticulum mesh.",
                 id="wxsetup-body",
             )
             with Horizontal(id="wxsetup-btns"):
-                yield Button("Skip", id="wxsetup-skip")
-                yield Button("MeshCore only", id="wxsetup-mc", variant="default")
-                yield Button("Reticulum only", id="wxsetup-rns", variant="default")
-                yield Button("Add both", id="wxsetup-both", variant="primary")
+                yield Button("Cancel", id="wxsetup-skip")
+                yield Button("Grids only", id="wxsetup-grids-only", variant="default")
+                yield Button("+ MC", id="wxsetup-mc", variant="default")
+                yield Button("+ RNS", id="wxsetup-rns", variant="default")
+                yield Button("Save all", id="wxsetup-both", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#wxsetup-grids", Input).focus()
+
+    def _build_result(self, mc: bool, rns: bool) -> dict:
+        grids = self.query_one("#wxsetup-grids", Input).value.strip()
+        return {"meshcore": mc, "reticulum": rns, "grids": grids}
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
         if bid == "wxsetup-skip":
             self.dismiss(None)
+        elif bid == "wxsetup-grids-only":
+            self.dismiss(self._build_result(False, False))
         elif bid == "wxsetup-mc":
-            self.dismiss({"meshcore": True, "reticulum": False})
+            self.dismiss(self._build_result(True, False))
         elif bid == "wxsetup-rns":
-            self.dismiss({"meshcore": False, "reticulum": True})
+            self.dismiss(self._build_result(False, True))
         elif bid == "wxsetup-both":
-            self.dismiss({"meshcore": True, "reticulum": True})
+            self.dismiss(self._build_result(True, True))
 
     def action_cancel(self) -> None:
         self.dismiss(None)
@@ -1310,6 +1334,8 @@ class RadioTUI(App):
     #weather-view { height: 1fr; }
     #wx-bar { height: 1; }
     #wx-grid-label { height: 1; width: auto; color: $accent; padding: 0 1 0 0; }
+    #wx-grid-prev { height: 1; min-width: 3; border: none; margin: 0; }
+    #wx-grid-next { height: 1; min-width: 3; border: none; margin: 0 1 0 0; }
     #wx-grid { width: 8; border: none; height: 1; }
     #wx-spacer { width: 1fr; height: 1; }
     #wx-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
@@ -1514,6 +1540,10 @@ class RadioTUI(App):
         self._cmd_hist_pos: dict[str, int] = {}   # -1 = not browsing
         self._cmd_hist_draft: dict[str, str] = {} # saved partial input while browsing
         self._cmd_hist_limit: int = 100
+        # Weather surface: saved grid squares for the picker (loaded from config
+        # on first _show_weather() call) and the active index.
+        self._wx_grids: list[str] = []
+        self._wx_grid_idx: int = 0
 
     # -- layout ---------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -1700,17 +1730,18 @@ class RadioTUI(App):
             with Vertical(id="weather-view"):
                 with Horizontal(id="wx-bar"):
                     yield Static("⛅", id="wx-grid-label")
+                    yield Button("◀", id="wx-grid-prev", classes="modebtn")
                     yield Input(value="", id="wx-grid", placeholder="FN31")
+                    yield Button("▶", id="wx-grid-next", classes="modebtn")
                     yield Static("", id="wx-spacer")
                     yield Button("All", id="wx-filter-all", classes="modebtn")
-                    yield Button("🌐", id="wx-filter-net", classes="modebtn")
+                    yield Button("Inet", id="wx-filter-net", classes="modebtn")
                     yield Button("JS8", id="wx-filter-js8", classes="modebtn")
                     yield Button("WL", id="wx-filter-wl", classes="modebtn")
                     yield Button("RNS", id="wx-filter-rns", classes="modebtn")
                     yield Button("MC", id="wx-filter-mc", classes="modebtn")
-                    yield Button("🌐 Online", id="wx-online", classes="modebtn")
-                    yield Button("⛅ Query", id="wx-query", classes="modebtn")
-                    yield Button("📭 Scan", id="wx-scan", classes="modebtn")
+                    yield Button("🌐 Fetch", id="wx-online", classes="modebtn")
+                    yield Button("📡 JS8", id="wx-query", classes="modebtn")
                     yield Button("📧 Subscribe", id="wx-subscribe", classes="modebtn")
                     yield Button("⚙ Setup", id="wx-setup", classes="modebtn")
                 yield RichLog(
@@ -2629,6 +2660,10 @@ class RadioTUI(App):
             self._show_net()
         elif bid == "view-weather":
             self._show_weather()
+        elif bid == "wx-grid-prev":
+            self._wx_cycle_grid(-1)
+        elif bid == "wx-grid-next":
+            self._wx_cycle_grid(1)
         elif bid == "wx-filter-all":
             self._render_weather(transport_filter=None)
         elif bid == "wx-filter-net":
@@ -2645,8 +2680,6 @@ class RadioTUI(App):
             self._wx_fetch_internet()
         elif bid == "wx-query":
             self._wx_js8_query()
-        elif bid == "wx-scan":
-            self._wx_winlink_scan()
         elif bid == "wx-subscribe":
             self._wx_subscribe_guide()
         elif bid == "wx-setup":
@@ -4104,19 +4137,58 @@ class RadioTUI(App):
         "meshcore":   "[magenta][MC][/magenta]",
     }
 
+    def _wx_load_grids(self) -> None:
+        """Load the saved grid list from config and sync the picker input."""
+        if self.core is None:
+            return
+        raw = str(self.core.config.ui.get("wx_grids", "") or "")
+        grids = [g.strip().upper() for g in raw.split(",") if g.strip()]
+        # Fall back to station grid_square if nothing saved.
+        if not grids:
+            st = getattr(self.core, "station", None)
+            gs = getattr(st, "grid_square", None) or ""
+            if gs:
+                grids = [gs.upper()]
+        self._wx_grids = grids
+        self._wx_grid_idx = min(self._wx_grid_idx, max(0, len(grids) - 1))
+        self._wx_sync_grid_input()
+
+    def _wx_sync_grid_input(self) -> None:
+        """Update the grid Input to show the current picker grid."""
+        try:
+            inp = self.query_one("#wx-grid", Input)
+            if self._wx_grids:
+                grid = self._wx_grids[self._wx_grid_idx]
+                total = len(self._wx_grids)
+                inp.value = grid
+                inp.placeholder = grid
+                # Show position hint in the prev/next buttons when >1 grid.
+                try:
+                    self.query_one("#wx-grid-prev", Button).disabled = total <= 1
+                    self.query_one("#wx-grid-next", Button).disabled = total <= 1
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _wx_cycle_grid(self, direction: int) -> None:
+        """Cycle to the previous (direction=-1) or next (direction=+1) saved grid."""
+        if not self._wx_grids:
+            return
+        self._wx_grid_idx = (self._wx_grid_idx + direction) % len(self._wx_grids)
+        self._wx_sync_grid_input()
+
     def _show_weather(self) -> None:
         """Show the Weather (WX) surface."""
         self.view = "weather"
         self.query_one("#main", ContentSwitcher).current = "weather-view"
         self._enable_composer(False)
-        # Pre-fill grid from station config if the input is still blank.
+        self._wx_load_grids()
+        # If still no grid in the input, fall back to a blank placeholder.
         try:
-            grid_inp = self.query_one("#wx-grid", Input)
-            if not grid_inp.value and self.core is not None:
-                st = getattr(self.core, "station", None)
-                gs = getattr(st, "grid_square", None) or ""
-                if gs:
-                    grid_inp.value = gs.upper()
+            inp = self.query_one("#wx-grid", Input)
+            if not inp.value:
+                inp.placeholder = "FN31"
         except Exception:  # noqa: BLE001
             pass
         self._render_weather()
@@ -4138,8 +4210,9 @@ class RadioTUI(App):
         if not msgs:
             wx_log.write(
                 "[dim]No weather data yet. "
-                "Try '🌐 Online' for internet forecast, '⛅ Query' for JS8/APRS, "
-                "'📭 Scan' for Winlink bulletins, or wait for passive RNS/MC data.[/dim]"
+                "Try '🌐 Fetch' for internet forecast, '📡 JS8' to query via radio, "
+                "or connect Winlink to download NWS bulletins. "
+                "RNS/MC weather arrives automatically when connected.[/dim]"
             )
             return
         for msg in msgs:
@@ -4284,59 +4357,121 @@ class RadioTUI(App):
 
     @work
     async def _wx_run_setup(self) -> None:
-        """Ask the user whether to add MeshCore #weather and Reticulum #weather groups."""
+        """Ask whether to add MeshCore #weather channel and Reticulum #weather groups."""
         if self.core is None:
             return
         from ..transports.meshcore_transport import MeshCoreTransport
         from ..transports.reticulum_transport import ReticulumTransport
         has_mc = any(isinstance(t, MeshCoreTransport) for t in self.core.transports)
         has_rns = any(isinstance(t, ReticulumTransport) for t in self.core.transports)
+        current_grids = str(self.core.config.ui.get("wx_grids", "") or "")
         result = await self.push_screen_wait(
-            WXSetupScreen(has_meshcore=has_mc, has_reticulum=has_rns)
+            WXSetupScreen(
+                has_meshcore=has_mc,
+                has_reticulum=has_rns,
+                current_grids=current_grids,
+            )
         )
         if result is None:
             return
-        cfg = self.core.config
+
+        # Save grid squares to config and reload the picker.
+        grids_str = result.get("grids", "").strip()
+        if grids_str:
+            ui = dict(self.core.config.ui)
+            ui["wx_grids"] = grids_str
+            self.core.config.data["ui"] = ui
+            try:
+                self.core.config.save()
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"Could not save WX grids: {exc}")
+            self._wx_load_grids()
+            n = len([g for g in grids_str.split(",") if g.strip()])
+            self._log_system(f"Saved {n} grid square(s) for WX picker.")
 
         if result.get("meshcore"):
-            mc = next(
-                (t for t in self.core.transports if isinstance(t, MeshCoreTransport)),
-                None,
-            )
-            if mc is not None:
+            t = self._meshcore_transport()
+            if t is not None and hasattr(t, "channels"):
                 try:
-                    t = await mc._get_transport()  # type: ignore[attr-defined]
-                    t.name_channel(mc._wx_channel_index(), "#weather")
-                    await t.create_channel(mc._wx_channel_index(), "#weather")
-                    mc._persist_meshcore_channels(t)
-                    self._log_system("Added MeshCore #weather channel.")
+                    # Find the first free slot above the public channel (index 0).
+                    used = {ch["index"] for ch in t.channels()}
+                    max_ch = getattr(t, "MAX_CHANNELS", 8)
+                    idx = next(
+                        (i for i in range(1, max_ch) if i not in used), None
+                    )
+                    if idx is None:
+                        self._log_system(
+                            "MeshCore: all channel slots used — remove one first "
+                            "with /channel rm <index>."
+                        )
+                    else:
+                        # Check if #weather already configured.
+                        existing = [
+                            ch for ch in t.channels()
+                            if ch.get("name", "").lower() == "weather"
+                        ]
+                        if existing:
+                            self._log_system(
+                                f"MeshCore #weather already at @{existing[0]['index']}."
+                            )
+                        else:
+                            t.name_channel(idx, "#weather")
+                            self._persist_meshcore_channels(t)
+                            if t.running:
+                                ok = await t.create_channel(idx, "#weather", None)
+                                if ok:
+                                    self._log_system(
+                                        f"Added MeshCore #weather at channel @{idx}."
+                                    )
+                                else:
+                                    self._log_system(
+                                        f"MeshCore #weather saved (@{idx}) but "
+                                        "device update failed — reconnect to apply."
+                                    )
+                            else:
+                                self._log_system(
+                                    f"MeshCore #weather saved (@{idx}); "
+                                    "will be created when MeshCore connects."
+                                )
+                            self._refresh_threads()
                 except Exception as exc:  # noqa: BLE001
                     self._log_system(f"MeshCore channel setup failed: {exc}")
             else:
                 self._log_system(
-                    "MeshCore not running; #weather will be added when it starts."
+                    "MeshCore not configured — add it to config first."
                 )
 
         if result.get("reticulum"):
-            rns = next(
-                (t for t in self.core.transports if isinstance(t, ReticulumTransport)),
-                None,
-            )
-            if rns is not None:
-                try:
-                    registry = rns._group_registry  # type: ignore[attr-defined]
-                    registry.ensure_group("weather")
-                    registry.add_tag("weather", "weather")
-                    registry.ensure_group("nws_alerts")
-                    registry.add_tag("nws_alerts", "weather")
-                    registry.save(cfg)
-                    self._log_system("Added Reticulum #weather and #nws_alerts groups.")
-                except Exception as exc:  # noqa: BLE001
-                    self._log_system(f"Reticulum group setup failed: {exc}")
-            else:
-                self._log_system(
-                    "Reticulum not running; groups will be added when it starts."
-                )
+            try:
+                gr = self.core.groups
+                added = []
+                for gname in ("weather", "nws_alerts"):
+                    g = gr.ensure_group(gname)
+                    changed = False
+                    if "reticulum" not in g.transports:
+                        g.transports.append("reticulum")
+                        gr._dirty = True  # noqa: SLF001
+                        changed = True
+                    if "weather" not in g.tags:
+                        gr.add_tag(gname, "weather")
+                        changed = True
+                    if changed:
+                        added.append(f"#{gname}")
+                if added:
+                    gr.save(self.core.config)
+                    # Re-push updated group list to running transports so they
+                    # join the new groups without a restart.
+                    self.core._apply_station_identity()  # noqa: SLF001
+                    self._log_system(
+                        f"Added Reticulum groups: {', '.join(added)}. "
+                        "They appear in the RNS mode contacts panel."
+                    )
+                else:
+                    self._log_system(
+                        "Reticulum #weather and #nws_alerts already configured."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"Reticulum group setup failed: {exc}")
 
     # -- favorites (continued) -------------------------------------------------
 
