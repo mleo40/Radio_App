@@ -343,6 +343,7 @@ class MessageStore:
         until: datetime | None = None,
         status: str | None = None,
         snr_min: float | None = None,
+        kind: str | None = None,
         limit: int = 200,
         newest_first: bool = True,
     ) -> list[UnifiedMessage]:
@@ -391,6 +392,9 @@ class MessageStore:
         if snr_min is not None:
             clauses.append("CAST(json_extract(metadata, '$.snr') AS REAL) >= ?")
             params.append(snr_min)
+        if kind is not None:
+            clauses.append("json_extract(metadata, '$.kind') = ?")
+            params.append(kind)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, limit))
         rows = self._conn.execute(

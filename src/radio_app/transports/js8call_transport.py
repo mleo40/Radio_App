@@ -77,6 +77,11 @@ SMS_GATEWAY_CALLSIGN = "SMSGTE"
 # gateway address + phone + text don't get silently truncated on the air.
 _SMS_MAX_TEXT = 60
 _PHONE_RE = re.compile(r"[^\d+]")
+# Weather reply detection: APRS NWS forecasts typically include these patterns.
+_JS8_WX_RE = re.compile(
+    r"Tonight:|Today:|Tomorrow:|°F|°C|NWS\s+\w{4}|mph\s+wind|FORECAST",
+    re.IGNORECASE,
+)
 
 
 def _aprs_addressee(callsign: str) -> str:
@@ -233,6 +238,9 @@ def message_from_event(
     # Recognise JS8 directed commands (SNR?/SNR/GRID?/...) and parse their value.
     _cmd, extra = _extract_command(params, text)
     metadata.update(extra)
+    # Stamp weather replies from the APRS gateway.
+    if sender == JS8_APRS_GATEWAY or _JS8_WX_RE.search(text):
+        metadata["kind"] = "weather_bulletin"
 
     msg = UnifiedMessage(
         sender=sender or "UNKNOWN",
@@ -644,6 +652,16 @@ class JS8CallTransport(Transport):
         if not grid or not self._running:
             return False
         return await self._send_api({"type": "STATION.SET_GRID", "value": grid})
+
+    async def send_wx_query(self, grid: str) -> bool:
+        """Send an NWS weather query via the JS8Call APRS gateway.
+
+        The APRS NWS gateway replies with a short forecast for the 4-char grid
+        square. The response arrives as a normal directed message from @APRSIS
+        and will be stamped as kind=weather_bulletin by message_from_event().
+        """
+        grid4 = grid[:4].upper()
+        return await self.send_directed(JS8_APRS_GATEWAY, f"NWS {grid4}")
 
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:

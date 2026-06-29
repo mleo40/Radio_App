@@ -70,6 +70,8 @@ from ..core.message import AddressType, DeliveryStatus, UnifiedMessage
 from ..core.micron import parse_address, render_micron
 from ..core.station import Station
 from ..transports.base import ReachabilityStatus, Transport
+from ..core.maidenhead import grid_to_latlon
+from ..core.wx_internet import fetch_weather
 from ..transports.js8call_transport import (
     JS8_BAND_DIAL_HZ,
     band_for_freq,
@@ -93,6 +95,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
     "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
+    "/wx [grid], "
     "/help, /quit"
 )
 
@@ -999,6 +1002,123 @@ class WinlinkEmailComposeScreen(ModalScreen["dict | None"]):
         self.dismiss(None)
 
 
+class WinlinkWXSubscribeScreen(ModalScreen[bool]):
+    """Instructions for subscribing to NWS bulletins via Winlink.
+
+    Dismisses with True if the user wants to open the compose modal to send
+    the subscription request, False otherwise.
+    """
+
+    CSS = """
+    WinlinkWXSubscribeScreen { align: center middle; }
+    #wxsub-box {
+        width: 76; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #wxsub-title  { height: auto; margin-bottom: 1; }
+    #wxsub-body   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #wxsub-hint   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #wxsub-btns   { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, grid: str = "") -> None:
+        super().__init__()
+        self._grid = grid.upper()[:6] if grid else ""
+
+    def compose(self) -> ComposeResult:
+        grid_hint = f" for grid {self._grid}" if self._grid else ""
+        with Vertical(id="wxsub-box"):
+            yield Static("[b]⛅ Subscribe to NWS Bulletins via Winlink[/b]", id="wxsub-title")
+            yield Static(
+                f"NWS distributes official weather bulletins to licensed amateur stations "
+                f"via Winlink. To receive forecasts{grid_hint}, send a subscription request "
+                f"to the NWS Winlink gateway:\n\n"
+                f"  [b]To:[/b] NWS\n"
+                f"  [b]Subject:[/b] SUBSCRIBE{' ' + self._grid[:4] if self._grid else ''}\n"
+                f"  [b]Body:[/b] (leave blank)\n\n"
+                f"Bulletins will arrive in your Winlink inbox during any connect session. "
+                f"They are automatically tagged as weather data in this app.",
+                id="wxsub-body",
+            )
+            yield Static(
+                "[dim]Press 'Open Compose' to pre-fill the request, or Esc to cancel.[/dim]",
+                id="wxsub-hint",
+            )
+            with Horizontal(id="wxsub-btns"):
+                yield Button("Cancel", id="wxsub-cancel")
+                yield Button("Open Compose →", id="wxsub-open", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "wxsub-open":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class WXSetupScreen(ModalScreen[dict | None]):
+    """Wizard that asks whether to add MeshCore #weather channel and
+    Reticulum #weather / #nws_alerts groups for passive weather reception.
+
+    Returns ``{"meshcore": bool, "reticulum": bool}`` on confirm, or ``None``
+    on cancel.
+    """
+
+    CSS = """
+    WXSetupScreen { align: center middle; }
+    #wxsetup-box {
+        width: 72; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #wxsetup-title  { height: auto; margin-bottom: 1; }
+    #wxsetup-body   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #wxsetup-btns   { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, has_meshcore: bool = False, has_reticulum: bool = False) -> None:
+        super().__init__()
+        self._has_mc = has_meshcore
+        self._has_rns = has_reticulum
+
+    def compose(self) -> ComposeResult:
+        mc_note = " (MeshCore not active — will configure for when it starts)" if not self._has_mc else ""
+        rns_note = " (Reticulum not active — will configure for when it starts)" if not self._has_rns else ""
+        with Vertical(id="wxsetup-box"):
+            yield Static("[b]⛅ Weather Setup — Passive Sources[/b]", id="wxsetup-title")
+            yield Static(
+                "These transports can receive weather passively (no transmission):\n\n"
+                f"[b]MeshCore #weather channel[/b]{mc_note}\n"
+                "  Receives weather posts from other mesh nodes that share conditions.\n\n"
+                f"[b]Reticulum #weather and #nws_alerts groups[/b]{rns_note}\n"
+                "  Subscribes to weather relays on the Reticulum mesh.\n\n"
+                "Add these now so weather data appears automatically in the WX view?",
+                id="wxsetup-body",
+            )
+            with Horizontal(id="wxsetup-btns"):
+                yield Button("Skip", id="wxsetup-skip")
+                yield Button("MeshCore only", id="wxsetup-mc", variant="default")
+                yield Button("Reticulum only", id="wxsetup-rns", variant="default")
+                yield Button("Add both", id="wxsetup-both", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "wxsetup-skip":
+            self.dismiss(None)
+        elif bid == "wxsetup-mc":
+            self.dismiss({"meshcore": True, "reticulum": False})
+        elif bid == "wxsetup-rns":
+            self.dismiss({"meshcore": False, "reticulum": True})
+        elif bid == "wxsetup-both":
+            self.dismiss({"meshcore": True, "reticulum": True})
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
 class AboutScreen(ModalScreen[None]):
     """Hidden "about" easter egg: a scrollable technical overview of the app.
 
@@ -1187,6 +1307,13 @@ class RadioTUI(App):
     #net-spacer { width: 1fr; height: 1; }
     #net-bar Button { height: 1; min-width: 8; border: none; margin: 0 1 0 0; }
     #net-log { height: 1fr; padding: 0 1; }
+    #weather-view { height: 1fr; }
+    #wx-bar { height: 1; }
+    #wx-grid-label { height: 1; width: auto; color: $accent; padding: 0 1 0 0; }
+    #wx-grid { width: 8; border: none; height: 1; }
+    #wx-spacer { width: 1fr; height: 1; }
+    #wx-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #wx-log { height: 1fr; padding: 0 1; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -1570,6 +1697,25 @@ class RadioTUI(App):
                 yield RichLog(
                     id="net-log", wrap=True, markup=True, highlight=False
                 )
+            with Vertical(id="weather-view"):
+                with Horizontal(id="wx-bar"):
+                    yield Static("⛅", id="wx-grid-label")
+                    yield Input(value="", id="wx-grid", placeholder="FN31")
+                    yield Static("", id="wx-spacer")
+                    yield Button("All", id="wx-filter-all", classes="modebtn")
+                    yield Button("🌐", id="wx-filter-net", classes="modebtn")
+                    yield Button("JS8", id="wx-filter-js8", classes="modebtn")
+                    yield Button("WL", id="wx-filter-wl", classes="modebtn")
+                    yield Button("RNS", id="wx-filter-rns", classes="modebtn")
+                    yield Button("MC", id="wx-filter-mc", classes="modebtn")
+                    yield Button("🌐 Online", id="wx-online", classes="modebtn")
+                    yield Button("⛅ Query", id="wx-query", classes="modebtn")
+                    yield Button("📭 Scan", id="wx-scan", classes="modebtn")
+                    yield Button("📧 Subscribe", id="wx-subscribe", classes="modebtn")
+                    yield Button("⚙ Setup", id="wx-setup", classes="modebtn")
+                yield RichLog(
+                    id="wx-log", wrap=True, markup=True, highlight=False
+                )
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
         yield Footer()
@@ -1802,6 +1948,11 @@ class RadioTUI(App):
             self._update_status()
             if self.view == "health":
                 self._render_health()
+            return
+        # Weather bulletins: append to WX feed when the view is active.
+        if msg.metadata.get("kind") == "weather_bulletin":
+            if self.view == "weather":
+                self._render_weather()
             return
         # Delivery receipts (e.g. LXMF) annotate a previously-sent message with a
         # delivered/failed indicator; they are not conversations.
@@ -2476,6 +2627,30 @@ class RadioTUI(App):
             self.action_archive()
         elif bid == "view-net":
             self._show_net()
+        elif bid == "view-weather":
+            self._show_weather()
+        elif bid == "wx-filter-all":
+            self._render_weather(transport_filter=None)
+        elif bid == "wx-filter-net":
+            self._render_weather(transport_filter="internet")
+        elif bid == "wx-filter-js8":
+            self._render_weather(transport_filter="js8call")
+        elif bid == "wx-filter-wl":
+            self._render_weather(transport_filter="winlink")
+        elif bid == "wx-filter-rns":
+            self._render_weather(transport_filter="reticulum")
+        elif bid == "wx-filter-mc":
+            self._render_weather(transport_filter="meshcore")
+        elif bid == "wx-online":
+            self._wx_fetch_internet()
+        elif bid == "wx-query":
+            self._wx_js8_query()
+        elif bid == "wx-scan":
+            self._wx_winlink_scan()
+        elif bid == "wx-subscribe":
+            self._wx_subscribe_guide()
+        elif bid == "wx-setup":
+            self._wx_run_setup()
         elif bid == "archive-mode":
             self._cycle_archive_filter()
         elif bid == "archive-refresh":
@@ -2602,7 +2777,7 @@ class RadioTUI(App):
         Stream, then advances Stream -> Health -> History -> Favorites -> Logs
         -> Stream.
         """
-        order = ["monitor", "health", "archive", "favorites", "net", "logs"]
+        order = ["monitor", "health", "archive", "favorites", "net", "weather", "logs"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -2617,6 +2792,8 @@ class RadioTUI(App):
             self._show_archive()
         elif nxt == "net":
             self._show_net()
+        elif nxt == "weather":
+            self._show_weather()
         else:
             self._show_favorites()
 
@@ -3911,6 +4088,252 @@ class RadioTUI(App):
                 "/net list · /net close · /net status · /net sessions"
             )
 
+    # -- weather surface -------------------------------------------------------
+
+    # Source badge colours and labels.
+    _WX_BADGE: dict[str, str] = {
+        "internet":   "[cyan][🌐][/cyan]",
+        "js8call":    "[yellow][JS8][/yellow]",
+        "winlink":    "[blue][WL][/blue]",
+        "reticulum":  "[green][RNS][/green]",
+        "meshcore":   "[magenta][MC][/magenta]",
+    }
+
+    def _show_weather(self) -> None:
+        """Show the Weather (WX) surface."""
+        self.view = "weather"
+        self.query_one("#main", ContentSwitcher).current = "weather-view"
+        self._enable_composer(False)
+        # Pre-fill grid from station config if the input is still blank.
+        try:
+            grid_inp = self.query_one("#wx-grid", Input)
+            if not grid_inp.value and self.core is not None:
+                st = getattr(self.core, "station", None)
+                gs = getattr(st, "grid_square", None) or ""
+                if gs:
+                    grid_inp.value = gs.upper()
+        except Exception:  # noqa: BLE001
+            pass
+        self._render_weather()
+        self._update_modebar()
+        self._update_status()
+
+    def _render_weather(self, transport_filter: str | None = None) -> None:
+        """Redraw the WX feed from the store, optionally filtered by transport."""
+        if self.core is None:
+            return
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+        except Exception:  # noqa: BLE001
+            return
+        wx_log.clear()
+        msgs = self.core.store.query(kind="weather_bulletin", limit=200, newest_first=True)
+        if transport_filter:
+            msgs = [m for m in msgs if m.transport == transport_filter]
+        if not msgs:
+            wx_log.write(
+                "[dim]No weather data yet. "
+                "Try '🌐 Online' for internet forecast, '⛅ Query' for JS8/APRS, "
+                "'📭 Scan' for Winlink bulletins, or wait for passive RNS/MC data.[/dim]"
+            )
+            return
+        for msg in msgs:
+            transport = msg.transport or "?"
+            badge = self._WX_BADGE.get(transport, f"[dim][{transport[:3].upper()}][/dim]")
+            ts = msg.timestamp.strftime("%m-%d %H:%MZ") if msg.timestamp else "??"
+            subject = msg.metadata.get("subject") or ""
+            nws_office = msg.metadata.get("nws_office", "")
+            source_label = nws_office or (msg.sender or "")
+            header = f"{badge} [dim]{ts}[/dim]  "
+            if subject:
+                header += f"[b]{subject}[/b]"
+                if source_label:
+                    header += f"  [dim]· {source_label}[/dim]"
+            elif source_label:
+                header += f"[dim]{source_label}[/dim]"
+            wx_log.write(header)
+            body = (msg.content or "").strip()
+            if body:
+                for line in body.splitlines()[:8]:
+                    wx_log.write(f"    {line}")
+            wx_log.write("")
+
+    @work
+    async def _wx_fetch_internet(self) -> None:
+        """Fetch a weather forecast from NWS or Open-Meteo for the current grid."""
+        if self.core is None:
+            return
+        try:
+            grid_inp = self.query_one("#wx-grid", Input)
+            grid = grid_inp.value.strip().upper() or "FN31"
+        except Exception:  # noqa: BLE001
+            grid = "FN31"
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+            wx_log.write(f"[dim]Fetching internet weather for {grid}…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            lat, lon = grid_to_latlon(grid)
+            text, source = await fetch_weather(lat, lon)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"WX internet fetch failed: {exc}")
+            try:
+                self.query_one("#wx-log", RichLog).write(
+                    f"[red]Internet weather unavailable: {exc}[/red]"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Store as a transient UnifiedMessage so it appears in the feed.
+        from ..core.message import UnifiedMessage as _UM
+        import datetime as _dt
+        msg = _UM(
+            id=f"wx-inet-{grid}-{int(_dt.datetime.now(_dt.timezone.utc).timestamp())}",
+            transport="internet",
+            sender="NWS/Open-Meteo",
+            recipient=None,
+            content=text,
+            timestamp=_dt.datetime.now(_dt.timezone.utc),
+            metadata={
+                "kind": "weather_bulletin",
+                "subject": f"Internet WX {grid} ({source})",
+                "grid": grid,
+                "source": source,
+            },
+        )
+        self.core.store.save(msg)
+        self._render_weather()
+
+    @work
+    async def _wx_js8_query(self) -> None:
+        """Send a JS8Call weather query to the APRS gateway (@APRSIS NWS <grid>)."""
+        if self.core is None:
+            return
+        try:
+            grid = self.query_one("#wx-grid", Input).value.strip().upper() or "FN31"
+        except Exception:  # noqa: BLE001
+            grid = "FN31"
+        from ..transports.js8call_transport import JS8CallTransport
+        js8 = next(
+            (t for t in self.core.transports if isinstance(t, JS8CallTransport)),
+            None,
+        )
+        if js8 is None:
+            self._log_system("JS8Call transport not active — cannot query APRS WX.")
+            return
+        self._log_system(f"Querying @APRSIS for NWS WX forecast for {grid[:4]}…")
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+            wx_log.write(
+                f"[dim]⛅ JS8/APRS query sent for {grid[:4]}. "
+                "Reply will appear when received.[/dim]"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+        ok = await js8.send_wx_query(grid)
+        if not ok:
+            self._log_system("JS8Call WX query failed — is JS8Call running?")
+
+    @work
+    async def _wx_winlink_scan(self) -> None:
+        """Scan the store for Winlink weather bulletins and refresh the feed."""
+        if self.core is None:
+            return
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+            wx_log.write("[dim]Scanning Winlink inbox for NWS bulletins…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        # The store query with kind= already covers stamped messages; just render.
+        self._render_weather(transport_filter="winlink")
+
+    @work
+    async def _wx_subscribe_guide(self) -> None:
+        """Show the Winlink NWS subscription guide and optionally open compose."""
+        try:
+            grid = self.query_one("#wx-grid", Input).value.strip().upper()
+        except Exception:  # noqa: BLE001
+            grid = ""
+        result = await self.push_screen_wait(WinlinkWXSubscribeScreen(grid=grid))
+        if result:
+            # Pre-fill compose with the subscription request.
+            grid4 = grid[:4] if grid else ""
+            subj = f"SUBSCRIBE {grid4}".strip()
+            await self.push_screen_wait(
+                WinlinkEmailComposeScreen(
+                    subject=subj,
+                    callsign=self._my_callsign(),
+                )
+            )
+
+    def _my_callsign(self) -> str:
+        """Return the operator's callsign from config."""
+        if self.core is None:
+            return ""
+        st = getattr(self.core, "station", None)
+        if st is not None:
+            cs = getattr(st, "callsign", None) or ""
+            if cs:
+                return str(cs)
+        return str(self.core.config.station.get("callsign", "") or "")
+
+    @work
+    async def _wx_run_setup(self) -> None:
+        """Ask the user whether to add MeshCore #weather and Reticulum #weather groups."""
+        if self.core is None:
+            return
+        from ..transports.meshcore_transport import MeshCoreTransport
+        from ..transports.reticulum_transport import ReticulumTransport
+        has_mc = any(isinstance(t, MeshCoreTransport) for t in self.core.transports)
+        has_rns = any(isinstance(t, ReticulumTransport) for t in self.core.transports)
+        result = await self.push_screen_wait(
+            WXSetupScreen(has_meshcore=has_mc, has_reticulum=has_rns)
+        )
+        if result is None:
+            return
+        cfg = self.core.config
+
+        if result.get("meshcore"):
+            mc = next(
+                (t for t in self.core.transports if isinstance(t, MeshCoreTransport)),
+                None,
+            )
+            if mc is not None:
+                try:
+                    t = await mc._get_transport()  # type: ignore[attr-defined]
+                    t.name_channel(mc._wx_channel_index(), "#weather")
+                    await t.create_channel(mc._wx_channel_index(), "#weather")
+                    mc._persist_meshcore_channels(t)
+                    self._log_system("Added MeshCore #weather channel.")
+                except Exception as exc:  # noqa: BLE001
+                    self._log_system(f"MeshCore channel setup failed: {exc}")
+            else:
+                self._log_system(
+                    "MeshCore not running; #weather will be added when it starts."
+                )
+
+        if result.get("reticulum"):
+            rns = next(
+                (t for t in self.core.transports if isinstance(t, ReticulumTransport)),
+                None,
+            )
+            if rns is not None:
+                try:
+                    registry = rns._group_registry  # type: ignore[attr-defined]
+                    registry.ensure_group("weather")
+                    registry.add_tag("weather", "weather")
+                    registry.ensure_group("nws_alerts")
+                    registry.add_tag("nws_alerts", "weather")
+                    registry.save(cfg)
+                    self._log_system("Added Reticulum #weather and #nws_alerts groups.")
+                except Exception as exc:  # noqa: BLE001
+                    self._log_system(f"Reticulum group setup failed: {exc}")
+            else:
+                self._log_system(
+                    "Reticulum not running; groups will be added when it starts."
+                )
+
     # -- favorites (continued) -------------------------------------------------
 
     def _favorite_kind(self, fav: Favorite) -> str:
@@ -4444,6 +4867,8 @@ class RadioTUI(App):
                 btn.set_class(self.view == "favorites", "-active")
             elif bid == "view-net":
                 btn.set_class(self.view == "net", "-active")
+            elif bid == "view-weather":
+                btn.set_class(self.view == "weather", "-active")
         self._update_input_indicator()
         self._update_mesh_bar()
         self._update_js8_bar()
@@ -5309,6 +5734,7 @@ class RadioTUI(App):
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
         bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
+        bar.mount(Button("\u26c5 WX", id="view-weather", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
     def _health_dot(self, name: str) -> str:
@@ -6877,6 +7303,14 @@ class RadioTUI(App):
             self._handle_start_command(arg)
         elif cmd == "/net":
             self._handle_net_command(arg)
+        elif cmd == "/wx":
+            if arg:
+                try:
+                    self.query_one("#wx-grid", Input).value = arg.strip().upper()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._show_weather()
+            self._wx_fetch_internet()
         else:
             self._log_system(f"unknown command: {cmd}")
 

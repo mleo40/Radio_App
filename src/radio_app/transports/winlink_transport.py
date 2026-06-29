@@ -115,6 +115,21 @@ _HTTP_TIMEOUT_S = 10.0
 _STATUS_TIMEOUT_S = 3.0
 _PROBE_TIMEOUT_S = 2.0
 
+_NWS_SUBJECT_RE = re.compile(
+    r"NWS[\s\-]BULLETIN|FPUS\d+\s+K\w{3}|MARINE FORECAST|"
+    r"CONVECTIVE OUTLOOK|ZONE FORECAST|AREA FORECAST|SPECIAL WEATHER STATEMENT|"
+    r"URGENT - WEATHER MESSAGE|SEVERE WEATHER STATEMENT|TORNADO WARNING|"
+    r"FLASH FLOOD|WINTER STORM|BLIZZARD WARNING",
+    re.IGNORECASE,
+)
+_WMO_OFFICE_RE = re.compile(r"\b([KP][A-Z]{3})\b")
+
+
+def _extract_wmo_office(subject: str) -> str:
+    """Extract WMO office ID (e.g. 'KBOX', 'PHFO') from an NWS subject line."""
+    m = _WMO_OFFICE_RE.search(subject)
+    return m.group(1) if m else ""
+
 
 class WinlinkTransport(Transport):
     """Wraps a user-installed Pat client over its HTTP API."""
@@ -1107,6 +1122,16 @@ class WinlinkTransport(Transport):
         attachments = [
             f.get("Name") for f in files if isinstance(f, dict) and f.get("Name")
         ]
+        meta: dict = {
+            "subject": subject,
+            "mid": mid,
+            "attachments": attachments,
+        }
+        if _NWS_SUBJECT_RE.search(subject):
+            meta["kind"] = "weather_bulletin"
+            office = _extract_wmo_office(subject)
+            if office:
+                meta["nws_office"] = office
         return UnifiedMessage(
             sender=sender,
             content=body_text,
@@ -1114,11 +1139,7 @@ class WinlinkTransport(Transport):
             recipient=recipient,
             status=DeliveryStatus.RECEIVED,
             transport=self.name,
-            metadata={
-                "subject": subject,
-                "mid": mid,
-                "attachments": attachments,
-            },
+            metadata=meta,
         )
 
     # -- HTTP plumbing (stdlib only; called via asyncio.to_thread) ------------
