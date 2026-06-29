@@ -92,7 +92,12 @@ _UNIVERSAL_COMMAND_HELP = (
     "/favorites (F6), /fav add|rm|list|only [<id> [label]], "
     "/mode (cycle, F3), /refresh, /logs, "
     "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
-    "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
+    "/chats, "
+    "/tmpl [list|<name>|add <n> <text>|del <n>], "
+    "/bands [<band>|activity [<band>]], "
+    "/sched [list|cancel <id>|+Nm|HH:MM [text]], "
+    "/subs [add|rm @GROUP], "
+    "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
     "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
@@ -2078,6 +2083,9 @@ class RadioTUI(App):
                     yield Button(
                         "\u2709 SMS", id="js8-sms", classes="modebtn"
                     )
+                    yield Button(
+                        "\U0001f4cd Beacon", id="js8-beacon", classes="modebtn"
+                    )
                 with Horizontal(id="winlink-bar"):
                     yield Static("Winlink", id="winlink-bar-label")
                     yield Static("", id="winlink-spacer")
@@ -3249,6 +3257,8 @@ class RadioTUI(App):
             self._js8_refresh_freq()
         elif bid == "js8-sms":
             self._js8_sms_prompt()
+        elif bid == "js8-beacon":
+            self._js8_send_beacon()
         elif bid.startswith("js8-query-"):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
@@ -6283,6 +6293,30 @@ class RadioTUI(App):
         self._send(f"{name}?")
 
     @work
+    async def _js8_send_beacon(self) -> None:
+        """Send a JS8Call position beacon (sets STATION.SET_GRID in JS8Call)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        from ..core.position import position_from_config
+        pos = self._position
+        if pos is None:
+            pos = position_from_config(self.core.config) if self.core else None
+        if pos is None:
+            self._log_system(
+                "No position set. Use /position <grid> to configure one."
+            )
+            return
+        ok = await t.send_position_beacon(pos)
+        if ok:
+            self._log_system(
+                f"\U0001f4cd Beacon sent: grid [b]{pos.grid}[/b] set in JS8Call."
+            )
+        else:
+            self._log_system("Beacon failed — check JS8Call connection.")
+
+    @work
     async def _js8_show_inbox(self) -> None:
         """``/inbox`` — list the messages JS8Call is holding for store-and-forward."""
         t = self._js8_transport()
@@ -7280,21 +7314,63 @@ class RadioTUI(App):
         )
 
     def _handle_tmpl_command(self, arg: str) -> None:
-        """List templates or load one into the composer for review before sending."""
+        """List, load, add, or delete message templates.
+
+        /tmpl list           — list all template names
+        /tmpl <name>         — load template into composer
+        /tmpl add <n> <text> — create a new template
+        /tmpl del <name>     — delete a template
+        """
         if self.core is None:
             return
         from ..core.templates import Templates
+        parts = arg.strip().split(None, 1)
+        sub = parts[0].lower() if parts else ""
+
+        if sub in ("add", "new"):
+            rest = parts[1].strip() if len(parts) > 1 else ""
+            subparts = rest.split(None, 1)
+            if len(subparts) < 2:
+                self._log_system(
+                    'usage: /tmpl add <name> <text>  e.g. /tmpl add ack "Message received"'
+                )
+                return
+            name, text = subparts[0], subparts[1]
+            self.core.config.set("templates", name, text)
+            self.core.config.save()
+            self._log_system(f"Template '{name}' saved.")
+            return
+
+        if sub in ("del", "delete", "rm", "remove"):
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /tmpl del <name>")
+                return
+            tmpls_data = self.core.config.data.get("templates", {})
+            if name not in tmpls_data:
+                self._log_system(
+                    f"Template '{name}' not found. "
+                    f"Available: {', '.join(sorted(tmpls_data)) or '(none)'}"
+                )
+                return
+            del tmpls_data[name]
+            self.core.config.save()
+            self._log_system(f"Template '{name}' deleted.")
+            return
+
         tmpls = Templates.from_config(self.core.config)
-        if not arg or arg.strip().lower() == "list":
+        if not arg or sub == "list":
             names = tmpls.names()
             if not names:
                 self._log_system(
-                    "No templates. Add [templates] to config.toml, e.g.:\n"
-                    '  welfare = "Welfare check — all OK"'
+                    "No templates. Use /tmpl add <name> <text> to create one."
                 )
             else:
                 joined = "  ".join(f"[b]{n}[/b]" for n in names)
-                self._log_system("Templates: " + joined)
+                self._log_system(
+                    "Templates: " + joined
+                    + "  [dim](/tmpl add <n> <text> to add, /tmpl del <n> to remove)[/dim]"
+                )
             return
         text = tmpls.get(arg.strip())
         if text is None:
@@ -7311,8 +7387,49 @@ class RadioTUI(App):
             self._log_system(f"Template text: {text}")
 
     def _handle_bands_command(self, arg: str) -> None:
-        """Show the band-plan / EmComm frequency reference with live conditions."""
+        """Show band-plan reference or recent HF band activity log.
+
+        /bands             — band-plan + solar conditions
+        /bands <band>      — filter plan to one band (e.g. /bands 40m)
+        /bands activity    — show recent messages with band metadata
+        /bands activity 40m — filter activity log to one band
+        """
         from ..core.bandplan import format_mhz, lookup
+        parts = arg.strip().lower().split(None, 1) if arg.strip() else []
+        first = parts[0] if parts else ""
+
+        if first in ("activity", "log", "rx"):
+            if self.core is None:
+                return
+            band_filter = parts[1].strip() if len(parts) > 1 else None
+            since = datetime.now(UTC) - timedelta(hours=24)
+            msgs = self.core.store.query(
+                band=band_filter, since=since, limit=100, newest_first=False
+            )
+            # Keep only messages that have a band in metadata (HF traffic).
+            msgs = [m for m in msgs if m.metadata.get("band")]
+            if not msgs:
+                qualifier = f" on {band_filter}" if band_filter else ""
+                self._log_system(
+                    f"No HF band activity{qualifier} in the last 24h."
+                )
+                return
+            title = f"[b]Band activity{f' — {band_filter}' if band_filter else ''} (last 24h):[/b]"
+            lines = [title]
+            for m in msgs:
+                ts = m.timestamp.strftime("%H:%M")
+                band_tag = m.metadata.get("band", "?")
+                snr = m.metadata.get("snr")
+                snr_str = f" SNR{snr:+.0f}" if snr is not None else ""
+                direction = "→" if m.status.value != "received" else "←"
+                preview = m.content[:50]
+                lines.append(
+                    f"  {ts}  [b]{band_tag:<5}[/b]  {m.sender:<10}"
+                    f"  {direction}  {preview!r}{snr_str}"
+                )
+            self._log_system("\n".join(lines))
+            return
+
         band = arg.strip().lower() or None
         entries = lookup(band=band, region="US")
         if not entries:
@@ -7367,16 +7484,70 @@ class RadioTUI(App):
         self._log_system("\n".join(lines))
 
     def _handle_sched_command(self, arg: str) -> None:
-        """Schedule current composer text (or given text) for a future send.
+        """Schedule, list, or cancel deferred sends.
 
         Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
+               /sched list  — show pending queue
+               /sched cancel <id>  — cancel a pending scheduled message
         """
         from ..core.message import UnifiedMessage
 
         parts = arg.strip().split(None, 1)
         if not parts:
-            self._log_system("Usage: /sched +30m | HH:MM [text]")
+            self._log_system(
+                "Usage: /sched +30m | HH:MM [text] | list | cancel <id>"
+            )
             return
+
+        if parts[0].lower() == "list":
+            if self.core is None:
+                return
+            pending = self.core.store.schedule_pending()
+            if not pending:
+                self._log_system("No scheduled messages pending.")
+                return
+            lines = [f"[b]Scheduled messages[/b] ({len(pending)} pending):"]
+            for e in pending:
+                ts = e.fire_at.strftime("%H:%M UTC")
+                target = e.message.recipient or (
+                    f"@{e.message.group}" if e.message.group else "?"
+                )
+                preview = e.message.content[:40]
+                short_id = e.id[:8]
+                lines.append(
+                    f"  [b]{ts}[/b]  → {target}  [dim]{preview!r}[/dim]"
+                    f"  [dim](id:{short_id})[/dim]"
+                )
+            lines.append("[dim]/sched cancel <id> to cancel[/dim]")
+            self._log_system("\n".join(lines))
+            return
+
+        if parts[0].lower() == "cancel":
+            if self.core is None:
+                return
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+            if not target_id:
+                self._log_system("usage: /sched cancel <id>  (from /sched list)")
+                return
+            # Allow partial ID match (first 8 chars)
+            pending = self.core.store.schedule_pending()
+            matches = [e for e in pending if e.id.startswith(target_id)]
+            if not matches:
+                self._log_system(f"No pending message with id starting '{target_id}'.")
+                return
+            if len(matches) > 1:
+                self._log_system(
+                    f"Ambiguous id '{target_id}' matches {len(matches)} messages; "
+                    "use more characters."
+                )
+                return
+            ok = self.core.store.schedule_cancel(matches[0].id)
+            if ok:
+                self._log_system(f"Cancelled: {matches[0].id[:8]}")
+            else:
+                self._log_system(f"Could not cancel {matches[0].id[:8]} (already sent?).")
+            return
+
         time_spec = parts[0]
         text_override = parts[1] if len(parts) > 1 else None
 
@@ -7465,6 +7636,125 @@ class RadioTUI(App):
                 f"  [b]{e.callsign}[/b]  {e.transport}  {ts}{snr}  ×{e.message_count}"
             )
         self._log_system("\n".join(lines))
+
+    def _handle_subs_command(self, arg: str) -> None:
+        """Manage group subscriptions from the TUI.
+
+        /subs           — list current subscriptions and all configured groups
+        /subs add @EMS  — subscribe to a group
+        /subs rm @EMS   — unsubscribe from a group
+        """
+        if self.core is None:
+            return
+        subs = list(self.core.config.subscriptions.get("groups", []))
+        all_groups = list(self.core.config.groups.keys())
+
+        parts = arg.strip().split(None, 1)
+        sub = parts[0].lower() if parts else ""
+
+        if sub in ("add", "sub"):
+            name = parts[1].strip().lstrip("@") if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /subs add <@GROUP>")
+                return
+            if name not in subs:
+                subs.append(name)
+                self.core.config.set("subscriptions", "groups", subs)
+                self.core.config.save()
+            self._log_system(f"Subscribed to @{name}.")
+            return
+
+        if sub in ("rm", "remove", "del", "unsub"):
+            name = parts[1].strip().lstrip("@") if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /subs rm <@GROUP>")
+                return
+            if name in subs:
+                subs.remove(name)
+                self.core.config.set("subscriptions", "groups", subs)
+                self.core.config.save()
+                self._log_system(f"Unsubscribed from @{name}.")
+            else:
+                self._log_system(f"@{name} is not in your subscriptions.")
+            return
+
+        # Default: show list
+        lines = ["[b]Group subscriptions[/b]"]
+        if all_groups:
+            for g in sorted(all_groups):
+                marker = "[green]✓[/green]" if g in subs else "[dim]○[/dim]"
+                lines.append(f"  {marker}  @{g}")
+        else:
+            lines.append("  [dim]No groups configured.[/dim]")
+        lines.append(
+            "[dim]/subs add @GROUP or /subs rm @GROUP to change subscriptions[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _handle_position_command(self, arg: str) -> None:
+        """Show or set the station position.
+
+        /position           — show current position
+        /position <grid>    — set position by Maidenhead grid square (e.g. FN31pr)
+        /position clear     — remove manually configured position
+        """
+        if self.core is None:
+            return
+        from ..core.maidenhead import grid_to_latlon, _GRID_RE as _GRE
+
+        sub = arg.strip()
+        if not sub:
+            from ..core.position import position_from_config
+            pos = self._position
+            if pos is None:
+                pos = position_from_config(self.core.config)
+            if pos is None:
+                self._log_system(
+                    "No position set. Use /position <grid> to set manually."
+                )
+            else:
+                self._log_system(
+                    f"Position: {pos.lat:+.4f}°  {pos.lon:+.4f}°  "
+                    f"grid [b]{pos.grid}[/b]  [dim]({pos.source})[/dim]"
+                )
+            return
+
+        if sub.lower() == "clear":
+            pos_data = self.core.config.data.get("position", {})
+            changed = False
+            for key in ("lat", "lon", "fixed_grid"):
+                if key in pos_data:
+                    del pos_data[key]
+                    changed = True
+            if changed:
+                self.core.config.save()
+                self._position = None
+                self._log_system("Position cleared.")
+            else:
+                self._log_system("No manually configured position to clear.")
+            return
+
+        # Treat argument as a Maidenhead grid square.
+        grid = sub.upper()
+        if not _GRE.match(grid):
+            self._log_system(
+                f"'{sub}' is not a valid Maidenhead grid (e.g. FN31, FN31pr)."
+            )
+            return
+        try:
+            lat, lon = grid_to_latlon(grid)
+        except ValueError as exc:
+            self._log_system(f"Grid error: {exc}")
+            return
+        self.core.config.set("position", "lat", round(lat, 6))
+        self.core.config.set("position", "lon", round(lon, 6))
+        self.core.config.save()
+        # Update cached position so Health panel reflects it immediately.
+        from ..core.position import Position
+        self._position = Position(lat=lat, lon=lon, source="manual")
+        self._log_system(
+            f"Position set: {lat:+.4f}°  {lon:+.4f}°  grid [b]{grid}[/b]"
+        )
 
     @work
     async def _handle_start_command(self, arg: str) -> None:
@@ -8018,6 +8308,10 @@ class RadioTUI(App):
             self._handle_sched_command(arg)
         elif cmd == "/roster":
             self._handle_roster_command(arg)
+        elif cmd in ("/subs", "/subscriptions"):
+            self._handle_subs_command(arg)
+        elif cmd in ("/position", "/pos", "/grid"):
+            self._handle_position_command(arg)
         elif cmd == "/start":
             self._handle_start_command(arg)
         elif cmd == "/net":
@@ -8041,7 +8335,13 @@ class RadioTUI(App):
             self._log_system("Pick a mode first (press F3).")
             return
         if not self.current_target:
-            self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
+            if self.active_transport == "meshcore":
+                self._log_system(
+                    "No channel selected. Use /to @0 for the public channel, "
+                    "or /channel list to see available channels."
+                )
+            else:
+                self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
             return
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None
