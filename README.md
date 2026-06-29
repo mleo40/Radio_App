@@ -19,8 +19,9 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > leaving user identity to the operator. A full suite of **field/EmComm
 > utilities** is built in: message export, canned templates, UTC time widget with
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
-> awareness, offline band-plan, scheduled sends, and a presence roster. 766 tests
-> pass; the whole suite runs without radio hardware.
+> awareness, offline band-plan, **band tracking** (every HF message stamped with
+> its band; per-band history filters and aggregate stats), scheduled sends, and a
+> presence roster. 840 tests pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 
@@ -108,7 +109,7 @@ src/radio_app/
 │   ├── timesource.py      # UTC clock + time consensus (GPS/chrony/NTP priority chain)
 │   ├── position.py        # GPS position, Maidenhead grid, GPSReader (gpsd)
 │   ├── power.py           # host battery state (Linux sysfs)
-│   ├── bandplan.py        # offline band-plan + EmComm frequency reference
+│   ├── bandplan.py        # offline band-plan + EmComm frequency reference; band_for_freq() maps Hz → band name
 │   ├── roster.py          # presence roster (recently-heard callsigns, SQL-derived)
 │   └── proc_manager.py    # on-demand lifecycle for JS8Call/WSJT-X/Pat (pgrep-based)
 ├── ui/                    # Textual TUI (single pane of glass)
@@ -418,6 +419,7 @@ radioapp send --to N0CALL --mode secure --encrypt "x"  # guarded on HF
 
 # Message history & export
 radioapp history [--thread @EMS] [--mode js8call] [--status received] [--snr-min 5] [--date 2026-06-27]
+radioapp history --band 40m                       # filter history to 40m messages
 radioapp search "checking in" [--status received] [--snr-min 0]
 radioapp export --thread @EMS --format md --out history.md
 radioapp export --all --format maildir --out ~/radio_archive
@@ -435,6 +437,9 @@ radioapp position --gps --beacon          # send grid beacon on all supporting t
 # Field reference
 radioapp bands --band 40m                 # EmComm + JS8Call freqs for 40m
 radioapp bands --mode JS8                 # all JS8Call calling frequencies
+radioapp bands --stats                    # per-band message counts from the store
+radioapp bands --stats --transport js8call # same, filtered to JS8Call only
+radioapp bands --stats --since 2026-06-01 # stats since a date
 
 # Scheduled sends
 radioapp schedule add --delay 30m --to W1AW "Net check-in"
@@ -520,6 +525,17 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   `[transports.X].launch_cmd` in your config; if not set, a prompt asks for it
   and saves the answer. For Winlink, `modem_cmd` additionally auto-launches the RF
   modem (VARA or any VARA-compatible modem) before a varahf/varafm session.
+- **⛅ Weather (WX):** a dedicated weather surface that aggregates bulletins from
+  all active sources (JS8Call APRS relay, Winlink NWS inbox, Reticulum #weather
+  group, MeshCore #weather channel) plus an internet fetch for the current grid
+  square (NWS point forecast → Open-Meteo fallback). A grid picker shows the
+  active grid with `◀ ▶` to cycle through saved squares. The **Setup** button
+  opens the **WX Setup dialog**: manage saved grid squares in a list (add by
+  typing + Enter, delete with Remove selected; auto-uppercased; saved to
+  `[ui] wx_grids` in `config.toml`), and check **MeshCore #weather** and/or
+  **Reticulum #weather / #nws_alerts** to join those passive sources — the dialog
+  stays open until you press **Save**, so you can configure multiple options in
+  one visit.
 - **Watch (observe):** select the **Watch** tab for a unified, **read-only** live stream of
   **all** messages across **every** transport — both the traffic you **receive**
   and the messages you **send** (e.g. both sides of a MeshCore channel) —
@@ -531,10 +547,12 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   **● up · ○ down · · n/a · ◌ unknown**. For **Reticulum** the board adds
   per-interface RNS/RNode telemetry; for **MeshCore** it adds the companion's
   **battery** and **LoRa radio parameters** (frequency / bandwidth / SF / CR /
-  TX power). The **System** section additionally shows: UTC time with
-  clock-offset from the best available source (GPS via gpsd → local
-  chrony/ntpd daemon → internet NTP), the station's Maidenhead grid position,
-  and host battery level with estimated runtime.
+  TX power). The **JS8Call** section additionally shows a compact **band log**
+  (`band log: 40m 67  20m 42  17m 11`) — message counts per band from the store,
+  so you can see which bands have been active this session at a glance. The **System**
+  section additionally shows: UTC time with clock-offset from the best available
+  source (GPS via gpsd → local chrony/ntpd daemon → internet NTP), the station's
+  Maidenhead grid position, and host battery level with estimated runtime.
 - **Favorites (recall):** press **F5** to cycle into it (Watch → Health → Logs →
   Chats → Favorites) for a saved list of **NomadNet servers, callsigns, JS8Call groups,
   MeshCore channels, MeshCore contacts and hashes**, grouped by type. Add entries
@@ -592,7 +610,7 @@ In-composer commands:
 | `/tmpl [<name>]` | list canned templates or load one into the composer |
 | `/sched +30m\|HH:MM [text]` | schedule composer content (or inline text) for later send |
 | `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
-| `/bands [band]` | show offline band-plan / EmComm frequencies |
+| `/bands [band]` | show offline band-plan / EmComm frequencies (same as `radioapp bands`) |
 | `/freq` / `/freq <MHz\|Hz>` | (JS8Call) show / set the radio dial frequency |
 | `/band` / `/band <name>` | (JS8Call) list bands / switch band (e.g. `/band 20m`) |
 | `/subject <text>` | (Winlink) set the subject for the next message |
@@ -611,6 +629,10 @@ In-composer commands:
 
 Typing plain text sends to the selected conversation **over the active mode only**.
 Each line shows the transport that carried it (`[js8call]`, `[reticulum]`, ...).
+HF messages (JS8Call and WSJT-X) additionally show a **dim band tag** between
+the transport badge and the sender name (e.g. `[js8call] 20m W1AW: cq`), so you
+can identify at a glance which band a message arrived on without scrolling back
+to the band-switch bar.
 **Click an inbound sender's name** in the message log to open a **direct reply**
 to that person — handy in a shared thread (a MeshCore channel or a JS8 `@group`)
 where one conversation carries many senders. The message format, SQLite storage

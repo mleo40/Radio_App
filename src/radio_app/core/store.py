@@ -331,6 +331,35 @@ class MessageStore:
         )
         return [self._row_to_message(r) for r in cur.fetchall()]
 
+    def band_stats(
+        self,
+        transport: str | None = None,
+        since: datetime | None = None,
+    ) -> dict[str, int]:
+        """Return ``{band: message_count}`` for messages with band metadata.
+
+        Results are sorted by count descending. Messages without a ``band`` key
+        in metadata (non-HF transports, pre-feature rows) are excluded.
+        """
+        clauses = [
+            "json_extract(metadata, '$.band') IS NOT NULL",
+            "json_extract(metadata, '$.band') != ''",
+        ]
+        params: list = []
+        if transport:
+            clauses.append("transport = ?")
+            params.append(transport)
+        if since is not None:
+            clauses.append("timestamp >= ?")
+            params.append(since.isoformat())
+        sql = (
+            "SELECT json_extract(metadata, '$.band') AS band, COUNT(*) AS cnt "
+            f"FROM messages WHERE {' AND '.join(clauses)} "
+            "GROUP BY band ORDER BY cnt DESC"
+        )
+        rows = self._conn.execute(sql, params).fetchall()
+        return {row[0]: row[1] for row in rows}
+
     def query(
         self,
         *,
@@ -343,6 +372,8 @@ class MessageStore:
         until: datetime | None = None,
         status: str | None = None,
         snr_min: float | None = None,
+        kind: str | None = None,
+        band: str | None = None,
         limit: int = 200,
         newest_first: bool = True,
     ) -> list[UnifiedMessage]:
@@ -391,6 +422,12 @@ class MessageStore:
         if snr_min is not None:
             clauses.append("CAST(json_extract(metadata, '$.snr') AS REAL) >= ?")
             params.append(snr_min)
+        if kind is not None:
+            clauses.append("json_extract(metadata, '$.kind') = ?")
+            params.append(kind)
+        if band is not None:
+            clauses.append("json_extract(metadata, '$.band') = ?")
+            params.append(band)
         where = (" WHERE " + " AND ".join(clauses)) if clauses else ""
         params.append(max(1, limit))
         rows = self._conn.execute(

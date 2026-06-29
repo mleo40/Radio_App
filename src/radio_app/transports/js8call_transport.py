@@ -30,6 +30,7 @@ import logging
 import re
 import time
 
+from ..core.bandplan import band_for_freq
 from ..core.message import AddressType, UnifiedMessage
 from .base import ReachabilityStatus, Transport, TransportCapabilities, probe_tcp
 
@@ -77,6 +78,11 @@ SMS_GATEWAY_CALLSIGN = "SMSGTE"
 # gateway address + phone + text don't get silently truncated on the air.
 _SMS_MAX_TEXT = 60
 _PHONE_RE = re.compile(r"[^\d+]")
+# Weather reply detection: APRS NWS forecasts typically include these patterns.
+_JS8_WX_RE = re.compile(
+    r"Tonight:|Today:|Tomorrow:|°F|°C|NWS\s+\w{4}|mph\s+wind|FORECAST",
+    re.IGNORECASE,
+)
 
 
 def _aprs_addressee(callsign: str) -> str:
@@ -233,6 +239,9 @@ def message_from_event(
     # Recognise JS8 directed commands (SNR?/SNR/GRID?/...) and parse their value.
     _cmd, extra = _extract_command(params, text)
     metadata.update(extra)
+    # Stamp weather replies from the APRS gateway.
+    if sender == JS8_APRS_GATEWAY or _JS8_WX_RE.search(text):
+        metadata["kind"] = "weather_bulletin"
 
     msg = UnifiedMessage(
         sender=sender or "UNKNOWN",
@@ -286,21 +295,6 @@ JS8_BAND_DIAL_HZ: dict[str, int] = {
     "6m": 50_318_000,
 }
 
-# Amateur HF/6m band edges (Hz) for labelling an arbitrary dial frequency.
-_BAND_EDGES: tuple[tuple[str, int, int], ...] = (
-    ("160m", 1_800_000, 2_000_000),
-    ("80m", 3_500_000, 4_000_000),
-    ("60m", 5_330_000, 5_410_000),
-    ("40m", 7_000_000, 7_300_000),
-    ("30m", 10_100_000, 10_150_000),
-    ("20m", 14_000_000, 14_350_000),
-    ("17m", 18_068_000, 18_168_000),
-    ("15m", 21_000_000, 21_450_000),
-    ("12m", 24_890_000, 24_990_000),
-    ("10m", 28_000_000, 29_700_000),
-    ("6m", 50_000_000, 54_000_000),
-)
-
 # JS8Call submode speeds: STATION.STATUS reports SPEED as a small int.
 _SPEED_NAMES = {
     "0": "normal",
@@ -308,16 +302,6 @@ _SPEED_NAMES = {
     "2": "turbo",
     "4": "slow",
 }
-
-
-def band_for_freq(hz: int | None) -> str | None:
-    """Return the amateur band name (e.g. ``"20m"``) for a dial frequency in Hz."""
-    if not hz:
-        return None
-    for name, lo, hi in _BAND_EDGES:
-        if lo <= hz <= hi:
-            return name
-    return None
 
 
 def dial_for_band(band: str | None) -> int | None:
@@ -645,6 +629,18 @@ class JS8CallTransport(Transport):
             return False
         return await self._send_api({"type": "STATION.SET_GRID", "value": grid})
 
+    async def send_wx_query(self, grid: str) -> bool:
+        """Send an NWS weather query via the JS8Call APRS gateway.
+
+        The APRS NWS gateway replies with a short forecast for the 4-char grid
+        square. The response arrives as a normal directed message from @APRSIS
+        and will be stamped as kind=weather_bulletin by message_from_event().
+        """
+        grid4 = grid[:4].upper()
+        return await self._send_api(
+            {"type": "TX.SEND_MESSAGE", "value": f"{JS8_APRS_GATEWAY} NWS {grid4}"}
+        )
+
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
             return False
@@ -724,6 +720,10 @@ class JS8CallTransport(Transport):
                 msg.recipient or (f"@{msg.group}" if msg.group else "?"),
                 msg.content,
             )
+            if self._dial_freq:
+                band = band_for_freq(self._dial_freq)
+                if band:
+                    msg.metadata["band"] = band
             await self._emit(msg)
 
     async def _emit_presence(self, callsign: str, params: dict) -> None:

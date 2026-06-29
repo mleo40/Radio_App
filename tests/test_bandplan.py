@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import pytest
 
-from radio_app.core.bandplan import FrequencyEntry, format_mhz, lookup
+from radio_app.core.bandplan import FrequencyEntry, band_for_freq, format_mhz, lookup
 
 
 def test_lookup_all_returns_entries():
@@ -114,3 +114,38 @@ def test_cli_bands_transport_filter(monkeypatch, capsys, tmp_path):
     assert main(["bands", "--transport", "winlink"]) == 0
     out = capsys.readouterr().out
     assert "WINLINK" in out
+
+
+# -- band_for_freq ------------------------------------------------------------
+
+
+def test_band_for_freq_20m():
+    assert band_for_freq(14_078_000) == "20m"
+
+
+def test_band_for_freq_40m():
+    assert band_for_freq(7_078_000) == "40m"
+
+
+def test_band_for_freq_at_lower_edge():
+    assert band_for_freq(14_000_000) == "20m"
+
+
+def test_band_for_freq_at_upper_edge():
+    assert band_for_freq(14_350_000) == "20m"
+
+
+def test_band_for_freq_between_bands_returns_none():
+    assert band_for_freq(15_000_000) is None
+
+
+def test_band_for_freq_none_returns_none():
+    assert band_for_freq(None) is None
+
+
+def test_band_for_freq_zero_returns_none():
+    assert band_for_freq(0) is None
+
+
+def test_band_for_freq_6m():
+    assert band_for_freq(50_318_000) == "6m"

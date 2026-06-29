@@ -72,6 +72,7 @@ class MeshCoreTransport(Transport):
         # device reports at start(), so the Mesh panel can list them up front.
         self._config_channels = self._parse_config_channels(config.get("channels"))
         self._device_channels: list[dict] = []
+        self._starting = False  # guard against concurrent hot-plug start attempts
 
     @staticmethod
     def _parse_config_channels(raw: object) -> list[dict]:
@@ -293,12 +294,16 @@ class MeshCoreTransport(Transport):
             if self._connection == "tcp":
                 host = self.config.get("host", "127.0.0.1")
                 port = int(self.config.get("tcp_port", 5000))
-                self._mc = await MeshCore.create_tcp(host, port)
+                self._mc = await MeshCore.create_tcp(
+                    host, port, auto_reconnect=True, max_reconnect_attempts=5
+                )
                 where = f"tcp://{host}:{port}"
             else:  # serial (USB)
                 dev = self.config.get("port", "/dev/ttyACM0")
                 baud = int(self.config.get("baud", 115200))
-                self._mc = await MeshCore.create_serial(dev, baud)
+                self._mc = await MeshCore.create_serial(
+                    dev, baud, auto_reconnect=True, max_reconnect_attempts=5
+                )
                 where = f"serial {dev} @ {baud}"
         except Exception as exc:  # noqa: BLE001 - never crash the whole app
             log.warning("MeshCore could not connect (%s).", exc)
@@ -316,12 +321,6 @@ class MeshCoreTransport(Transport):
             self._mc.subscribe(EventType.CHANNEL_MSG_RECV, self._on_channel_msg),
             self._mc.subscribe(EventType.ADVERTISEMENT, self._on_advert),
         ]
-        # Have the library poll the device for queued messages and dispatch them
-        # as the events we subscribed to above.
-        try:
-            self._fetch_sub = await self._mc.start_auto_message_fetching()
-        except Exception:  # noqa: BLE001
-            log.debug("MeshCore auto message fetching unavailable", exc_info=True)
 
         # Enumerate the device's configured channels so the Mesh panel can list
         # them as conversations (a failure here just leaves config-only channels).
@@ -333,11 +332,20 @@ class MeshCoreTransport(Transport):
         self._running = True
         # Re-create our saved channels on the device so hashtag/secret channels
         # keep working after a restart even if the companion did not retain their
-        # keys (the symptom: "only the public channel works again").
+        # keys (the symptom: "only the public channel works again"). Must happen
+        # before auto-fetching so queued channel messages decode with correct keys.
         try:
             await self._restore_config_channels()
         except Exception:  # noqa: BLE001
             log.debug("MeshCore channel restore failed", exc_info=True)
+
+        # Have the library poll the device for queued messages and dispatch them
+        # as the events we subscribed to above. Runs after channel keys are
+        # restored so queued channel messages decode correctly.
+        try:
+            self._fetch_sub = await self._mc.start_auto_message_fetching()
+        except Exception:  # noqa: BLE001
+            log.debug("MeshCore auto message fetching unavailable", exc_info=True)
 
         info = self._self_info()
         log.info(
@@ -367,18 +375,48 @@ class MeshCoreTransport(Transport):
         await self._safe_disconnect()
         self._mc = None
 
+    async def _try_start(self) -> None:
+        """Attempt start() once; no-op if already running or a start is in flight."""
+        if self._starting or self._running:
+            return
+        self._starting = True
+        try:
+            await self.start()
+        finally:
+            self._starting = False
+
     async def check_reachable(self) -> ReachabilityStatus:
         """Passively probe the companion endpoint (no transmission).
 
-        Reflects the live connection when up; otherwise TCP confirms the console
-        socket accepts a connection and serial confirms the device path exists.
+        Returns OK only when the transport session is live. When the session is
+        up but the library reports disconnected (e.g. mid-reconnect) the endpoint
+        probe is used as a fallback so the health dot reflects physical presence
+        while auto-reconnect is in progress.  When the transport is not running
+        at all (never started, or failed to start), the physical endpoint is
+        probed; if it's present a background start() is scheduled so the transport
+        self-heals within a health-check cycle when the device is hot-plugged.
         """
-        if self._mc is not None and self._running:
-            try:
-                if self._mc.is_connected():
-                    return ReachabilityStatus.OK
-            except Exception:  # noqa: BLE001
-                pass
+        if not self._running or self._mc is None:
+            # Check whether the physical device has appeared since last time.
+            if self._connection == "tcp":
+                host = self.config.get("host", "127.0.0.1")
+                port = int(self.config.get("tcp_port", 5000))
+                endpoint_up = await probe_tcp(host, port) is ReachabilityStatus.OK
+            else:
+                dev = self.config.get("port", "/dev/ttyACM0")
+                endpoint_up = os.path.exists(dev)
+            if endpoint_up and not self._starting:
+                import asyncio
+                asyncio.create_task(self._try_start())
+            return ReachabilityStatus.DOWN
+        try:
+            if self._mc.is_connected:
+                return ReachabilityStatus.OK
+        except Exception:  # noqa: BLE001
+            pass
+        # Transport is running but the library reports not-connected (between
+        # reconnect attempts) — probe the raw endpoint to distinguish "device
+        # temporarily unreachable" from "device gone."
         if self._connection == "tcp":
             host = self.config.get("host", "127.0.0.1")
             port = int(self.config.get("tcp_port", 5000))

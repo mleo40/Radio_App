@@ -640,6 +640,157 @@ def test_winlink_open_forms_reports_when_none_installed(config_path):
     asyncio.run(run())
 
 
+# ---------------------------------------------------------------------------
+# WinlinkEmailComposeScreen + template tests
+# ---------------------------------------------------------------------------
+
+def test_wl_template_substitution():
+    """_substitute_wl_template replaces all three placeholders."""
+    from radio_app.ui.tui import _substitute_wl_template
+
+    result = _substitute_wl_template(
+        "From {callsign} on {date_utc} at {time_utc}",
+        callsign="W1AW",
+        date_utc="28 Jun 2026",
+        time_utc="1430",
+    )
+    assert result == "From W1AW on 28 Jun 2026 at 1430"
+
+
+def test_wl_templates_list_not_empty():
+    """_WL_TEMPLATES contains at least blank + standard ham radio forms."""
+    from radio_app.ui.tui import _WL_TEMPLATES
+
+    names = [t.name for t in _WL_TEMPLATES]
+    assert "(blank)" in names
+    assert any("Radiogram" in n for n in names)
+    assert any("Welfare" in n for n in names)
+    assert any("EmComm" in n for n in names)
+
+
+def test_winlink_compose_button_exists(config_path):
+    """The Winlink action bar has a '✉ Compose' button."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+            # Button must be present and enabled even when transport is DOWN.
+            btn = app.query_one("#winlink-compose")
+            assert btn is not None
+
+    asyncio.run(run())
+
+
+def test_winlink_compose_cancel_returns_none(config_path):
+    """Cancelling the compose modal does not queue any message."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+
+            sent: list = []
+
+            async def fake_send(msg, force_transport=None):
+                sent.append(msg)
+                return True
+
+            app.core.router.send = fake_send  # type: ignore[assignment]
+            app._winlink_email_compose()
+            # Wait for the modal to appear.
+            from radio_app.ui.tui import WinlinkEmailComposeScreen
+            for _ in range(20):
+                await pilot.pause()
+                if isinstance(app.screen, WinlinkEmailComposeScreen):
+                    break
+            assert isinstance(app.screen, WinlinkEmailComposeScreen)
+            # Cancel — nothing should be sent.
+            app.screen.dismiss(None)
+            await pilot.pause()
+            assert sent == []
+
+    asyncio.run(run())
+
+
+def test_winlink_compose_prefills_subject(config_path):
+    """Compose modal pre-fills Subject from _winlink_subject."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            app._winlink_subject = "Pre-set subject"
+            await pilot.pause()
+
+            app._winlink_email_compose()
+            from radio_app.ui.tui import WinlinkEmailComposeScreen
+            from textual.widgets import Input
+            for _ in range(20):
+                await pilot.pause()
+                if isinstance(app.screen, WinlinkEmailComposeScreen):
+                    break
+            assert isinstance(app.screen, WinlinkEmailComposeScreen)
+            val = app.screen.query_one("#wecf-subject", Input).value
+            assert val == "Pre-set subject"
+            app.screen.dismiss(None)
+
+    asyncio.run(run())
+
+
+def test_winlink_compose_builds_message_with_correct_metadata(config_path):
+    """Submitting the compose modal queues an email with subject/cc/body."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+
+            captured: dict = {}
+
+            async def fake_send(msg, force_transport=None):
+                captured["msg"] = msg
+                captured["transport"] = force_transport
+                return True
+
+            app.core.router.send = fake_send  # type: ignore[assignment]
+            app._winlink_email_compose()
+
+            from radio_app.ui.tui import WinlinkEmailComposeScreen
+            for _ in range(20):
+                await pilot.pause()
+                if isinstance(app.screen, WinlinkEmailComposeScreen):
+                    break
+            assert isinstance(app.screen, WinlinkEmailComposeScreen)
+
+            # Simulate user filling in fields and submitting.
+            app.screen.dismiss({
+                "to": "W1AW",
+                "cc": "K1ABC",
+                "subject": "Test Subject",
+                "body": "Line one\nLine two\nLine three",
+                "attachments": [],
+            })
+            # Wait for the worker to process the result.
+            for _ in range(30):
+                await pilot.pause()
+                if captured.get("msg"):
+                    break
+
+            msg = captured.get("msg")
+            assert msg is not None
+            assert msg.recipient == "W1AW"
+            assert msg.content == "Line one\nLine two\nLine three"
+            assert msg.metadata.get("subject") == "Test Subject"
+            assert msg.metadata.get("cc") == "K1ABC"
+            assert captured["transport"] == "winlink"
+
+    asyncio.run(run())
+
+
 
 
 

@@ -115,6 +115,21 @@ _HTTP_TIMEOUT_S = 10.0
 _STATUS_TIMEOUT_S = 3.0
 _PROBE_TIMEOUT_S = 2.0
 
+_NWS_SUBJECT_RE = re.compile(
+    r"NWS[\s\-]BULLETIN|FPUS\d+\s+K\w{3}|MARINE FORECAST|"
+    r"CONVECTIVE OUTLOOK|ZONE FORECAST|AREA FORECAST|SPECIAL WEATHER STATEMENT|"
+    r"URGENT - WEATHER MESSAGE|SEVERE WEATHER STATEMENT|TORNADO WARNING|"
+    r"FLASH FLOOD|WINTER STORM|BLIZZARD WARNING",
+    re.IGNORECASE,
+)
+_WMO_OFFICE_RE = re.compile(r"\b([KP][A-Z]{3})\b")
+
+
+def _extract_wmo_office(subject: str) -> str:
+    """Extract WMO office ID (e.g. 'KBOX', 'PHFO') from an NWS subject line."""
+    m = _WMO_OFFICE_RE.search(subject)
+    return m.group(1) if m else ""
+
 
 class WinlinkTransport(Transport):
     """Wraps a user-installed Pat client over its HTTP API."""
@@ -819,6 +834,35 @@ class WinlinkTransport(Transport):
         mids = await self._outbox_mids()
         return None if mids is None else len(mids)
 
+    async def list_outbox(self) -> list[dict]:
+        """Full outbox listing: ``[{"mid","to","subject","date","size"}]``.
+
+        Returns an empty list when the outbox is empty or Pat is unreachable.
+        Keys are normalised to lowercase; unknown fields default to empty string.
+        """
+        try:
+            raw = await asyncio.to_thread(
+                self._http_get, "/api/mailbox/out", _HTTP_TIMEOUT_S
+            )
+            data = json.loads(raw) or []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink outbox list failed: %s", exc)
+            return []
+        if not isinstance(data, list):
+            return []
+        result = []
+        for e in data:
+            if not isinstance(e, dict):
+                continue
+            result.append({
+                "mid": str(e.get("MID") or e.get("mid") or ""),
+                "to": str(e.get("To") or e.get("to") or ""),
+                "subject": str(e.get("Subject") or e.get("subject") or ""),
+                "date": str(e.get("Date") or e.get("date") or ""),
+                "size": int(e.get("Size") or e.get("size") or 0),
+            })
+        return result
+
     async def _reconcile_outbox(self) -> None:
         """Emit a delivery receipt for any tracked message that left the outbox.
 
@@ -1107,6 +1151,16 @@ class WinlinkTransport(Transport):
         attachments = [
             f.get("Name") for f in files if isinstance(f, dict) and f.get("Name")
         ]
+        meta: dict = {
+            "subject": subject,
+            "mid": mid,
+            "attachments": attachments,
+        }
+        if _NWS_SUBJECT_RE.search(subject):
+            meta["kind"] = "weather_bulletin"
+            office = _extract_wmo_office(subject)
+            if office:
+                meta["nws_office"] = office
         return UnifiedMessage(
             sender=sender,
             content=body_text,
@@ -1114,11 +1168,7 @@ class WinlinkTransport(Transport):
             recipient=recipient,
             status=DeliveryStatus.RECEIVED,
             transport=self.name,
-            metadata={
-                "subject": subject,
-                "mid": mid,
-                "attachments": attachments,
-            },
+            metadata=meta,
         )
 
     # -- HTTP plumbing (stdlib only; called via asyncio.to_thread) ------------

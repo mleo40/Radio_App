@@ -48,6 +48,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     ContentSwitcher,
     Footer,
     Header,
@@ -57,7 +58,9 @@ from textual.widgets import (
     ListView,
     Markdown,
     RichLog,
+    Select,
     Static,
+    TextArea,
 )
 
 from .._compat import UTC
@@ -68,6 +71,8 @@ from ..core.message import AddressType, DeliveryStatus, UnifiedMessage
 from ..core.micron import parse_address, render_micron
 from ..core.station import Station
 from ..transports.base import ReachabilityStatus, Transport
+from ..core.maidenhead import grid_to_latlon
+from ..core.wx_internet import fetch_weather
 from ..transports.js8call_transport import (
     JS8_BAND_DIAL_HZ,
     band_for_freq,
@@ -91,6 +96,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
     "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
+    "/wx [grid], "
     "/help, /quit"
 )
 
@@ -110,8 +116,9 @@ def _looks_like_callsign(token: str) -> bool:
 # _handle_command's handlers, so this map mirrors that gating.
 _MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
     "winlink": (
+        "\u2709 Compose button \u2014 full email editor with multi-line body + templates",
         "/subject <text> \u2014 set the email subject for the next message",
-        "type \\n in the body \u2014 inserts a line break (multi-line email)",
+        "type \\n in the body \u2014 inserts a line break (quick multi-line)",
         "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
         "/save \u2014 save attachments from the open message",
         "/connect [gateway] \u2014 open a forwarding session (send + receive)",
@@ -139,6 +146,107 @@ _MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
         "/channel list|add <index> <#name> [secret] \u2014 manage channels",
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Winlink email templates
+# ---------------------------------------------------------------------------
+
+class _WLTemplate:
+    """A named email template with optional subject/body placeholders."""
+
+    def __init__(self, name: str, subject: str, body: str) -> None:
+        self.name = name
+        self.subject = subject
+        self.body = body
+
+
+def _substitute_wl_template(text: str, callsign: str, date_utc: str, time_utc: str) -> str:
+    """Replace {callsign}, {date_utc}, {time_utc} placeholders in a template."""
+    return (
+        text
+        .replace("{callsign}", callsign or "N0CALL")
+        .replace("{date_utc}", date_utc)
+        .replace("{time_utc}", time_utc)
+    )
+
+
+_WL_TEMPLATES: list[_WLTemplate] = [
+    _WLTemplate("(blank)", "", ""),
+    _WLTemplate(
+        "ARRL Radiogram",
+        "ARRL RADIOGRAM — {callsign}",
+        (
+            "ARRL RADIOGRAM\n\n"
+            "Precedence: R (Routine)\n"
+            "Handling Instructions: \n"
+            "Station of Origin: {callsign}\n"
+            "Check: \n"
+            "Place of Origin: \n"
+            "Time Filed: {time_utc} UTC\n"
+            "Date: {date_utc}\n\n"
+            "TO: \n"
+            "STREET: \n"
+            "CITY: \n"
+            "STATE/ZIP: \n"
+            "PHONE: \n\n"
+            "MESSAGE:\n\n\n\n"
+            "End of message. Please confirm receipt. 73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "Health & Welfare",
+        "Health & Welfare — {callsign}",
+        (
+            "HEALTH & WELFARE MESSAGE\n\n"
+            "From: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n\n"
+            "This message certifies the station below is safe and well.\n\n"
+            "Station: \n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "Status: All is well. No special needs at this time.\n\n"
+            "Please relay to the addressee if possible.\n\n"
+            "73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "Activity Report",
+        "Station Activity Report — {callsign} {date_utc}",
+        (
+            "STATION ACTIVITY REPORT\n\n"
+            "Station: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "Bands / Modes Active: \n"
+            "Traffic Handled: \n"
+            "Stations Worked: \n\n"
+            "Status: Operational\n\n"
+            "Comments:\n\n\n"
+            "73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "EmComm Spot Report",
+        "EmComm Spot Report — {callsign} {time_utc}Z",
+        (
+            "EMCOMM SPOT REPORT\n\n"
+            "From: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "SITUATION:\n\n\n"
+            "RESOURCES NEEDED:\n\n\n"
+            "RESOURCES AVAILABLE:\n\n\n"
+            "CASUALTIES: \n\n"
+            "INFRASTRUCTURE STATUS:\n\n\n"
+            "PRIORITY TRAFFIC:\n\n\n"
+            "Next scheduled contact: \n\n"
+            "73 de {callsign}"
+        ),
+    ),
+]
 
 
 def _cache_age(when: datetime | None) -> str:
@@ -516,6 +624,20 @@ class BrowseScreen(ModalScreen[None]):
             return
         link = self._links[idx - 1]
         dest = link.resolve_dest(self._current[0])
+        # If resolve_dest returned a short hex prefix (didn't match the current
+        # node), consult the offline cache before going live. If the cache has a
+        # unique entry for this prefix+path, its stored dest IS the full 32-char
+        # hash — using it avoids "ambiguous prefix" errors when multiple live RNS
+        # nodes happen to share the same leading hex digits.
+        if (
+            dest
+            and len(dest) < 32
+            and all(c in "0123456789abcdef" for c in dest.lower())
+            and getattr(self._browser, "_cache", None) is not None
+        ):
+            hit = self._browser._cache.get(dest, link.path)
+            if hit is not None:
+                dest = hit.dest
         self._load(dest, link.path, link.fields)
 
     def action_back(self) -> None:
@@ -714,6 +836,802 @@ class WinlinkComposeFormScreen(ModalScreen["dict | None"]):
         self.dismiss(None)
 
 
+class WinlinkEmailComposeScreen(ModalScreen["dict | None"]):
+    """Full-screen modal for composing a Winlink email.
+
+    Replaces the single-line + ``\\n`` workaround with a proper multi-line
+    body editor (TextArea) plus To/Cc/Subject fields and optional templates.
+
+    Returns ``{"to", "cc", "subject", "body", "attachments"}`` on submit,
+    ``{"action": "ics_forms"}`` when the user picks ICS Forms from the
+    template picker, or ``None`` on cancel.
+    """
+
+    CSS = """
+    WinlinkEmailComposeScreen { align: center middle; }
+    #wecf-box {
+        width: 84; height: 90%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wecf-title { height: auto; margin-bottom: 1; }
+    #wecf-fields { height: 1fr; }
+    #wecf-fields Input { margin-bottom: 1; }
+    #wecf-fields Label { color: $text-muted; }
+    #wecf-fields Select { margin-bottom: 1; }
+    #wecf-body { height: 10; margin-bottom: 1; }
+    #wecf-attach-row { height: auto; }
+    #wecf-attach-label { width: 1fr; color: $text-muted; }
+    #wecf-error { height: auto; color: $error; }
+    #wecf-buttons { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    _ICS_SENTINEL = "__ics_forms__"
+
+    def __init__(
+        self,
+        subject: str = "",
+        attachments: list[str] | None = None,
+        callsign: str = "",
+        date_utc: str = "",
+        time_utc: str = "",
+    ) -> None:
+        super().__init__()
+        self._init_subject = subject
+        self._attachments: list[str] = list(attachments or [])
+        self._callsign = callsign
+        self._date_utc = date_utc
+        self._time_utc = time_utc
+        self._last_template_body = ""
+
+    def compose(self) -> ComposeResult:
+        options: list[tuple[str, str]] = [
+            (t.name, str(i)) for i, t in enumerate(_WL_TEMPLATES)
+        ]
+        options.append(("ICS Forms →", self._ICS_SENTINEL))
+        with Vertical(id="wecf-box"):
+            yield Static("[b]✉ Compose Winlink Email[/b]", id="wecf-title")
+            with VerticalScroll(id="wecf-fields"):
+                yield Select(
+                    options,
+                    prompt="— template (optional) —",
+                    id="wecf-template",
+                    allow_blank=True,
+                )
+                yield Label("To:")
+                yield Input(
+                    id="wecf-to",
+                    placeholder="W1AW  (callsign or email address)",
+                )
+                yield Label("Cc:")
+                yield Input(id="wecf-cc", placeholder="optional")
+                yield Label("Subject:")
+                yield Input(id="wecf-subject", value=self._init_subject)
+                yield Label("Body:")
+                yield TextArea(id="wecf-body")
+                yield Label("Attachments:")
+                with Horizontal(id="wecf-attach-row"):
+                    yield Static(self._attach_summary(), id="wecf-attach-label")
+                    yield Button("Clear", id="wecf-attach-clear", classes="modebtn")
+                yield Input(
+                    id="wecf-attach-path",
+                    placeholder="/path/to/attachment  (Enter to add)",
+                )
+            yield Static("", id="wecf-error")
+            with Horizontal(id="wecf-buttons"):
+                yield Button("Cancel", id="wecf-cancel")
+                yield Button(
+                    "Queue to outbox", id="wecf-queue", variant="primary"
+                )
+
+    def on_mount(self) -> None:
+        self.query_one("#wecf-to", Input).focus()
+
+    # -- template picker ------------------------------------------------------
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        if val is Select.BLANK:
+            return
+        if val == self._ICS_SENTINEL:
+            self.dismiss({"action": "ics_forms"})
+            return
+        tmpl = _WL_TEMPLATES[int(val)]
+        body_widget = self.query_one("#wecf-body", TextArea)
+        current_body = body_widget.text
+        if not current_body.strip() or current_body == self._last_template_body:
+            body = _substitute_wl_template(
+                tmpl.body, self._callsign, self._date_utc, self._time_utc
+            )
+            body_widget.load_text(body)
+            self._last_template_body = body
+        subj_widget = self.query_one("#wecf-subject", Input)
+        if not subj_widget.value.strip() and tmpl.subject:
+            subj_widget.value = _substitute_wl_template(
+                tmpl.subject, self._callsign, self._date_utc, self._time_utc
+            )
+
+    # -- attachments ----------------------------------------------------------
+
+    def _attach_summary(self) -> str:
+        if not self._attachments:
+            return "[dim]\U0001f4ce[/dim] None"
+        names = ", ".join(os.path.basename(p) for p in self._attachments)
+        return f"[dim]\U0001f4ce[/dim] {len(self._attachments)}: {names}"
+
+    def _queue_attachment(self, path: str) -> None:
+        path = path.strip()
+        if not path:
+            return
+        if not os.path.exists(path):
+            self.query_one("#wecf-error", Static).update(
+                f"File not found: {path}"
+            )
+            return
+        self._attachments.append(path)
+        self.query_one("#wecf-attach-label", Static).update(
+            self._attach_summary()
+        )
+        self.query_one("#wecf-error", Static).update("")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "wecf-attach-path":
+            self._queue_attachment(event.input.value)
+            event.input.value = ""
+
+    # -- buttons --------------------------------------------------------------
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "wecf-cancel":
+            self.dismiss(None)
+        elif bid == "wecf-attach-clear":
+            self._attachments = []
+            self.query_one("#wecf-attach-label", Static).update(
+                self._attach_summary()
+            )
+        elif bid == "wecf-queue":
+            to = self.query_one("#wecf-to", Input).value.strip()
+            if not to:
+                self.query_one("#wecf-error", Static).update(
+                    "To: address is required."
+                )
+                return
+            attach_input = self.query_one("#wecf-attach-path", Input).value
+            if attach_input.strip():
+                self._queue_attachment(attach_input)
+                if not os.path.exists(attach_input.strip()):
+                    return
+            self.dismiss(self._build_result())
+
+    def _build_result(self) -> dict:
+        return {
+            "to": self.query_one("#wecf-to", Input).value.strip(),
+            "cc": self.query_one("#wecf-cc", Input).value.strip() or None,
+            "subject": self.query_one("#wecf-subject", Input).value.strip(),
+            "body": self.query_one("#wecf-body", TextArea).text,
+            "attachments": list(self._attachments),
+        }
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class WinlinkWXSubscribeScreen(ModalScreen[bool]):
+    """Instructions for subscribing to NWS bulletins via Winlink.
+
+    Dismisses with True if the user wants to open the compose modal to send
+    the subscription request, False otherwise.
+    """
+
+    CSS = """
+    WinlinkWXSubscribeScreen { align: center middle; }
+    #wxsub-box {
+        width: 76; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #wxsub-title  { height: auto; margin-bottom: 1; }
+    #wxsub-body   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #wxsub-hint   { height: auto; color: $text-muted; margin-bottom: 1; }
+    #wxsub-btns   { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, grid: str = "") -> None:
+        super().__init__()
+        self._grid = grid.upper()[:6] if grid else ""
+
+    def compose(self) -> ComposeResult:
+        grid_hint = f" for grid {self._grid}" if self._grid else ""
+        with Vertical(id="wxsub-box"):
+            yield Static("[b]⛅ Subscribe to NWS Bulletins via Winlink[/b]", id="wxsub-title")
+            yield Static(
+                f"NWS distributes official weather bulletins to licensed amateur stations "
+                f"via Winlink. To receive forecasts{grid_hint}, send a subscription request "
+                f"to the NWS Winlink gateway:\n\n"
+                f"  [b]To:[/b] NWS\n"
+                f"  [b]Subject:[/b] SUBSCRIBE{' ' + self._grid[:4] if self._grid else ''}\n"
+                f"  [b]Body:[/b] (leave blank)\n\n"
+                f"Bulletins will arrive in your Winlink inbox during any connect session. "
+                f"They are automatically tagged as weather data in this app.",
+                id="wxsub-body",
+            )
+            yield Static(
+                "[dim]Press 'Open Compose' to pre-fill the request, or Esc to cancel.[/dim]",
+                id="wxsub-hint",
+            )
+            with Horizontal(id="wxsub-btns"):
+                yield Button("Cancel", id="wxsub-cancel")
+                yield Button("Open Compose →", id="wxsub-open", variant="primary")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "wxsub-open":
+            self.dismiss(True)
+        else:
+            self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class WXSetupScreen(ModalScreen[dict | None]):
+    """Weather setup: manage grid squares and passive radio source subscriptions.
+
+    Grid squares are shown in a ListView (arrow keys to navigate, Remove to
+    delete the highlighted entry).  The add field forces uppercase as you type.
+    MeshCore and Reticulum checkboxes stay open until the user explicitly saves.
+
+    Returns ``{"meshcore": bool, "reticulum": bool, "grids": str}`` on save,
+    or ``None`` on cancel.
+    """
+
+    CSS = """
+    WXSetupScreen { align: center middle; }
+    #wxsetup-box {
+        width: 72; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #wxsetup-title      { height: auto; margin-bottom: 1; }
+    #wxsetup-grids-l    { height: auto; }
+    #wxsetup-grid-list  { height: 5; margin-bottom: 0; }
+    #wxsetup-grid-rm    { height: 3; width: auto; margin-bottom: 1; }
+    #wxsetup-add-row    { height: 3; margin-bottom: 1; }
+    #wxsetup-grid-input { width: 1fr; }
+    #wxsetup-grid-add   { width: 7; min-width: 7; }
+    #wxsetup-sources-l  { height: auto; margin-top: 1; margin-bottom: 1; }
+    #wxsetup-btns       { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(
+        self,
+        has_meshcore: bool = False,
+        has_reticulum: bool = False,
+        current_grids: str = "",
+    ) -> None:
+        super().__init__()
+        self._has_mc = has_meshcore
+        self._has_rns = has_reticulum
+        self._grids: list[str] = [
+            g.strip().upper()
+            for g in current_grids.split(",")
+            if g.strip()
+        ]
+
+    def compose(self) -> ComposeResult:
+        mc_note = "" if self._has_mc else " [dim](when MeshCore connects)[/dim]"
+        rns_note = "" if self._has_rns else " [dim](when Reticulum connects)[/dim]"
+        with Vertical(id="wxsetup-box"):
+            yield Static("[b]⛅ Weather Setup[/b]", id="wxsetup-title")
+            yield Static(
+                "Grid squares (↑↓ to select, Remove to delete):",
+                id="wxsetup-grids-l",
+            )
+            yield ListView(id="wxsetup-grid-list")
+            yield Button("Remove selected", id="wxsetup-grid-rm", variant="warning")
+            with Horizontal(id="wxsetup-add-row"):
+                yield Input(placeholder="FN42", id="wxsetup-grid-input", max_length=6)
+                yield Button("+ Add", id="wxsetup-grid-add", variant="default")
+            yield Static(
+                "[b]Passive radio sources[/b]",
+                id="wxsetup-sources-l",
+            )
+            yield Checkbox(
+                f"MeshCore #weather channel{mc_note}",
+                value=self._has_mc,
+                id="wxsetup-mc-cb",
+            )
+            yield Checkbox(
+                f"Reticulum #weather / #nws_alerts groups{rns_note}",
+                value=self._has_rns,
+                id="wxsetup-rns-cb",
+            )
+            with Horizontal(id="wxsetup-btns"):
+                yield Button("Cancel", id="wxsetup-skip")
+                yield Button("Save", id="wxsetup-both", variant="primary")
+
+    def on_mount(self) -> None:
+        lst = self.query_one("#wxsetup-grid-list", ListView)
+        for grid in self._grids:
+            lst.append(ListItem(Label(grid)))
+        self.query_one("#wxsetup-grid-input", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "wxsetup-grid-input":
+            upper = event.value.upper()
+            if upper != event.value:
+                event.input.value = upper
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "wxsetup-grid-input":
+            self._do_add_grid()
+
+    def _do_add_grid(self) -> None:
+        inp = self.query_one("#wxsetup-grid-input", Input)
+        grid = inp.value.strip().upper()
+        if grid and grid not in self._grids:
+            self._grids.append(grid)
+            self.query_one("#wxsetup-grid-list", ListView).append(
+                ListItem(Label(grid))
+            )
+        inp.value = ""
+        inp.focus()
+
+    def _build_result(self) -> dict:
+        mc = self.query_one("#wxsetup-mc-cb", Checkbox).value
+        rns = self.query_one("#wxsetup-rns-cb", Checkbox).value
+        return {"meshcore": mc, "reticulum": rns, "grids": ",".join(self._grids)}
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid == "wxsetup-skip":
+            self.dismiss(None)
+        elif bid == "wxsetup-both":
+            self.dismiss(self._build_result())
+        elif bid == "wxsetup-grid-add":
+            self._do_add_grid()
+            event.stop()
+        elif bid == "wxsetup-grid-rm":
+            lst = self.query_one("#wxsetup-grid-list", ListView)
+            idx = lst.index
+            if idx is not None and 0 <= idx < len(self._grids):
+                del self._grids[idx]
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
+            event.stop()
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
+
+class SettingsScreen(ModalScreen["dict | None"]):
+    """Four-tab settings modal: Favorites, Weather, Backup, Database."""
+
+    CSS = """
+    SettingsScreen { align: center middle; }
+    #settings-box {
+        width: 76; height: auto; max-height: 95vh;
+        padding: 1 2; border: thick $accent; background: $surface;
+    }
+    #settings-title     { height: auto; margin-bottom: 1; }
+    #settings-tabs      { height: 3; }
+    #settings-tabs Button {
+        height: 1; border: none; padding: 0 2; margin: 0 1 0 0;
+    }
+    #settings-tabs Button.-active { text-style: bold reverse; }
+    #settings-content   { height: auto; }
+    /* Favorites pane */
+    #stab-fav-pane      { height: auto; }
+    #stab-fav-list      { height: 8; margin-bottom: 0; }
+    #stab-fav-rm        { height: 3; width: auto; margin-bottom: 1; }
+    #stab-fav-kinds     { height: 3; margin-bottom: 0; }
+    #stab-fav-kinds Button { height: 1; min-width: 8; border: none; padding: 0 1; margin: 0 1 0 0; }
+    #stab-fav-kinds Button.-active { text-style: bold reverse; }
+    #stab-fav-add-row   { height: 3; margin-top: 1; }
+    #stab-fav-id        { width: 1fr; }
+    #stab-fav-label     { width: 20; }
+    #stab-fav-add       { width: 7; min-width: 7; }
+    /* Weather pane */
+    #stab-wx-pane       { height: auto; }
+    #stab-wx-list       { height: 5; margin-bottom: 0; }
+    #stab-wx-rm         { height: 3; width: auto; margin-bottom: 1; }
+    #stab-wx-add-row    { height: 3; margin-bottom: 1; }
+    #stab-wx-grid-input { width: 1fr; }
+    #stab-wx-grid-add   { width: 7; min-width: 7; }
+    #stab-wx-sources-l  { height: auto; margin-top: 1; }
+    /* Backup pane */
+    #stab-bak-pane      { height: auto; }
+    #stab-bak-status    { height: auto; margin-bottom: 1; color: $text-muted; }
+    #stab-bak-btns      { height: 3; margin-bottom: 1; }
+    #stab-bak-restore-l { height: auto; margin-bottom: 0; }
+    #stab-bak-restore-row { height: 3; margin-bottom: 1; }
+    #stab-bak-path      { width: 1fr; }
+    #stab-bak-do        { width: 10; min-width: 10; }
+    #stab-bak-log       { height: auto; color: $text-muted; }
+    /* Database pane */
+    #stab-db-pane       { height: auto; }
+    #stab-db-stats      { height: auto; margin-bottom: 1; color: $text-muted; }
+    #stab-db-vac-row    { height: 3; margin-bottom: 1; }
+    #stab-db-vacuum     { width: auto; }
+    #stab-db-prune-l    { height: auto; margin-bottom: 0; }
+    #stab-db-prune-row  { height: 3; margin-bottom: 1; }
+    #stab-db-days       { width: 8; }
+    #stab-db-do         { width: 10; min-width: 10; }
+    #stab-db-log        { height: auto; color: $text-muted; }
+    /* Footer */
+    #settings-footer    { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+
+    BINDINGS = [("escape", "close_settings", "Close")]
+
+    def __init__(self, core) -> None:
+        super().__init__()
+        self._core = core
+        self._add_kind: str = "callsign"
+        self._wx_grids: list[str] = [
+            g.strip().upper()
+            for g in str(core.config.ui.get("wx_grids", "") or "").split(",")
+            if g.strip()
+        ]
+        self._has_mc = any(t.name == "meshcore" for t in core.transports)
+        self._has_rns = any(t.name == "reticulum" for t in core.transports)
+
+    def compose(self) -> ComposeResult:
+        mc_note = "" if self._has_mc else " [dim](when MC connects)[/dim]"
+        rns_note = "" if self._has_rns else " [dim](when RNS connects)[/dim]"
+        with Vertical(id="settings-box"):
+            yield Static("[b]⚙ Settings[/b]", id="settings-title")
+            with Horizontal(id="settings-tabs"):
+                yield Button("Favorites", id="stab-fav", classes="stab")
+                yield Button("Weather", id="stab-wx", classes="stab")
+                yield Button("Backup", id="stab-bak", classes="stab")
+                yield Button("Database", id="stab-db", classes="stab")
+            with ContentSwitcher(initial="stab-fav-pane", id="settings-content"):
+                with Vertical(id="stab-fav-pane"):
+                    yield Static("Saved contacts (arrow keys to select):")
+                    yield ListView(id="stab-fav-list")
+                    yield Button("Remove selected", id="stab-fav-rm", variant="warning")
+                    yield Static("Type:")
+                    with Horizontal(id="stab-fav-kinds"):
+                        yield Button("User", id="stab-kind-user", classes="stab-kind")
+                        yield Button("Group", id="stab-kind-group", classes="stab-kind")
+                        yield Button("Room", id="stab-kind-room", classes="stab-kind")
+                    with Horizontal(id="stab-fav-add-row"):
+                        yield Input(
+                            placeholder="ID (callsign / @group / #room)",
+                            id="stab-fav-id",
+                        )
+                        yield Input(
+                            placeholder="Label (opt.)",
+                            id="stab-fav-label",
+                            max_length=40,
+                        )
+                        yield Button("+ Add", id="stab-fav-add", variant="default")
+                with Vertical(id="stab-wx-pane"):
+                    yield Static("Grid squares (arrow keys to select):", id="stab-wx-l")
+                    yield ListView(id="stab-wx-list")
+                    yield Button("Remove selected", id="stab-wx-rm", variant="warning")
+                    with Horizontal(id="stab-wx-add-row"):
+                        yield Input(
+                            placeholder="FN42",
+                            id="stab-wx-grid-input",
+                            max_length=6,
+                        )
+                        yield Button("+ Add", id="stab-wx-grid-add", variant="default")
+                    yield Static(
+                        "\n[b]Passive radio sources[/b]", id="stab-wx-sources-l"
+                    )
+                    yield Checkbox(
+                        f"MeshCore #weather channel{mc_note}",
+                        id="stab-wx-mc",
+                    )
+                    yield Checkbox(
+                        f"Reticulum #weather / #nws_alerts{rns_note}",
+                        id="stab-wx-rns",
+                    )
+                with Vertical(id="stab-bak-pane"):
+                    yield Static("", id="stab-bak-status")
+                    with Horizontal(id="stab-bak-btns"):
+                        yield Button("Backup Now", id="stab-bak-backup", variant="primary")
+                    yield Static("Restore from archive:", id="stab-bak-restore-l")
+                    with Horizontal(id="stab-bak-restore-row"):
+                        yield Input(
+                            placeholder="/path/to/radio_app-backup-*.tar.gz",
+                            id="stab-bak-path",
+                        )
+                        yield Button("Restore…", id="stab-bak-do", variant="warning")
+                    yield Static("", id="stab-bak-log")
+                with Vertical(id="stab-db-pane"):
+                    yield Static("", id="stab-db-stats")
+                    with Horizontal(id="stab-db-vac-row"):
+                        yield Button("Vacuum Now", id="stab-db-vacuum", variant="primary")
+                    yield Static("Prune messages older than:", id="stab-db-prune-l")
+                    with Horizontal(id="stab-db-prune-row"):
+                        yield Input(placeholder="90", id="stab-db-days", max_length=5)
+                        yield Static(" days  ", id="stab-db-days-l")
+                        yield Button("Prune…", id="stab-db-do", variant="warning")
+                    yield Static("", id="stab-db-log")
+            with Horizontal(id="settings-footer"):
+                yield Button("Close", id="settings-close", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#stab-fav", Button).add_class("-active")
+        self.query_one("#stab-kind-user", Button).add_class("-active")
+        self._refresh_fav_list()
+        wx_lst = self.query_one("#stab-wx-list", ListView)
+        for grid in self._wx_grids:
+            wx_lst.append(ListItem(Label(grid)))
+        self._refresh_backup_status()
+        self._refresh_db_stats()
+
+    def _refresh_fav_list(self) -> None:
+        lst = self.query_one("#stab-fav-list", ListView)
+        lst.clear()
+        for fav in self._core.favorites.all():
+            k = getattr(fav, "kind", "") or ""
+            fid = fav.id or ""
+            if k == "node":
+                badge = "[dim]Node[/dim]"
+            elif k == "mc_channel" or fid.startswith("#"):
+                badge = "[dim]Room[/dim]"
+            elif k == "group" or fid.startswith("@"):
+                badge = "[dim]Grp [/dim]"
+            elif k == "mc_peer":
+                badge = "[dim]MC  [/dim]"
+            else:
+                badge = "[dim]User[/dim]"
+            label_str = f'  "{fav.label}"' if fav.label else ""
+            lst.append(ListItem(Label(f"{badge}  {fid}{label_str}")))
+
+    def _refresh_backup_status(self) -> None:
+        cfg_dir = self._core.config.path.parent
+        backups = sorted(cfg_dir.glob("radio_app-backup-*.tar.gz"))
+        status = self.query_one("#stab-bak-status", Static)
+        if backups:
+            latest = backups[-1]
+            size_kb = latest.stat().st_size // 1024
+            status.update(f"Last backup: {latest.name} ({size_kb} KB)")
+        else:
+            status.update("No backup found in config directory.")
+
+    def _refresh_db_stats(self) -> None:
+        try:
+            s = self._core.store.stats()
+            msgs = s.get("messages", 0)
+            threads = s.get("threads", 0)
+            size_kb = (s.get("size_bytes") or 0) // 1024
+            size_str = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb} KB"
+            self.query_one("#stab-db-stats", Static).update(
+                f"{msgs:,} messages · {threads:,} threads · {size_str}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @work
+    async def _do_vacuum(self) -> None:
+        try:
+            freed = self._core.store.vacuum()
+            freed_kb = freed // 1024
+            msg = f"✓ Vacuum done — freed {freed_kb} KB." if freed_kb else "✓ Vacuum done — nothing to reclaim."
+            self._set_db_log(msg)
+            self._refresh_db_stats()
+        except Exception as exc:  # noqa: BLE001
+            self._set_db_log(f"✗ Vacuum failed: {exc}")
+
+    @work
+    async def _do_prune(self, days: int) -> None:
+        try:
+            removed = self._core.store.purge_older_than(days)
+            msg = f"✓ Pruned {removed} message(s) older than {days} days."
+            self._set_db_log(msg)
+            self._refresh_db_stats()
+        except Exception as exc:  # noqa: BLE001
+            self._set_db_log(f"✗ Prune failed: {exc}")
+
+    def _trigger_prune(self) -> None:
+        raw = self.query_one("#stab-db-days", Input).value.strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            self._set_db_log("Enter a positive number of days.")
+            return
+        self._do_prune(int(raw))
+
+    def _set_db_log(self, msg: str) -> None:
+        try:
+            self.query_one("#stab-db-log", Static).update(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _set_active_tab(self, tab_id: str) -> None:
+        for tid in ("stab-fav", "stab-wx", "stab-bak", "stab-db"):
+            try:
+                self.query_one(f"#{tid}", Button).set_class(tid == tab_id, "-active")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id in ("stab-fav-id", "stab-wx-grid-input"):
+            upper = event.value.upper()
+            if upper != event.value:
+                event.input.value = upper
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id in ("stab-fav-id", "stab-fav-label"):
+            self._do_add_fav()
+            event.stop()
+        elif event.input.id == "stab-wx-grid-input":
+            self._do_add_wx_grid()
+            event.stop()
+        elif event.input.id == "stab-db-days":
+            self._trigger_prune()
+            event.stop()
+
+    def _do_add_fav(self) -> None:
+        fid = self.query_one("#stab-fav-id", Input).value.strip()
+        label = self.query_one("#stab-fav-label", Input).value.strip()
+        if not fid:
+            return
+        if self._add_kind == "group" and not fid.startswith("@"):
+            fid = f"@{fid}"
+        elif self._add_kind == "mc_channel" and not fid.startswith("#"):
+            fid = f"#{fid}"
+        self._core.favorites.add(fid, label, kind=self._add_kind)
+        self._core.favorites.save(self._core.config)
+        self.query_one("#stab-fav-id", Input).value = ""
+        self.query_one("#stab-fav-label", Input).value = ""
+        self._refresh_fav_list()
+
+    def _do_add_wx_grid(self) -> None:
+        inp = self.query_one("#stab-wx-grid-input", Input)
+        grid = inp.value.strip().upper()
+        if grid and grid not in self._wx_grids:
+            self._wx_grids.append(grid)
+            self.query_one("#stab-wx-list", ListView).append(ListItem(Label(grid)))
+        inp.value = ""
+        inp.focus()
+
+    def _build_wx_result(self) -> dict:
+        mc = self.query_one("#stab-wx-mc", Checkbox).value
+        rns = self.query_one("#stab-wx-rns", Checkbox).value
+        return {"meshcore": mc, "reticulum": rns, "grids": ",".join(self._wx_grids)}
+
+    @work(thread=True)
+    def _do_backup(self) -> None:
+        from ..core import backup as bk
+        try:
+            result = bk.create_backup(
+                self._core.config.path,
+                self._core.config.database_path(),
+            )
+            size_kb = result.size_bytes // 1024
+            self.app.call_from_thread(
+                self._set_bak_log,
+                f"✓ Backup written: {result.path.name} ({size_kb} KB)",
+            )
+            self.app.call_from_thread(self._refresh_backup_status)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(
+                self._set_bak_log, f"✗ Backup failed: {exc}"
+            )
+
+    @work(thread=True)
+    def _do_restore(self, path_str: str) -> None:
+        from pathlib import Path as _Path
+        from ..core import backup as bk
+        archive = _Path(path_str).expanduser()
+        if not archive.exists():
+            self.app.call_from_thread(
+                self._set_bak_log, f"File not found: {path_str}"
+            )
+            return
+        try:
+            result = bk.restore_backup(
+                archive,
+                self._core.config.path,
+                self._core.config.database_path(),
+            )
+            msg = (
+                f"✓ Restored — config: {result.config_restored}, "
+                f"db: {result.db_restored}. Restart the app to apply."
+            )
+            self.app.call_from_thread(self._set_bak_log, msg)
+        except Exception as exc:  # noqa: BLE001
+            self.app.call_from_thread(
+                self._set_bak_log, f"✗ Restore failed: {exc}"
+            )
+
+    def _set_bak_log(self, msg: str) -> None:
+        try:
+            self.query_one("#stab-bak-log", Static).update(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        # Tab switching
+        if bid == "stab-fav":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-fav-pane"
+            self._set_active_tab("stab-fav")
+            event.stop()
+        elif bid == "stab-wx":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-wx-pane"
+            self._set_active_tab("stab-wx")
+            event.stop()
+        elif bid == "stab-bak":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-bak-pane"
+            self._set_active_tab("stab-bak")
+            event.stop()
+        elif bid == "stab-db":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-db-pane"
+            self._set_active_tab("stab-db")
+            event.stop()
+        # Kind selector
+        elif bid in ("stab-kind-user", "stab-kind-group", "stab-kind-room"):
+            kind_map = {
+                "stab-kind-user": "callsign",
+                "stab-kind-group": "group",
+                "stab-kind-room": "mc_channel",
+            }
+            self._add_kind = kind_map[bid]
+            for k in kind_map:
+                try:
+                    self.query_one(f"#{k}", Button).set_class(k == bid, "-active")
+                except Exception:  # noqa: BLE001
+                    pass
+            event.stop()
+        # Favorites actions
+        elif bid == "stab-fav-add":
+            self._do_add_fav()
+            event.stop()
+        elif bid == "stab-fav-rm":
+            lst = self.query_one("#stab-fav-list", ListView)
+            idx = lst.index
+            if idx is not None:
+                favs = self._core.favorites.all()
+                if 0 <= idx < len(favs):
+                    self._core.favorites.remove(favs[idx].id)
+                    self._core.favorites.save(self._core.config)
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
+            event.stop()
+        # WX grid actions
+        elif bid == "stab-wx-grid-add":
+            self._do_add_wx_grid()
+            event.stop()
+        elif bid == "stab-wx-rm":
+            lst = self.query_one("#stab-wx-list", ListView)
+            idx = lst.index
+            if idx is not None and 0 <= idx < len(self._wx_grids):
+                del self._wx_grids[idx]
+                if lst.highlighted_child is not None:
+                    lst.highlighted_child.remove()
+            event.stop()
+        # Backup actions
+        elif bid == "stab-bak-backup":
+            self._do_backup()
+            event.stop()
+        elif bid == "stab-bak-do":
+            path_str = self.query_one("#stab-bak-path", Input).value.strip()
+            if path_str:
+                self._do_restore(path_str)
+            else:
+                self._set_bak_log("Enter a backup archive path first.")
+            event.stop()
+        # Database actions
+        elif bid == "stab-db-vacuum":
+            self._do_vacuum()
+            event.stop()
+        elif bid == "stab-db-do":
+            self._trigger_prune()
+            event.stop()
+        # Close
+        elif bid == "settings-close":
+            self.action_close_settings()
+            event.stop()
+
+    def action_close_settings(self) -> None:
+        self.dismiss({"wx": self._build_wx_result()})
+
+
 class AboutScreen(ModalScreen[None]):
     """Hidden "about" easter egg: a scrollable technical overview of the app.
 
@@ -808,6 +1726,8 @@ class LaunchCmdScreen(ModalScreen):
 class RadioTUI(App):
     """The Textual application."""
 
+    ENABLE_COMMAND_PALETTE = False
+
     # Transports whose per-message size cap is advisory rather than a hard
     # protocol limit. JS8Call has no documented character cap — it auto-frames
     # long text into successive transmissions — so we warn instead of blocking.
@@ -873,8 +1793,8 @@ class RadioTUI(App):
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
     #health-body { height: 1fr; }
-    #health-log { height: 1fr; width: 1fr; padding: 0 1; }
-    #health-sys-log { height: 1fr; width: 1fr; padding: 0 1; border-left: tall $panel; }
+    #health-log { height: 1fr; width: 50%; padding: 0 1; }
+    #health-sys-log { height: 1fr; width: 50%; padding: 0 1; border-left: tall $panel; }
     #logs-view { height: 1fr; }
     #logs-bar { height: 1; }
     #logs-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
@@ -902,6 +1822,15 @@ class RadioTUI(App):
     #net-spacer { width: 1fr; height: 1; }
     #net-bar Button { height: 1; min-width: 8; border: none; margin: 0 1 0 0; }
     #net-log { height: 1fr; padding: 0 1; }
+    #weather-view { height: 1fr; }
+    #wx-bar { height: 1; }
+    #wx-grid-label { height: 1; width: auto; color: $accent; padding: 0 1 0 0; }
+    #wx-grid-prev { height: 1; min-width: 3; border: none; margin: 0; }
+    #wx-grid-next { height: 1; min-width: 3; border: none; margin: 0 1 0 0; }
+    #wx-grid { width: 8; border: none; height: 1; }
+    #wx-spacer { width: 1fr; height: 1; }
+    #wx-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #wx-log { height: 1fr; padding: 0 1; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -918,13 +1847,14 @@ class RadioTUI(App):
         Binding("q", "quit", "Quit"),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
-        ("f5", "cycle_utility", "Stream/Health/Fav"),
+        ("f5", "cycle_utility", "Stream/Health…"),
+        Binding("ctrl+l", "logs", "Logs", show=False, priority=True),
         ("f", "toggle_nomad_favorite", "Save node"),
         ("s", "sync_nomad", "Sync favs"),
         ("g", "cycle_watch_group", "Group filter"),
         ("i", "identity", "My address"),
         ("ctrl+n", "announce", "Announce"),
-        ("ctrl+p", "find_path", "Find path"),
+        Binding("ctrl+p", "settings", "Settings", show=True, priority=True),
         Binding("ctrl+w", "close_chat", "Close chat", priority=True),
         ("delete", "remove_favorite", "Remove fav"),
         Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
@@ -932,6 +1862,7 @@ class RadioTUI(App):
         # Full-text history search palette. Priority so it fires even while the
         # composer (or another Input) has focus.
         Binding("ctrl+f", "search", "Search", priority=True),
+        Binding("escape", "deselect_chat", "All messages", show=False, priority=True),
         Binding("escape", "close_search", "Close search", show=False, priority=True),
         # Hidden easter egg: technical "about" overview. show=False keeps it out
         # of the footer; priority lets it fire even while the composer is focused.
@@ -953,7 +1884,7 @@ class RadioTUI(App):
         if action == "toggle_fav_only":
             return self.view in ("monitor", "active", "nomadnet")
         # Reticulum-only tools: only meaningful in the Reticulum chat mode.
-        if action in ("identity", "find_path"):
+        if action == "identity":
             return self.view == "active" and self.active_transport == "reticulum"
         # Announce is available in both Reticulum (LXMF announce) and MeshCore
         # (node advert) modes.
@@ -971,6 +1902,12 @@ class RadioTUI(App):
         # Cycle the Watch stream group filter: only on the Watch surface.
         if action == "cycle_watch_group":
             return self.view == "monitor"
+        # Escape deselects the open chat (returns to full feed, keeps history).
+        # Don't steal Escape from modal screens — let them handle it themselves.
+        if action == "deselect_chat":
+            if len(self.screen_stack) > 1:
+                return False
+            return self.view == "active" and self.current_target is not None
         # Escape only closes the search palette while it's open (otherwise let
         # the key pass through to focused widgets).
         if action == "close_search":
@@ -1101,6 +2038,10 @@ class RadioTUI(App):
         self._cmd_hist_pos: dict[str, int] = {}   # -1 = not browsing
         self._cmd_hist_draft: dict[str, str] = {} # saved partial input while browsing
         self._cmd_hist_limit: int = 100
+        # Weather surface: saved grid squares for the picker (loaded from config
+        # on first _show_weather() call) and the active index.
+        self._wx_grids: list[str] = []
+        self._wx_grid_idx: int = 0
 
     # -- layout ---------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -1145,10 +2086,16 @@ class RadioTUI(App):
                         "\u270e Subject", id="winlink-subject", classes="modebtn"
                     )
                     yield Button(
+                        "\u2709 Compose", id="winlink-compose", classes="modebtn"
+                    )
+                    yield Button(
                         "\U0001f4cb Forms", id="winlink-forms", classes="modebtn"
                     )
                     yield Button(
                         "\U0001f4e1 Connect", id="winlink-connect", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4e5 Outbox", id="winlink-outbox", classes="modebtn"
                     )
                     yield Button(
                         "\u2630 Gateways", id="winlink-gateways", classes="modebtn"
@@ -1207,10 +2154,12 @@ class RadioTUI(App):
                 )
                 with Horizontal(id="health-body"):
                     yield RichLog(
-                        id="health-log", wrap=True, markup=True, highlight=False
+                        id="health-log", wrap=True, markup=True, highlight=False,
+                        auto_scroll=False,
                     )
                     yield RichLog(
-                        id="health-sys-log", wrap=True, markup=True, highlight=False
+                        id="health-sys-log", wrap=True, markup=True, highlight=False,
+                        auto_scroll=False,
                     )
             with Vertical(id="logs-view"):
                 with Horizontal(id="logs-bar"):
@@ -1280,6 +2229,26 @@ class RadioTUI(App):
                     yield Button("✗ Close", id="net-close-btn", classes="modebtn")
                 yield RichLog(
                     id="net-log", wrap=True, markup=True, highlight=False
+                )
+            with Vertical(id="weather-view"):
+                with Horizontal(id="wx-bar"):
+                    yield Static("⛅", id="wx-grid-label")
+                    yield Button("◀", id="wx-grid-prev", classes="modebtn")
+                    yield Input(value="", id="wx-grid", placeholder="FN31")
+                    yield Button("▶", id="wx-grid-next", classes="modebtn")
+                    yield Static("", id="wx-spacer")
+                    yield Button("All", id="wx-filter-all", classes="modebtn")
+                    yield Button("Inet", id="wx-filter-net", classes="modebtn")
+                    yield Button("JS8", id="wx-filter-js8", classes="modebtn")
+                    yield Button("WL", id="wx-filter-wl", classes="modebtn")
+                    yield Button("RNS", id="wx-filter-rns", classes="modebtn")
+                    yield Button("MC", id="wx-filter-mc", classes="modebtn")
+                    yield Button("🌐 Fetch", id="wx-online", classes="modebtn")
+                    yield Button("📡 JS8", id="wx-query", classes="modebtn")
+                    yield Button("📧 Subscribe", id="wx-subscribe", classes="modebtn")
+                    yield Button("⚙ Setup", id="wx-setup", classes="modebtn")
+                yield RichLog(
+                    id="wx-log", wrap=True, markup=True, highlight=False
                 )
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
@@ -1514,6 +2483,11 @@ class RadioTUI(App):
             if self.view == "health":
                 self._render_health()
             return
+        # Weather bulletins: append to WX feed when the view is active.
+        if msg.metadata.get("kind") == "weather_bulletin":
+            if self.view == "weather":
+                self._render_weather()
+            return
         # Delivery receipts (e.g. LXMF) annotate a previously-sent message with a
         # delivered/failed indicator; they are not conversations.
         if msg.metadata.get("kind") == "delivery":
@@ -1708,6 +2682,20 @@ class RadioTUI(App):
             self._refresh_threads()
         self._update_status()
 
+    @work
+    async def action_settings(self) -> None:
+        """Open the Settings modal (Favorites / Weather / Backup)."""
+        if self.core is None:
+            return
+        if isinstance(self.screen, SettingsScreen):
+            return
+        result = await self.push_screen_wait(SettingsScreen(self.core))
+        if result is None:
+            return
+        wx_result = result.get("wx")
+        if wx_result is not None:
+            await self._apply_wx_result(wx_result)
+
     def action_about(self) -> None:
         """Hidden easter egg: show the technical 'about' overview.
 
@@ -1762,6 +2750,12 @@ class RadioTUI(App):
         self._log_system(
             f"replying to {self._display_id(ident)} — type a message and press Enter"
         )
+
+    def action_deselect_chat(self) -> None:
+        """Return to the full-feed view without deleting the thread (Escape)."""
+        self.current_target = None
+        if self.view == "active" and self.active_transport:
+            self._show_all_messages()
 
     def action_close_chat(self) -> None:
         """Close (delete) the open conversation, removing it from the list."""
@@ -2137,6 +3131,16 @@ class RadioTUI(App):
     # Canonical display order for mode chips and F3 cycling.
     _MODE_ORDER = ["meshcore", "reticulum", "nomadnet", "js8call", "winlink", "wsjt_x"]
 
+    # Abbreviated labels shown in the mode-selector bar.
+    _MODE_SHORT_LABELS: dict[str, str] = {
+        "meshcore":  "MC",
+        "reticulum": "RNS",
+        "nomadnet":  "Nomad",
+        "js8call":   "JS8",
+        "winlink":   "WL",
+        "wsjt_x":    "WSJTX",
+    }
+
     def _mode_keys(self) -> list[str]:
         """Ordered selectable operating modes, matching the selector chips."""
         if not self.core:
@@ -2169,14 +3173,38 @@ class RadioTUI(App):
             self._show_watch()
         elif bid == "view-health":
             self.action_health()
-        elif bid == "view-favorites":
-            self._show_favorites()
         elif bid == "view-logs":
             self.action_logs()
         elif bid == "view-archive":
             self.action_archive()
         elif bid == "view-net":
             self._show_net()
+        elif bid == "view-weather":
+            self._show_weather()
+        elif bid == "wx-grid-prev":
+            self._wx_cycle_grid(-1)
+        elif bid == "wx-grid-next":
+            self._wx_cycle_grid(1)
+        elif bid == "wx-filter-all":
+            self._render_weather(transport_filter=None)
+        elif bid == "wx-filter-net":
+            self._render_weather(transport_filter="internet")
+        elif bid == "wx-filter-js8":
+            self._render_weather(transport_filter="js8call")
+        elif bid == "wx-filter-wl":
+            self._render_weather(transport_filter="winlink")
+        elif bid == "wx-filter-rns":
+            self._render_weather(transport_filter="reticulum")
+        elif bid == "wx-filter-mc":
+            self._render_weather(transport_filter="meshcore")
+        elif bid == "wx-online":
+            self._wx_fetch_internet()
+        elif bid == "wx-query":
+            self._wx_js8_query()
+        elif bid == "wx-subscribe":
+            self._wx_subscribe_guide()
+        elif bid == "wx-setup":
+            self._wx_run_setup()
         elif bid == "archive-mode":
             self._cycle_archive_filter()
         elif bid == "archive-refresh":
@@ -2225,10 +3253,14 @@ class RadioTUI(App):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
             self._winlink_subject_prompt()
+        elif bid == "winlink-compose":
+            self._winlink_email_compose()
         elif bid == "winlink-forms":
             self._winlink_open_forms()
         elif bid == "winlink-connect":
             self._winlink_connect()
+        elif bid == "winlink-outbox":
+            self._winlink_show_outbox()
         elif bid == "winlink-gateways":
             self._winlink_list_gateways()
         elif bid == "fav-remove":
@@ -2301,7 +3333,7 @@ class RadioTUI(App):
         Stream, then advances Stream -> Health -> History -> Favorites -> Logs
         -> Stream.
         """
-        order = ["monitor", "health", "archive", "favorites", "net", "logs"]
+        order = ["monitor", "health", "archive", "favorites", "net", "weather", "logs"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -2316,6 +3348,8 @@ class RadioTUI(App):
             self._show_archive()
         elif nxt == "net":
             self._show_net()
+        elif nxt == "weather":
+            self._show_weather()
         else:
             self._show_favorites()
 
@@ -2648,6 +3682,7 @@ class RadioTUI(App):
             return
         log = self.query_one("#health-log", RichLog)
         log.clear()
+        log.scroll_home(animate=False)
         log.write("[b]Transport reachability[/b] (passive endpoint probe)")
         if not self.core.transports:
             log.write("[dim]No transports configured. Enable one in your config.[/dim]")
@@ -2668,16 +3703,16 @@ class RadioTUI(App):
                 if status is ReachabilityStatus.OK
                 else ""
             )
-            log.write(f"  {dot} [b]{t.name}[/b]  {word}{vol}")
+            log.write(f" {dot} [b]{t.name}[/b] {word}{vol}")
             # Show the actual on-air identity this transport uses (callsign for
             # HF media, an anonymous address for Reticulum/MeshCore) so it's
             # obvious which callsign goes out — matching `radioapp status`.
-            log.write(f"       {self._transport_identity(t)}")
+            log.write(f"    {self._transport_identity(t)}")
             # Show the configured control endpoint (host:port / URL) even when
             # the transport is down, so the operator can confirm *where* we dial.
             endpoint = self._transport_endpoint(t)
             if endpoint:
-                log.write(f"       {endpoint}")
+                log.write(f"    {endpoint}")
             if (
                 t.name == "reticulum"
                 and status is ReachabilityStatus.OK
@@ -2697,6 +3732,11 @@ class RadioTUI(App):
                 and hasattr(t, "radio_status_snapshot")
             ):
                 self._render_js8_status(log, t.radio_status_snapshot())
+                if self.core is not None:
+                    bstats = self.core.store.band_stats(transport=t.name)
+                    if bstats:
+                        parts = " ".join(f"{b} {c}" for b, c in bstats.items())
+                        log.write(f"    [dim]band log: {parts}[/dim]")
             # MeshCore (and any transport exposing device_telemetry) shows its
             # device health: battery + radio parameters.
             if (
@@ -2726,6 +3766,7 @@ class RadioTUI(App):
         except Exception:  # noqa: BLE001 - widget may not be mounted yet
             return
         log.clear()
+        log.scroll_home(animate=False)
         db_path = self.core.config.database_path()
         health = collect(str(db_path))
         log.write("[b]System[/b] (host resources)")
@@ -2817,20 +3858,28 @@ class RadioTUI(App):
         # Database size + history extent — the "is my history bloating?" signal.
         try:
             s = self.core.store.stats()
-            c = self.core.nomad_cache.stats()
             retention = int(
                 self.core.config.general.get("history_retention_days", 0) or 0
             )
             keep = f"{retention}d retention" if retention > 0 else "kept forever"
             log.write(
-                f"  data  : {format_bytes(s['size_bytes'])} db · "
-                f"{s['messages']} msgs / {s['threads']} threads · "
-                f"{c['pages']} cached pages · {keep}"
+                f"  data  : {format_bytes(s['size_bytes'])} · {keep}"
             )
         except Exception:  # noqa: BLE001 - never let stats break the board
             pass
 
         self._render_propagation(log)
+        self._render_session_activity(log)
+
+    def _render_session_activity(self, log: RichLog) -> None:
+        """Compact per-transport traffic tally for this session."""
+        if self.core is None:
+            return
+        log.write("")
+        log.write("[b]Activity[/b] (this session)")
+        for t in self.core.transports:
+            vol = self._format_traffic_volume(t.name)
+            log.write(f"  {t.name:<12}{vol}")
 
     def _render_power_line(self, log: RichLog, health, format_duration) -> None:
         """Render a battery/power line: charge %, AC/battery, time remaining.
@@ -2909,7 +3958,7 @@ class RadioTUI(App):
         """
         paths = self._winlink_paths
         if not paths:
-            log.write("      [dim](connection paths not probed yet)[/dim]")
+            log.write("    [dim](connection paths not probed yet)[/dim]")
             return
         for p in paths:
             reachable = p.get("reachable")
@@ -2921,7 +3970,7 @@ class RadioTUI(App):
                 dot, word = "[dim]\u00b7[/dim]", "[dim]n/a[/dim]"
             label = p.get("label", p.get("name", "?"))
             detail = p.get("detail", "")
-            log.write(f"      {dot} {label}  {word}  [dim]{detail}[/dim]")
+            log.write(f"    {dot} {label} {word} [dim]{detail}[/dim]")
 
     def _render_js8_status(self, log: RichLog, snap: dict | None) -> None:
         """Render the JS8Call rig operating state under its status line.
@@ -2933,7 +3982,7 @@ class RadioTUI(App):
         """
         if not snap or not snap.get("cat"):
             log.write(
-                "      [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
+                "    [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
             )
             return
         bits: list[str] = []
@@ -2952,7 +4001,7 @@ class RadioTUI(App):
         if sel:
             bits.append(f"selected {sel}")
         if bits:
-            log.write(f"      [dim]{'  ·  '.join(bits)}[/dim]")
+            log.write(f"    [dim]{' · '.join(bits)}[/dim]")
 
     def _render_device_telemetry(self, log: RichLog, tel: dict | None) -> None:
         """Render a MeshCore companion's device telemetry under its status line.
@@ -2963,12 +4012,12 @@ class RadioTUI(App):
         """
         if not tel:
             log.write(
-                "      [dim](no device telemetry — companion not responding)[/dim]"
+                "    [dim](no device telemetry — companion not responding)[/dim]"
             )
             return
         name = tel.get("name") or "(unnamed)"
         pk = (tel.get("public_key") or "")[:12]
-        head = f"      [b]{name}[/b]"
+        head = f"    [b]{name}[/b]"
         if pk:
             head += f"  [dim]<{pk}>[/dim]"
         batt = tel.get("battery")
@@ -2992,7 +4041,7 @@ class RadioTUI(App):
         if txp is not None:
             radio_bits.append(f"{txp} dBm")
         if radio_bits:
-            log.write(f"         [dim]{'  ·  '.join(radio_bits)}[/dim]")
+            log.write(f"       [dim]{' · '.join(radio_bits)}[/dim]")
 
     @staticmethod
     def _format_mesh_battery(level: object) -> str:
@@ -3019,16 +4068,16 @@ class RadioTUI(App):
         when present - RNode-specific health (RSSI, SNR, battery, frequency).
         """
         if not stats:
-            log.write("      [dim](no rnsd RPC reply - is rnsd running?)[/dim]")
+            log.write("    [dim](no rnsd RPC reply - is rnsd running?)[/dim]")
             return
         ifs = stats.get("interfaces") or []
         if not ifs:
-            log.write("      [dim](no RNS interfaces reported)[/dim]")
+            log.write("    [dim](no RNS interfaces reported)[/dim]")
             return
         uptime = stats.get("transport_uptime")
         if uptime:
             log.write(
-                f"      [dim]rnsd uptime: {self._format_duration(uptime)}  "
+                f"    [dim]rnsd uptime: {self._format_duration(uptime)} "
                 f"rx {self._format_bytes(stats.get('rxb', 0))} / "
                 f"tx {self._format_bytes(stats.get('txb', 0))}[/dim]"
             )
@@ -3040,8 +4089,8 @@ class RadioTUI(App):
             rxb = ifs_row.get("rxb", 0)
             txb = ifs_row.get("txb", 0)
             line = (
-                f"      {up_dot} [b]{name}[/b]  "
-                f"{self._format_bitrate(br)}  "
+                f"    {up_dot} [b]{name}[/b] "
+                f"{self._format_bitrate(br)} "
                 f"rx {self._format_bytes(rxb)} / tx {self._format_bytes(txb)}"
             )
             log.write(line)
@@ -3062,7 +4111,7 @@ class RadioTUI(App):
             if "clients" in ifs_row and ifs_row["clients"] is not None:
                 extras.append(f"clients {ifs_row['clients']}")
             if extras:
-                log.write(f"         [dim]{'  ·  '.join(extras)}[/dim]")
+                log.write(f"       [dim]{' · '.join(extras)}[/dim]")
 
     @staticmethod
     def _format_bytes(n: int | float | None) -> str:
@@ -3610,6 +4659,361 @@ class RadioTUI(App):
                 "/net list · /net close · /net status · /net sessions"
             )
 
+    # -- weather surface -------------------------------------------------------
+
+    # Source badge colours and labels.
+    _WX_BADGE: dict[str, str] = {
+        "internet":   "[cyan][🌐][/cyan]",
+        "js8call":    "[yellow][JS8][/yellow]",
+        "winlink":    "[blue][WL][/blue]",
+        "reticulum":  "[green][RNS][/green]",
+        "meshcore":   "[magenta][MC][/magenta]",
+    }
+
+    def _wx_load_grids(self) -> None:
+        """Load the saved grid list from config and sync the picker input."""
+        if self.core is None:
+            return
+        raw = str(self.core.config.ui.get("wx_grids", "") or "")
+        grids = [g.strip().upper() for g in raw.split(",") if g.strip()]
+        # Fall back to station grid_square if nothing saved.
+        if not grids:
+            st = getattr(self.core, "station", None)
+            gs = getattr(st, "grid_square", None) or ""
+            if gs:
+                grids = [gs.upper()]
+        self._wx_grids = grids
+        self._wx_grid_idx = min(self._wx_grid_idx, max(0, len(grids) - 1))
+        self._wx_sync_grid_input()
+
+    def _wx_sync_grid_input(self) -> None:
+        """Update the grid Input to show the current picker grid."""
+        try:
+            inp = self.query_one("#wx-grid", Input)
+            if self._wx_grids:
+                grid = self._wx_grids[self._wx_grid_idx]
+                total = len(self._wx_grids)
+                inp.value = grid
+                inp.placeholder = grid
+                # Show position hint in the prev/next buttons when >1 grid.
+                try:
+                    self.query_one("#wx-grid-prev", Button).disabled = total <= 1
+                    self.query_one("#wx-grid-next", Button).disabled = total <= 1
+                except Exception:  # noqa: BLE001
+                    pass
+        except Exception:  # noqa: BLE001
+            pass
+
+    def _wx_cycle_grid(self, direction: int) -> None:
+        """Cycle to the previous (direction=-1) or next (direction=+1) saved grid."""
+        if not self._wx_grids:
+            return
+        self._wx_grid_idx = (self._wx_grid_idx + direction) % len(self._wx_grids)
+        self._wx_sync_grid_input()
+
+    def _show_weather(self) -> None:
+        """Show the Weather (WX) surface."""
+        self.view = "weather"
+        self.query_one("#main", ContentSwitcher).current = "weather-view"
+        self._enable_composer(False)
+        self._wx_load_grids()
+        # If still no grid in the input, fall back to a blank placeholder.
+        try:
+            inp = self.query_one("#wx-grid", Input)
+            if not inp.value:
+                inp.placeholder = "FN31"
+        except Exception:  # noqa: BLE001
+            pass
+        self._render_weather()
+        self._update_modebar()
+        self._update_status()
+
+    def _render_weather(self, transport_filter: str | None = None) -> None:
+        """Redraw the WX feed from the store, optionally filtered by transport."""
+        if self.core is None:
+            return
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+        except Exception:  # noqa: BLE001
+            return
+        wx_log.clear()
+        msgs = self.core.store.query(kind="weather_bulletin", limit=200, newest_first=True)
+        if transport_filter:
+            msgs = [m for m in msgs if m.transport == transport_filter]
+        if not msgs:
+            wx_log.write(
+                "[dim]No weather data yet. "
+                "Try '🌐 Fetch' for internet forecast, '📡 JS8' to query via radio, "
+                "or connect Winlink to download NWS bulletins. "
+                "RNS/MC weather arrives automatically when connected.[/dim]"
+            )
+            return
+        for msg in msgs:
+            transport = msg.transport or "?"
+            badge = self._WX_BADGE.get(transport, f"[dim][{transport[:3].upper()}][/dim]")
+            ts = msg.timestamp.strftime("%m-%d %H:%MZ") if msg.timestamp else "??"
+            subject = msg.metadata.get("subject") or ""
+            nws_office = msg.metadata.get("nws_office", "")
+            source_label = nws_office or (msg.sender or "")
+            header = f"{badge} [dim]{ts}[/dim]  "
+            if subject:
+                header += f"[b]{subject}[/b]"
+                if source_label:
+                    header += f"  [dim]· {source_label}[/dim]"
+            elif source_label:
+                header += f"[dim]{source_label}[/dim]"
+            wx_log.write(header)
+            body = (msg.content or "").strip()
+            if body:
+                for line in body.splitlines()[:8]:
+                    wx_log.write(f"    {line}")
+            wx_log.write("")
+
+    @work
+    async def _wx_fetch_internet(self) -> None:
+        """Fetch a weather forecast from NWS or Open-Meteo for the current grid."""
+        if self.core is None:
+            return
+        try:
+            grid_inp = self.query_one("#wx-grid", Input)
+            grid = grid_inp.value.strip().upper() or "FN31"
+        except Exception:  # noqa: BLE001
+            grid = "FN31"
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+            wx_log.write(f"[dim]Fetching internet weather for {grid}…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        try:
+            lat, lon = grid_to_latlon(grid)
+            text, source = await fetch_weather(lat, lon)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"WX internet fetch failed: {exc}")
+            try:
+                self.query_one("#wx-log", RichLog).write(
+                    f"[red]Internet weather unavailable: {exc}[/red]"
+                )
+            except Exception:  # noqa: BLE001
+                pass
+            return
+        # Store as a transient UnifiedMessage so it appears in the feed.
+        from ..core.message import UnifiedMessage as _UM
+        import datetime as _dt
+        msg = _UM(
+            msg_id=f"wx-inet-{grid}-{int(_dt.datetime.now(_dt.timezone.utc).timestamp())}",
+            transport="internet",
+            sender="NWS/Open-Meteo",
+            content=text,
+            timestamp=_dt.datetime.now(_dt.timezone.utc),
+            metadata={
+                "kind": "weather_bulletin",
+                "subject": f"Internet WX {grid} ({source})",
+                "grid": grid,
+                "source": source,
+            },
+        )
+        self.core.store.save(msg)
+        self._render_weather()
+
+    @work
+    async def _wx_js8_query(self) -> None:
+        """Send a JS8Call weather query to the APRS gateway (@APRSIS NWS <grid>)."""
+        if self.core is None:
+            return
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+        except Exception:  # noqa: BLE001
+            return
+        try:
+            grid = self.query_one("#wx-grid", Input).value.strip().upper() or "FN31"
+        except Exception:  # noqa: BLE001
+            grid = "FN31"
+        from ..transports.js8call_transport import JS8CallTransport
+        js8 = next(
+            (t for t in self.core.transports if isinstance(t, JS8CallTransport)),
+            None,
+        )
+        if js8 is None:
+            wx_log.write("[yellow]JS8Call transport not active — cannot query APRS WX.[/yellow]")
+            return
+        wx_log.write(
+            f"[dim]⛅ JS8/APRS query sent for {grid[:4]}. "
+            "Reply will appear when received.[/dim]"
+        )
+        ok = await js8.send_wx_query(grid)
+        if not ok:
+            wx_log.write("[yellow]JS8Call WX query failed — is JS8Call running?[/yellow]")
+
+    @work
+    async def _wx_winlink_scan(self) -> None:
+        """Scan the store for Winlink weather bulletins and refresh the feed."""
+        if self.core is None:
+            return
+        try:
+            wx_log = self.query_one("#wx-log", RichLog)
+            wx_log.write("[dim]Scanning Winlink inbox for NWS bulletins…[/dim]")
+        except Exception:  # noqa: BLE001
+            pass
+        # The store query with kind= already covers stamped messages; just render.
+        self._render_weather(transport_filter="winlink")
+
+    @work
+    async def _wx_subscribe_guide(self) -> None:
+        """Show the Winlink NWS subscription guide and optionally open compose."""
+        try:
+            grid = self.query_one("#wx-grid", Input).value.strip().upper()
+        except Exception:  # noqa: BLE001
+            grid = ""
+        result = await self.push_screen_wait(WinlinkWXSubscribeScreen(grid=grid))
+        if result:
+            # Pre-fill compose with the subscription request.
+            grid4 = grid[:4] if grid else ""
+            subj = f"SUBSCRIBE {grid4}".strip()
+            await self.push_screen_wait(
+                WinlinkEmailComposeScreen(
+                    subject=subj,
+                    callsign=self._my_callsign(),
+                )
+            )
+
+    def _my_callsign(self) -> str:
+        """Return the operator's callsign from config."""
+        if self.core is None:
+            return ""
+        st = getattr(self.core, "station", None)
+        if st is not None:
+            cs = getattr(st, "callsign", None) or ""
+            if cs:
+                return str(cs)
+        return str(self.core.config.station.get("callsign", "") or "")
+
+    @work
+    async def _wx_run_setup(self) -> None:
+        """Ask whether to add MeshCore #weather channel and Reticulum #weather groups."""
+        if self.core is None:
+            return
+        from ..transports.meshcore_transport import MeshCoreTransport
+        from ..transports.reticulum_transport import ReticulumTransport
+        has_mc = any(isinstance(t, MeshCoreTransport) for t in self.core.transports)
+        has_rns = any(isinstance(t, ReticulumTransport) for t in self.core.transports)
+        current_grids = str(self.core.config.ui.get("wx_grids", "") or "")
+        result = await self.push_screen_wait(
+            WXSetupScreen(
+                has_meshcore=has_mc,
+                has_reticulum=has_rns,
+                current_grids=current_grids,
+            )
+        )
+        if result is None:
+            return
+        await self._apply_wx_result(result)
+
+    async def _apply_wx_result(self, result: dict) -> None:
+        """Apply a WX setup result dict (grids + meshcore/reticulum flags) to config."""
+        if self.core is None:
+            return
+
+        # Save grid squares to config and reload the picker (always write, even
+        # when empty, so the user can clear a previously saved list).
+        grids_str = result.get("grids", "").strip()
+        ui = dict(self.core.config.ui)
+        ui["wx_grids"] = grids_str
+        self.core.config.data["ui"] = ui
+        try:
+            self.core.config.save()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Could not save WX grids: {exc}")
+        self._wx_load_grids()
+        n = len([g for g in grids_str.split(",") if g.strip()])
+        if n:
+            self._log_system(f"Saved {n} grid square(s) for WX picker.")
+        else:
+            self._log_system("WX grid list cleared.")
+
+        if result.get("meshcore"):
+            t = self._meshcore_transport()
+            if t is not None and hasattr(t, "channels"):
+                try:
+                    # Find the first free slot above the public channel (index 0).
+                    used = {ch["index"] for ch in t.channels()}
+                    max_ch = getattr(t, "MAX_CHANNELS", 8)
+                    idx = next(
+                        (i for i in range(1, max_ch) if i not in used), None
+                    )
+                    if idx is None:
+                        self._log_system(
+                            "MeshCore: all channel slots used — remove one first "
+                            "with /channel rm <index>."
+                        )
+                    else:
+                        # Check if #weather already configured.
+                        existing = [
+                            ch for ch in t.channels()
+                            if ch.get("name", "").lower() == "weather"
+                        ]
+                        if existing:
+                            self._log_system(
+                                f"MeshCore #weather already at @{existing[0]['index']}."
+                            )
+                        else:
+                            t.name_channel(idx, "#weather")
+                            self._persist_meshcore_channels(t)
+                            if t.running:
+                                ok = await t.create_channel(idx, "#weather", None)
+                                if ok:
+                                    self._log_system(
+                                        f"Added MeshCore #weather at channel @{idx}."
+                                    )
+                                else:
+                                    self._log_system(
+                                        f"MeshCore #weather saved (@{idx}) but "
+                                        "device update failed — reconnect to apply."
+                                    )
+                            else:
+                                self._log_system(
+                                    f"MeshCore #weather saved (@{idx}); "
+                                    "will be created when MeshCore connects."
+                                )
+                            self._refresh_threads()
+                except Exception as exc:  # noqa: BLE001
+                    self._log_system(f"MeshCore channel setup failed: {exc}")
+            else:
+                self._log_system(
+                    "MeshCore not configured — add it to config first."
+                )
+
+        if result.get("reticulum"):
+            try:
+                gr = self.core.groups
+                added = []
+                for gname in ("weather", "nws_alerts"):
+                    g = gr.ensure_group(gname)
+                    changed = False
+                    if "reticulum" not in g.transports:
+                        g.transports.append("reticulum")
+                        gr._dirty = True  # noqa: SLF001
+                        changed = True
+                    if "weather" not in g.tags:
+                        gr.add_tag(gname, "weather")
+                        changed = True
+                    if changed:
+                        added.append(f"#{gname}")
+                if added:
+                    gr.save(self.core.config)
+                    # Re-push updated group list to running transports so they
+                    # join the new groups without a restart.
+                    self.core._apply_station_identity()  # noqa: SLF001
+                    self._log_system(
+                        f"Added Reticulum groups: {', '.join(added)}. "
+                        "They appear in the RNS mode contacts panel."
+                    )
+                else:
+                    self._log_system(
+                        "Reticulum #weather and #nws_alerts already configured."
+                    )
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"Reticulum group setup failed: {exc}")
+
     # -- favorites (continued) -------------------------------------------------
 
     def _favorite_kind(self, fav: Favorite) -> str:
@@ -4078,19 +5482,12 @@ class RadioTUI(App):
     def _default_channel_target(self) -> str | None:
         """Default conversation for the active mode, or None.
 
-        Transports exposing channels (MeshCore) open on the public channel
-        (index 0 when present) so the operator can chat immediately without
-        first picking a channel. Channel tags are '@<index>'.
+        Channel-based transports (MeshCore) start with no channel selected so the
+        right panel shows all channels at once — same as JS8Call's all-messages
+        firehose. The operator clicks a specific channel to filter, then presses
+        Escape to return to the full feed.
         """
-        t = self._active_transport_obj()
-        if t is None or not hasattr(t, "channels"):
-            return None
-        channels = t.channels()
-        if not channels:
-            return None
-        indices = [c["index"] for c in channels]
-        idx = 0 if 0 in indices else indices[0]
-        return f"@{idx}"
+        return None
 
     def _update_modebar(self) -> None:
         """Refresh the persistent mode selector: active highlight + health dots.
@@ -4112,7 +5509,8 @@ class RadioTUI(App):
         for btn in bar.query(Button):
             bid = btn.id or ""
             if bid == "mode-nomadnet":
-                btn.label = f"{self._health_dot('nomadnet')} nomadnet"
+                short = self._MODE_SHORT_LABELS.get("nomadnet", "Nomad")
+                btn.label = f"{self._health_dot('nomadnet')} {short}"
                 btn.set_class(current == "nomadnet", "-active")
                 btn.set_class(
                     self._health.get("nomadnet") is ReachabilityStatus.DOWN,
@@ -4120,7 +5518,8 @@ class RadioTUI(App):
                 )
             elif bid.startswith("mode-"):
                 name = bid[len("mode-"):]
-                btn.label = f"{self._health_dot(name)} {name}"
+                short = self._MODE_SHORT_LABELS.get(name, name)
+                btn.label = f"{self._health_dot(name)} {short}"
                 btn.set_class(
                     self.view == "active" and current == name,
                     "-active",
@@ -4137,14 +5536,15 @@ class RadioTUI(App):
                 btn.set_class(self.view == "logs", "-active")
             elif bid == "view-archive":
                 btn.set_class(self.view == "archive", "-active")
-            elif bid == "view-favorites":
-                btn.set_class(self.view == "favorites", "-active")
             elif bid == "view-net":
                 btn.set_class(self.view == "net", "-active")
+            elif bid == "view-weather":
+                btn.set_class(self.view == "weather", "-active")
         self._update_input_indicator()
         self._update_mesh_bar()
         self._update_js8_bar()
         self._update_winlink_bar()
+        self._update_wx_bar()
         # View changed -> re-evaluate context bindings (e.g. F4 only on Watch)
         # so the footer shows/hides them correctly.
         self.refresh_bindings()
@@ -4191,8 +5591,10 @@ class RadioTUI(App):
         for btn in bar.query(Button):
             if btn.id == "winlink-start":
                 btn.disabled = not down
-            else:
+            elif btn.id == "winlink-connect":
                 btn.disabled = down
+            # All other buttons (Compose, Subject, Forms, Outbox, Gateways)
+            # work regardless of Pat's state.
         if not show:
             return
         t = self._winlink_transport()
@@ -4261,9 +5663,17 @@ class RadioTUI(App):
             self._log_system(f"Winlink template fetch failed: {exc}")
             return
         fields = detect_form_fields(text or "")
-        result = await self.push_screen_wait(
-            WinlinkComposeFormScreen(template, fields)
+        self._log_system(
+            f"Winlink: form [b]{template}[/b] "
+            + (f"({len(fields)} fields)" if fields else "(no prompt fields — fill To/Subject)")
         )
+        try:
+            result = await self.push_screen_wait(
+                WinlinkComposeFormScreen(template, fields)
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form compose failed: {exc}")
+            return
         if not result:
             return
         if not getattr(t, "running", False):
@@ -4294,6 +5704,73 @@ class RadioTUI(App):
             "Nothing sent yet; press Connect to transmit."
         )
         self._refresh_active_pane()
+
+    def _update_wx_bar(self) -> None:
+        """Dim the JS8 WX query button when JS8Call is not running."""
+        try:
+            btn = self.query_one("#wx-query", Button)
+        except Exception:  # noqa: BLE001 - not mounted yet
+            return
+        down = self._health.get("js8call") is ReachabilityStatus.DOWN
+        btn.disabled = down
+
+    @work
+    async def _winlink_email_compose(self) -> None:
+        """Open the full-screen Winlink email compose modal.
+
+        Pre-fills Subject from any pending /subject, Attachments from the
+        current queue, and Callsign/Date/Time for template substitution.
+        On submit, builds and queues the message to Pat's outbox. If the user
+        picks "ICS Forms →" from the template selector, hands off to the
+        existing Pat form flow instead.
+        """
+        now = datetime.now(UTC)
+        callsign = (self.core.station.callsign or "") if self.core else ""
+        result = await self.push_screen_wait(
+            WinlinkEmailComposeScreen(
+                subject=self._winlink_subject,
+                attachments=list(self._attach_queue),
+                callsign=callsign,
+                date_utc=now.strftime("%d %b %Y"),
+                time_utc=now.strftime("%H%M"),
+            )
+        )
+        if result is None:
+            return
+        if result.get("action") == "ics_forms":
+            self._winlink_open_forms()
+            return
+        to = result.get("to") or ""
+        if not to:
+            return
+        body = result.get("body") or ""
+        if not body.strip():
+            self._log_system("Compose: no message body — nothing queued.")
+            return
+        me = callsign or "unknown"
+        msg = UnifiedMessage.direct(me, to, body)
+        if result.get("subject"):
+            msg.metadata["subject"] = result["subject"]
+        if result.get("cc"):
+            msg.metadata["cc"] = result["cc"]
+        if result.get("attachments"):
+            msg.metadata["attach"] = list(result["attachments"])
+        ok = await self.core.router.send(msg, force_transport="winlink")
+        self._winlink_subject = ""
+        self._attach_queue = []
+        self._update_winlink_bar()
+        if ok:
+            self._log_system(
+                f"Winlink email queued to Pat's outbox — "
+                f"To: {to} · "
+                f"Subj: {result.get('subject') or '(no subject)'}. "
+                "Nothing sent yet; press Connect to transmit."
+            )
+        else:
+            self._log_system(f"Winlink: failed to queue email to {to}.")
+        self._render_message(msg, outgoing=True, ok=ok)
+        self._append_monitor(msg)
+        self._refresh_threads()
 
     def _set_winlink_subject(self, text: str) -> None:
         """Set (or clear) the pending subject for the next Winlink message."""
@@ -4688,6 +6165,34 @@ class RadioTUI(App):
             "[b]Connect[/b]."
         )
 
+    @work
+    async def _winlink_show_outbox(self) -> None:
+        """Show Pat's outbox queue in the message log."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "list_outbox"):
+            self._log_system("Winlink is not enabled.")
+            return
+        try:
+            items = await t.list_outbox()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink outbox fetch failed: {exc}")
+            return
+        if not items:
+            self._log_system("Winlink outbox is empty.")
+            return
+        self._log_system(f"Winlink outbox ({len(items)} queued — Connect to send):")
+        log = self.query_one("#messages", RichLog)
+        for item in items:
+            to = item.get("to") or "(no address)"
+            subj = item.get("subject") or "(no subject)"
+            mid = item.get("mid") or ""
+            size = item.get("size") or 0
+            size_str = f"{size // 1024} KB" if size >= 1024 else f"{size} B"
+            log.write(
+                f"  [b]To:[/b] {to}  [b]Subj:[/b] {subj}  "
+                f"[dim]{size_str} · {mid}[/dim]"
+            )
+
     def _js8_transport(self) -> Transport | None:
         """The live JS8CallTransport instance, or None when not configured."""
         if self.core is None:
@@ -4731,11 +6236,14 @@ class RadioTUI(App):
             label.update("JS8Call [dim]— not running[/dim]")
             return
         hz = getattr(t, "dial_freq", None)
+        band = t.current_band()
         if hz:
-            band = t.current_band() or "?"
-            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band})[/dim]")
+            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or "?"})[/dim]")
         else:
             label.update("JS8Call  [dim]freq unknown — \u21bb to query[/dim]")
+        for btn in bar.query(Button):
+            if btn.id and btn.id.startswith("js8-band-"):
+                btn.set_class(btn.id == f"js8-band-{band}", "-active")
 
     @work
     async def _js8_refresh_freq(self) -> None:
@@ -4938,19 +6446,14 @@ class RadioTUI(App):
         bar = self.query_one("#modebar", Horizontal)
         by_name = {t.name: t for t in self.core.transports}
         for key in self._mode_keys():
-            if key == "nomadnet":
-                bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
-            else:
-                t = by_name[key]
-                label = t.display_name or t.name
-                bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
+            label = self._MODE_SHORT_LABELS.get(key, key)
+            bar.mount(Button(label, id=f"mode-{key}", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
-        bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
         bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
-        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
+        bar.mount(Button("\u26c5 WX", id="view-weather", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
     def _health_dot(self, name: str) -> str:
@@ -6519,6 +8022,14 @@ class RadioTUI(App):
             self._handle_start_command(arg)
         elif cmd == "/net":
             self._handle_net_command(arg)
+        elif cmd == "/wx":
+            if arg:
+                try:
+                    self.query_one("#wx-grid", Input).value = arg.strip().upper()
+                except Exception:  # noqa: BLE001
+                    pass
+            self._show_weather()
+            self._wx_fetch_internet()
         else:
             self._log_system(f"unknown command: {cmd}")
 
@@ -6656,9 +8167,15 @@ class RadioTUI(App):
                 status = " [red]\u2717 (failed)[/red]"
         tag = ""
         if msg.address_type is AddressType.GROUP and msg.group:
-            tag = f" [magenta]@{msg.group}[/magenta]"
+            if msg.group.isdigit() and msg.transport == "meshcore":
+                ch_name = self._meshcore_channel_name(int(msg.group))
+                tag = f" [magenta]#{ch_name or msg.group}[/magenta]"
+            else:
+                tag = f" [magenta]@{msg.group}[/magenta]"
+        band = msg.metadata.get("band", "")
+        band_tag = f" [dim]{band}[/dim]" if band else ""
         log.write(
-            f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag} {who}: "
+            f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag}{band_tag} {who}: "
             f"{self._subject_md(msg)}{msg.content}{lock}{status}"
             f"{self._attachments_md(msg)}"
         )

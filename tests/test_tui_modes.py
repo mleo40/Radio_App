@@ -63,7 +63,7 @@ def test_mode_selector_has_nomadnet_and_no_mercury(config_path):
             assert "mode-nomadnet" in ids       # virtual mode present
             assert "mode-mercury" not in ids    # mercury disabled
             assert "view-watch" in ids and "view-health" in ids
-            assert "view-favorites" in ids       # favorites page chip
+            assert "view-settings" not in ids    # settings moved to Ctrl+P, no modebar button
 
     asyncio.run(run())
 
@@ -465,6 +465,9 @@ def test_f5_cycles_watch_health_logs_chats_favorites(config_path):
             app.action_cycle_utility()  # -> Net
             await pilot.pause()
             assert app.query_one("#main").current == "net-view"
+            app.action_cycle_utility()  # -> Weather
+            await pilot.pause()
+            assert app.query_one("#main").current == "weather-view"
             app.action_cycle_utility()  # -> Logs
             await pilot.pause()
             assert app.query_one("#main").current == "logs-view"
@@ -572,7 +575,7 @@ def test_reticulum_tools_hidden_when_not_reticulum_mode(config_path):
             await pilot.pause()
             assert app.check_action("identity", ()) is False
             assert app.check_action("announce", ()) is False
-            assert app.check_action("find_path", ()) is False
+            # find_path has no keyboard binding now (use /path command); no check_action gate needed
             # Invoking them is a graceful no-op (logs, never raises).
             app.action_identity()
             app.action_announce()
@@ -1079,20 +1082,20 @@ def test_channel_command_requires_meshcore_mode(config_path):
 
 
 def test_meshcore_defaults_to_public_channel(config_path):
-    """Selecting MeshCore opens the public channel (@0) by default."""
+    """Selecting MeshCore opens with no channel selected (all-channels firehose)."""
     async def run():
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # A non-channel transport opens with no conversation selected.
+            # Both channel-based (MeshCore) and non-channel (JS8Call) transports
+            # open with no conversation selected so the right pane shows all messages.
             app._select_mode("js8call")
             await pilot.pause()
             assert app.current_target is None
-            # Switching to MeshCore defaults the open conversation to channel 0,
-            # so the panel is ready to chat immediately.
             app._select_mode("meshcore")
             await pilot.pause()
-            assert app.current_target == "@0"
+            assert app.current_target is None
+            # Channels are still listed in the left pane for clicking.
             assert "@0" in app._thread_keys
             assert "#public" in app._display_id("@0")
 
@@ -1455,15 +1458,15 @@ def test_fav_only_always_shows_configured_groups(groups_config_path):
 
 
 def test_reply_to_opens_direct_thread_with_sender_in_meshcore(config_path):
-    """Clicking a sender in a MeshCore channel opens a 1:1 reply to them."""
+    """Clicking a sender in MeshCore opens a 1:1 reply to them."""
     async def run():
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app._select_mode("meshcore")
             await pilot.pause()
-            # MeshCore opens on the public channel ('@0'), a shared thread.
-            assert app.current_target == "@0"
+            # MeshCore starts with no channel selected (all-channels firehose).
+            assert app.current_target is None
             # Click a participant's username: peel off into a direct reply.
             app.action_reply_to("a1b2c3d4e5f6", "meshcore")
             await pilot.pause()

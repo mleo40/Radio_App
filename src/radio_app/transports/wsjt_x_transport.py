@@ -23,6 +23,7 @@ import struct
 import time
 from dataclasses import dataclass
 
+from ..core.bandplan import band_for_freq
 from ..core.message import AddressType, UnifiedMessage
 from .base import ReachabilityStatus, Transport, TransportCapabilities
 
@@ -441,6 +442,10 @@ class WsjtXTransport(Transport):
             if event is not None and not event.off_air:
                 msg = decode_to_message(event, self._my_callsign)
                 if msg is not None:
+                    if self._status:
+                        band = band_for_freq(self._status.freq_hz)
+                        if band:
+                            msg.metadata["band"] = band
                     asyncio.ensure_future(self._emit(msg))
 
         elif msg_type == _MSG_STATUS:

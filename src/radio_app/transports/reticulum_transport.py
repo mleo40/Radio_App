@@ -430,7 +430,8 @@ class ReticulumTransport(Transport):
             identity=self._identity,
             storagepath=os.path.join(storage, "lxmf"),
         )
-        display_name = self.config.get("display_name") or None
+        raw_dn = self.config.get("display_name")
+        display_name = str(raw_dn).strip() if isinstance(raw_dn, str) and str(raw_dn).strip() else None
         self._local_destination = self._lxmf.register_delivery_identity(
             self._identity, display_name=display_name
         )
@@ -687,6 +688,14 @@ class ReticulumTransport(Transport):
         if our_hex and sender and sender.lower() == our_hex.lower():
             return
         is_broadcast = group_name == _BROADCAST_GROUP
+        rns_meta: dict = {
+            "encrypted": True,
+            "rns_source": sender,
+            "display_name": parsed["name"],
+        }
+        _norm = (group_name or "").lstrip("#").lower()
+        if _norm in ("weather", "nws_alerts") or (parsed.get("content") or "").upper().startswith("WX:"):
+            rns_meta["kind"] = "weather_bulletin"
         msg = UnifiedMessage(
             sender=sender or "unknown",
             content=parsed["content"],
@@ -695,11 +704,7 @@ class ReticulumTransport(Transport):
             ),
             group=None if is_broadcast else group_name,
             transport=self.name,
-            metadata={
-                "encrypted": True,
-                "rns_source": sender,
-                "display_name": parsed["name"],
-            },
+            metadata=rns_meta,
         )
         self._dispatch_to_loop(msg)
 
