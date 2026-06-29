@@ -676,7 +676,7 @@ def test_winlink_compose_button_exists(config_path):
             await pilot.pause()
             app._select_mode("winlink")
             await pilot.pause()
-            # Button must be present (even if disabled while transport is DOWN).
+            # Button must be present and enabled even when transport is DOWN.
             btn = app.query_one("#winlink-compose")
             assert btn is not None
 

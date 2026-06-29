@@ -4494,8 +4494,10 @@ class RadioTUI(App):
         for btn in bar.query(Button):
             if btn.id == "winlink-start":
                 btn.disabled = not down
-            else:
+            elif btn.id == "winlink-connect":
                 btn.disabled = down
+            # All other buttons (Compose, Subject, Forms, Gateways) work
+            # offline: compose and queue now, connect later.
         if not show:
             return
         t = self._winlink_transport()
