@@ -21,7 +21,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
 > awareness, offline band-plan, **band tracking** (every HF message stamped with
 > its band; per-band history filters and aggregate stats), scheduled sends, and a
-> presence roster. 867 tests pass; the whole suite runs without radio hardware.
+> presence roster. 880 tests pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 
@@ -504,7 +504,10 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     glance. New traffic appends live; pick a conversation (click a name, tap a
     row, or `/to <call|@GROUP>`) to focus it, and closing a conversation drops
     back to the firehose. (This applies to any chat mode that has no default
-    conversation, e.g. Reticulum too.)
+    conversation, e.g. Reticulum too.) In **MeshCore** mode, the composer
+    placeholder reads "click a channel to chat · /to @0 for public channel"
+    while no channel is selected, so new operators aren't left staring at a
+    silent input box.
   - **Adding a channel:** in MeshCore mode, type
     `/channel add <index> <#name> [secret]` in the composer (e.g.
     `/channel add 2 #ops`). A **hashtag channel** (a name starting with `#`)
@@ -618,6 +621,7 @@ In-composer commands:
 | `/sched list` / `/sched cancel <id>` | view pending scheduled sends / cancel one |
 | `/sched band <band> <time> [daily]` | (JS8Call) schedule a band change; `daily` repeats every 24h |
 | `/subs [add\|rm @GROUP]` | show group subscriptions / add or remove one |
+| `/groups [@NAME\|new\|delete\|add\|rm\|tag\|untag]` | manage group routing config (members, tags, outbound transports) |
 | `/position [<grid>\|clear]` | set your station grid square (e.g. `/position FN31`), show, or clear |
 | `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
 | `/bands [band]` | show offline band-plan / EmComm frequencies (same as `radioapp bands`) |
