@@ -158,9 +158,10 @@ frequencies (11 bands), common US EmComm/ARES/RACES simplex and net frequencies,
 and select Winlink P2P/RMS spot frequencies.
 
 **Delivered:**
-1. ✅ **`core/bandplan.py`** — `FrequencyEntry` frozen dataclass + `ALL_ENTRIES` static table + `lookup(band, mode, region, transport)` with AND-combined filters + `format_mhz()` helper.
+1. ✅ **`core/bandplan.py`** — `FrequencyEntry` frozen dataclass + `ALL_ENTRIES` static table + `lookup(band, mode, region, transport)` with AND-combined filters + `format_mhz()` helper. Also `band_for_freq(hz) → str | None` (maps a dial frequency in Hz to a band name, e.g. `14_078_000 → "20m"`).
 2. ✅ **CLI** — `radioapp bands [--band 40m] [--mode JS8] [--region US|INTL] [--transport winlink]`.
 3. ✅ **TUI** — `/bands [band]` prints a formatted table to the log pane.
+4. ✅ **Band tracking** — JS8Call and WSJT-X transports stamp `metadata["band"]` on every inbound message using `band_for_freq()`. `store.band_stats([transport, since])` returns per-band message counts. `radioapp history --band 40m` filters history; `radioapp bands --stats [--transport] [--since]` shows aggregate counts. The Health panel shows a compact `band log:` line under JS8Call rig state. HF messages in the TUI show a dim band tag (`20m`) between the transport badge and sender name.
 
 ---
 
@@ -468,8 +469,9 @@ read/query feature, not a data-model change.
    the prior surface. The cross-mode "All chats" archive view + lazy scroll-back
    remain a later polish item.
 4. ✅ **Richer filters** — `--status`, `--snr-min`, `--date` on `history` and `search`; `store.query()` accepts `status` and `snr_min` params with SQL JSON extract for SNR.
-5. ✅ **Export** — `radioapp export --thread <key>|--all --format txt|json|md|maildir [--out path]`.
-6. **Retention/housekeeping** — optional age/size-based pruning, per-thread
+5. ✅ **Band filter** — `radioapp history --band 40m` filters to HF messages on a specific band; `store.query(band=)` uses `json_extract(metadata, '$.band')`. Pairs with band tracking above.
+6. ✅ **Export** — `radioapp export --thread <key>|--all --format txt|json|md|maildir [--out path]`.
+7. **Retention/housekeeping** — optional age/size-based pruning, per-thread
    "keep forever" pins, and VACUUM so history doesn't bloat small devices.
 
 **Suggested sequencing:** start with #1 (CLI history+search) over `MessageStore`,
