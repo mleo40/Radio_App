@@ -2119,6 +2119,41 @@ def test_cmd_history_via_submit(tmp_path):
     asyncio.run(run())
 
 
+def test_start_command_does_not_crash(config_path):
+    """/start command must not raise TypeError (regression: @work can't be awaited).
 
+    _handle_start_command is decorated with @work, so calling it returns a
+    Worker, not a coroutine.  The command dispatcher must NOT await it.
+    This test verifies the command dispatches cleanly and logs a status line.
+    """
+    from textual.widgets import RichLog
 
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+
+            # This must not raise TypeError.
+            await app._handle_command("/start")
+
+            # Let the @work worker tick and log its status message.
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0)
+                text = "\n".join(
+                    s.text for s in app.query_one("#messages", RichLog).lines
+                )
+                if "js8call" in text.lower():
+                    break
+
+            text = "\n".join(
+                s.text for s in app.query_one("#messages", RichLog).lines
+            )
+            # Either "Starting js8call…" (pre-spawn) or an error/ready message
+            # must appear — confirming the worker ran, not that it crashed.
+            assert "js8call" in text.lower(), f"Expected js8call status in log, got: {text!r}"
+
+    asyncio.run(run())
 
