@@ -18,7 +18,7 @@ of glass* for radio comms.
 | Persistence | **SQLite** (stdlib `sqlite3`) |
 | Reticulum transport | `rns` + `lxmf` (optional extra) |
 | MeshCore transport | `meshcore` companion library (optional extra) |
-| Tests | `pytest` (~738) · `ruff` · `mypy` |
+| Tests | `pytest` (766) · `ruff` · `mypy` |
 | Interop targets vendored for reference (not built or shipped) | **Pat** = Go |
 
 The app's own code is **100% Python**. The Go (`pat/`) tree is the external

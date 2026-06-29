@@ -89,34 +89,27 @@ transport = "reticulum"
 ## On-demand transport app launcher (`/start` command)
 
 **Requested:** 2026-06-27
-**Status:** Backlog
-**Area:** `core/proc_manager.py` (new), `transports/base.py`, `ui/tui.py`, `cli.py`
+**Status:** Done
+**Area:** `core/proc_manager.py`, `ui/tui.py`, `cli.py`
 
-A `/start` command in each transport mode that:
-- Launches the backing app for the **current** transport (JS8Call, Pat, WSJT-X, etc.)
-- Stops the backing apps for **all other** transports that Radio_App previously started
-- Only fires **on explicit operator command** — no automatic start/stop on mode switch
+✅ Shipped. `ProcManager` handles full on-demand lifecycle for JS8Call, WSJT-X,
+and Pat (Winlink). ⚡ Start buttons in each transport mode bar plus `/start
+[transport]` in the composer and `radioapp start <transport>` from the CLI.
 
-**Design notes:**
-- Opt-in per transport via `launch_cmd` config key — supports a full command with
-  arguments (e.g. `launch_cmd = "js8call --rig FT-991A"`, `launch_cmd = "pat http"`,
-  `launch_cmd = "wsjtx --rig IC-7300"`). Arguments are passed through verbatim.
-- Process is launched **detached in the background** — stdio is not inherited, the
-  app window (if any) opens behind the TUI and does not steal focus
-- Radio_App tracks which processes it owns (`_child_proc` on the transport object);
-  it only stops processes it started, never externally-launched instances
-- Existing `check_reachable()` already provides port-open detection — no psutil needed
-  to determine if the app is already running
-- After launching, retry `check_reachable()` in a backoff loop before calling
-  `transport.start()` to reconnect the adapter
-- CLI equivalent: `radioapp start` (stops others, launches current transport's app)
-
-**UX sketch:**
-```
-/start
-  → Stopping Pat (Winlink)...
-  → Starting JS8Call... connected.
-```
+**What shipped:**
+- `launch_cmd` config key per transport (with built-in defaults: `js8call`,
+  `wsjtx`, `pat http`). Arguments supported verbatim.
+- First-time `LaunchCmdScreen` modal prompts for a custom command if none is
+  configured; answer is saved to config automatically.
+- Spawned with `start_new_session=True` — detached, no stdio, no focus steal.
+- `pgrep -x <process_name>` as OS truth for `is_running()`; `we_own()` is
+  separate — Radio_App only stops processes it started, never external ones.
+- Radio interlock transfer on start for radio-contending transports (JS8Call,
+  WSJT-X); Winlink is non-contending.
+- Polls `check_reachable()` up to `launch_wait_s` (default 15 s) before
+  connecting the transport adapter.
+- `radioapp start <transport>` CLI equivalent wired up.
+- 97 tests covering ProcManager + TUI start command path.
 
 ---
 
@@ -437,7 +430,7 @@ now auto-reconnects (so a sync can fire when the stack comes online).
 ## Past-chats history view + searchable message archive
 
 **Requested:** 2026-06-26
-**Status:** In progress (CLI history + search done; FTS5 + TUI surface done; export queued)
+**Status:** Done (CLI history + search, FTS5, TUI search palette, export all shipped; lazy scroll-back and "All chats" archive view remain as polish)
 **Area:** `core/store.py`, `cli.py`, `ui/tui.py`
 
 Give users a way to browse and search their full conversation history offline.
@@ -527,41 +520,22 @@ capped at 383 bytes, `_GROUP_PAYLOAD_MAX`), so file transfer is DIRECT-only.
 ## WSJT-X transport
 
 **Requested:** 2026-06-27
-**Status:** Backlog
-**Area:** `transports/wsjtx_transport.py` (new), `transports/base.py`, `ui/tui.py`
+**Status:** Done
+**Area:** `transports/wsjt_x_transport.py`, `ui/tui.py`
 
-Add WSJT-X as a transport, enabling FT8/FT4/MSK144/Q65 weak-signal digital
-modes alongside the existing JS8Call HF mode.
+✅ Shipped. FT8/FT4 weak-signal mode via WSJT-X's UDP API (port 2237).
 
-**Architecture:** WSJT-X exposes a UDP-based API (port 2237 by default) using
-a binary protocol (`QDataStream`-encoded). Key messages: `Heartbeat`,
-`Status`, `Decode`, `QSOLogged`, `Clear`, `Reply`, `Close`, `Halt Tx`,
-`Free Text`. The transport would:
-
-- Open a UDP socket and listen for `Decode` messages (received contacts) →
-  emit `UnifiedMessage` with `transport="wsjtx"`, `kind="decode"`.
-- Send `Free Text` / `Reply` datagrams for outbound messages (FT8 free-text
-  is limited to 13 chars; longer messages need multi-transmission sequencing).
-- Use `Status` heartbeats to populate the Health board (frequency, mode, DX
-  call, TX/RX state, grid).
-- New `TransportCapabilities`: `supports_addressing=True`,
-  `supports_broadcast=True` (CQ), `supports_groups=False`,
-  `max_content_bytes=13` (FT8 free-text limit per frame).
-
-**Constraints:**
-- FT8/FT4 operate on strict 15-second/7.5-second TX windows — the transport
-  must queue outbound messages and transmit only at the next window boundary.
-  Radio_App must never preempt an in-progress TX cycle.
-- Free-text payloads are 13 printable ASCII characters. Structured contacts
-  (callsign + grid + signal report) use a different message type and do not
-  map cleanly to arbitrary text; the transport should expose decodes as
-  read-only received messages and allow CQ / directed free-text replies.
-- WSJT-X does not expose a password or callsign API — identity is read from
-  `Status` heartbeats (`de_call`, `de_grid`).
-
-**Value:** FT8 is by far the most-used HF digital mode globally and is
-purpose-built for weak-signal / marginal-propagation contacts — exactly the
-grid-down, low-power scenario Radio_App targets. Receiving FT8 decodes in the
-Watch surface and sending short welfare messages or check-ins over FT8 would
-be a meaningful addition alongside JS8Call.
+**What shipped:**
+- UDP listener for `Decode`, `Status`, `Heartbeat`, `QSOLogged`, `Clear`
+  datagrams (binary `QDataStream`-encoded protocol).
+- `Decode` → `UnifiedMessage` with `transport="wsjtx"`, kind `"decode"`.
+- `FreeText` datagram outbound (13-char limit enforced; message truncated with
+  warning if over).
+- `Status` heartbeats populate the Health board (frequency, mode, DX call,
+  TX/RX state, grid); callsign auto-learned from `de_call` if not configured.
+- `TransportCapabilities`: `supports_addressing=True`,
+  `supports_broadcast=True`, `supports_groups=False`,
+  `max_content_bytes=13`.
+- ⚡ Start button in the WSJT-X mode bar; `launch_cmd = "wsjtx"` default.
+- 34 tests covering decode, status, outbound, health board, and ⚡ Start.
 

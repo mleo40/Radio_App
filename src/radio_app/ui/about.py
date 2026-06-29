@@ -26,7 +26,7 @@ of glass* for radio comms.
 - **TUI:** Textual (optional extra). **Config:** TOML (only hard dep: `tomli-w`).
 - **Persistence:** SQLite + FTS5 (stdlib). **Reticulum:** `rns` + `lxmf` (extra).
   **MeshCore:** `meshcore` companion lib (extra).
-- **Tests:** pytest (765) · ruff · mypy.
+- **Tests:** pytest (766) · ruff · mypy.
 - *Interop targets vendored only for reference (not built or shipped here):*
   **Pat** is Go. The app talks to external programs over their network APIs.
 

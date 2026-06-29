@@ -19,7 +19,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > leaving user identity to the operator. A full suite of **field/EmComm
 > utilities** is built in: message export, canned templates, UTC time widget with
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
-> awareness, offline band-plan, scheduled sends, and a presence roster. 765 tests
+> awareness, offline band-plan, scheduled sends, and a presence roster. 766 tests
 > pass; the whole suite runs without radio hardware.
 
 ## Key ideas
