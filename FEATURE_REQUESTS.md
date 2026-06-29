@@ -2,6 +2,63 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Cross-mode identity linking ("contacts book")
+
+**Requested:** 2026-06-29
+**Status:** Backlog
+**Area:** `core/` (new `contacts.py`), `core/store.py`, `core/favorites.py`, `ui/tui.py`
+
+Associate multiple transport-specific addresses to a single named person. Once
+linked, marking any of their identities as a favorite in one mode automatically
+favorites them in all modes, and display names propagate everywhere.
+
+**Use case:** Bob uses `KC1BOB` on JS8Call, `a1b2c3d4...` on MeshCore, and
+`bob@winlink.org` on Winlink. Today you must save three separate favorites across
+three modes and they show as unrelated entries. With identity linking, saving any
+one of Bob's addresses saves all of them, and every conversation with Bob — across
+all transports — shows his name.
+
+**Design notes:**
+
+*Data model* — new `contacts` table in SQLite, separate from `favorites`:
+- `contact_id` (UUID), `display_name` (text), `notes` (text), `created_at`
+- `contact_identities` table: `contact_id`, `transport` (e.g. `"js8call"`),
+  `address` (the transport-specific id — callsign / hex hash / email), `label`
+- Many-to-one: one contact can have multiple identities across any number of
+  transports. An identity can belong to at most one contact.
+
+*Favorites integration* — `favorites.py` consults the contacts table on add/remove:
+when you favorite an address that belongs to a contact, all of that contact's
+identities are favorited simultaneously. `display_id()` in the TUI checks contacts
+before falling back to the raw address, so names appear everywhere.
+
+*Account management surface* — new hidden TUI view (not in the mode bar; reachable
+via `/contacts` command). The view has two panes:
+- Left: contact list (display names, sortable). New / Delete / Rename actions.
+- Right: identity table for the selected contact. Shows transport + address +
+  label. Add (type `<transport> <address> [label]`), Remove, and a search box that
+  queries the message store for addresses not yet linked to any contact so you can
+  bulk-assign them (e.g. "unlinked addresses heard on meshcore").
+
+*Discovery assist* — when opening a direct thread with an address, check whether
+any *other* transport has a message from the same contact (by display name match or
+operator-confirmed link). If yes, offer a one-press "link to existing contact" banner.
+
+*CLI* — `radioapp contacts list|add|link|unlink|rename|show <name>`:
+```bash
+radioapp contacts add "Bob Smith"
+radioapp contacts link "Bob Smith" js8call KC1BOB
+radioapp contacts link "Bob Smith" meshcore a1b2c3d4
+radioapp contacts link "Bob Smith" winlink bob@winlink.org
+radioapp contacts show "Bob Smith"
+```
+
+*Scope boundary* — identity linking is opt-in and operator-confirmed; the app never
+auto-merges addresses based on heuristics alone, since a false merge (two different
+people with similar callsigns) is worse than two separate entries.
+
+---
+
 ## Scheduled band changes (JS8Call / HF)
 
 **Requested:** 2026-06-29
