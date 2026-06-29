@@ -4795,6 +4795,10 @@ class RadioTUI(App):
         if self.core is None:
             return
         try:
+            wx_log = self.query_one("#wx-log", RichLog)
+        except Exception:  # noqa: BLE001
+            return
+        try:
             grid = self.query_one("#wx-grid", Input).value.strip().upper() or "FN31"
         except Exception:  # noqa: BLE001
             grid = "FN31"
@@ -4804,20 +4808,15 @@ class RadioTUI(App):
             None,
         )
         if js8 is None:
-            self._log_system("JS8Call transport not active — cannot query APRS WX.")
+            wx_log.write("[yellow]JS8Call transport not active — cannot query APRS WX.[/yellow]")
             return
-        self._log_system(f"Querying @APRSIS for NWS WX forecast for {grid[:4]}…")
-        try:
-            wx_log = self.query_one("#wx-log", RichLog)
-            wx_log.write(
-                f"[dim]⛅ JS8/APRS query sent for {grid[:4]}. "
-                "Reply will appear when received.[/dim]"
-            )
-        except Exception:  # noqa: BLE001
-            pass
+        wx_log.write(
+            f"[dim]⛅ JS8/APRS query sent for {grid[:4]}. "
+            "Reply will appear when received.[/dim]"
+        )
         ok = await js8.send_wx_query(grid)
         if not ok:
-            self._log_system("JS8Call WX query failed — is JS8Call running?")
+            wx_log.write("[yellow]JS8Call WX query failed — is JS8Call running?[/yellow]")
 
     @work
     async def _wx_winlink_scan(self) -> None:
