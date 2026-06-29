@@ -48,6 +48,7 @@ from textual.message import Message
 from textual.screen import ModalScreen
 from textual.widgets import (
     Button,
+    Checkbox,
     ContentSwitcher,
     Footer,
     Header,
@@ -1060,11 +1061,13 @@ class WinlinkWXSubscribeScreen(ModalScreen[bool]):
 
 
 class WXSetupScreen(ModalScreen[dict | None]):
-    """Wizard that asks whether to add MeshCore #weather channel and
-    Reticulum #weather / #nws_alerts groups for passive weather reception.
+    """Weather setup: manage grid squares and passive radio source subscriptions.
 
-    Returns ``{"meshcore": bool, "reticulum": bool}`` on confirm, or ``None``
-    on cancel.
+    Grid squares are shown as a deletable list; the add field forces uppercase.
+    MeshCore and Reticulum checkboxes stay open until the user explicitly saves.
+
+    Returns ``{"meshcore": bool, "reticulum": bool, "grids": str}`` on save,
+    or ``None`` on cancel.
     """
 
     CSS = """
@@ -1073,9 +1076,21 @@ class WXSetupScreen(ModalScreen[dict | None]):
         width: 72; height: auto; padding: 1 2;
         border: thick $accent; background: $surface;
     }
-    #wxsetup-title  { height: auto; margin-bottom: 1; }
-    #wxsetup-body   { height: auto; color: $text-muted; margin-bottom: 1; }
-    #wxsetup-btns   { height: auto; align-horizontal: right; }
+    #wxsetup-title      { height: auto; margin-bottom: 1; }
+    #wxsetup-grids-l    { height: auto; }
+    #wxsetup-grid-list  { height: auto; max-height: 6; margin-bottom: 0; }
+    .wxsetup-grid-row   { height: 1; }
+    .wxsetup-grid-label { width: 1fr; }
+    .wxsetup-del-btn    {
+        width: 3; min-width: 3; height: 1;
+        border: none; padding: 0; margin: 0;
+        background: transparent; color: $error;
+    }
+    #wxsetup-add-row    { height: 3; margin-bottom: 1; }
+    #wxsetup-grid-input { width: 1fr; }
+    #wxsetup-grid-add   { width: 7; min-width: 7; }
+    #wxsetup-sources-l  { height: auto; margin-top: 1; margin-bottom: 1; }
+    #wxsetup-btns       { height: auto; align-horizontal: right; margin-top: 1; }
     """
     BINDINGS = [("escape", "cancel", "Cancel")]
 
@@ -1088,56 +1103,92 @@ class WXSetupScreen(ModalScreen[dict | None]):
         super().__init__()
         self._has_mc = has_meshcore
         self._has_rns = has_reticulum
-        self._current_grids = current_grids
+        self._grids: list[str] = [
+            g.strip().upper()
+            for g in current_grids.split(",")
+            if g.strip()
+        ]
 
     def compose(self) -> ComposeResult:
-        mc_note = "" if self._has_mc else " [dim](applies when MeshCore connects)[/dim]"
-        rns_note = "" if self._has_rns else " [dim](applies when Reticulum connects)[/dim]"
+        mc_note = "" if self._has_mc else " [dim](when MeshCore connects)[/dim]"
+        rns_note = "" if self._has_rns else " [dim](when Reticulum connects)[/dim]"
         with Vertical(id="wxsetup-box"):
             yield Static("[b]⛅ Weather Setup[/b]", id="wxsetup-title")
+            yield Static("Grid squares:", id="wxsetup-grids-l")
+            yield VerticalScroll(id="wxsetup-grid-list")
+            with Horizontal(id="wxsetup-add-row"):
+                yield Input(placeholder="FN42", id="wxsetup-grid-input", max_length=6)
+                yield Button("+ Add", id="wxsetup-grid-add", variant="default")
             yield Static(
-                "Grid squares for the WX picker (comma-separated):",
-                id="wxsetup-grids-l",
+                "[b]Passive radio sources[/b]",
+                id="wxsetup-sources-l",
             )
-            yield Input(
-                value=self._current_grids,
-                placeholder="e.g. FN42, FN31, EM50",
-                id="wxsetup-grids",
+            yield Checkbox(
+                f"MeshCore #weather channel{mc_note}",
+                value=self._has_mc,
+                id="wxsetup-mc-cb",
             )
-            yield Static(
-                f"\n[b]Passive radio sources[/b]\n\n"
-                f"[b]MeshCore #weather channel[/b]{mc_note}\n"
-                "  Receives weather from nearby mesh nodes automatically.\n\n"
-                f"[b]Reticulum #weather and #nws_alerts groups[/b]{rns_note}\n"
-                "  Joins weather relay groups on the Reticulum mesh.",
-                id="wxsetup-body",
+            yield Checkbox(
+                f"Reticulum #weather / #nws_alerts groups{rns_note}",
+                value=self._has_rns,
+                id="wxsetup-rns-cb",
             )
             with Horizontal(id="wxsetup-btns"):
                 yield Button("Cancel", id="wxsetup-skip")
-                yield Button("Grids only", id="wxsetup-grids-only", variant="default")
-                yield Button("+ MC", id="wxsetup-mc", variant="default")
-                yield Button("+ RNS", id="wxsetup-rns", variant="default")
-                yield Button("Save all", id="wxsetup-both", variant="primary")
+                yield Button("Save", id="wxsetup-both", variant="primary")
 
     def on_mount(self) -> None:
-        self.query_one("#wxsetup-grids", Input).focus()
+        for grid in self._grids:
+            self._mount_grid_row(grid)
+        self.query_one("#wxsetup-grid-input", Input).focus()
 
-    def _build_result(self, mc: bool, rns: bool) -> dict:
-        grids = self.query_one("#wxsetup-grids", Input).value.strip()
-        return {"meshcore": mc, "reticulum": rns, "grids": grids}
+    def _mount_grid_row(self, grid: str) -> None:
+        container = self.query_one("#wxsetup-grid-list", VerticalScroll)
+        row = Horizontal(classes="wxsetup-grid-row")
+        container.mount(row)
+        row.mount(Label(grid, classes="wxsetup-grid-label"))
+        row.mount(Button("×", id=f"wxsetup-del-{grid}", classes="wxsetup-del-btn"))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "wxsetup-grid-input":
+            upper = event.value.upper()
+            if upper != event.value:
+                event.input.value = upper
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "wxsetup-grid-input":
+            self._do_add_grid()
+
+    def _do_add_grid(self) -> None:
+        inp = self.query_one("#wxsetup-grid-input", Input)
+        grid = inp.value.strip().upper()
+        if grid and grid not in self._grids:
+            self._grids.append(grid)
+            self._mount_grid_row(grid)
+        inp.value = ""
+        inp.focus()
+
+    def _build_result(self) -> dict:
+        mc = self.query_one("#wxsetup-mc-cb", Checkbox).value
+        rns = self.query_one("#wxsetup-rns-cb", Checkbox).value
+        return {"meshcore": mc, "reticulum": rns, "grids": ",".join(self._grids)}
 
     def on_button_pressed(self, event: Button.Pressed) -> None:
         bid = event.button.id or ""
         if bid == "wxsetup-skip":
             self.dismiss(None)
-        elif bid == "wxsetup-grids-only":
-            self.dismiss(self._build_result(False, False))
-        elif bid == "wxsetup-mc":
-            self.dismiss(self._build_result(True, False))
-        elif bid == "wxsetup-rns":
-            self.dismiss(self._build_result(False, True))
         elif bid == "wxsetup-both":
-            self.dismiss(self._build_result(True, True))
+            self.dismiss(self._build_result())
+        elif bid == "wxsetup-grid-add":
+            self._do_add_grid()
+            event.stop()
+        elif bid.startswith("wxsetup-del-"):
+            grid = bid[len("wxsetup-del-"):]
+            if grid in self._grids:
+                self._grids.remove(grid)
+            if event.button.parent is not None:
+                event.button.parent.remove()
+            event.stop()
 
     def action_cancel(self) -> None:
         self.dismiss(None)
