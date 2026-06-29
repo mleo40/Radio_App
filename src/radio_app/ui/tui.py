@@ -57,7 +57,9 @@ from textual.widgets import (
     ListView,
     Markdown,
     RichLog,
+    Select,
     Static,
+    TextArea,
 )
 
 from .._compat import UTC
@@ -110,8 +112,9 @@ def _looks_like_callsign(token: str) -> bool:
 # _handle_command's handlers, so this map mirrors that gating.
 _MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
     "winlink": (
+        "\u2709 Compose button \u2014 full email editor with multi-line body + templates",
         "/subject <text> \u2014 set the email subject for the next message",
-        "type \\n in the body \u2014 inserts a line break (multi-line email)",
+        "type \\n in the body \u2014 inserts a line break (quick multi-line)",
         "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
         "/save \u2014 save attachments from the open message",
         "/connect [gateway] \u2014 open a forwarding session (send + receive)",
@@ -139,6 +142,107 @@ _MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
         "/channel list|add <index> <#name> [secret] \u2014 manage channels",
     ),
 }
+
+
+# ---------------------------------------------------------------------------
+# Winlink email templates
+# ---------------------------------------------------------------------------
+
+class _WLTemplate:
+    """A named email template with optional subject/body placeholders."""
+
+    def __init__(self, name: str, subject: str, body: str) -> None:
+        self.name = name
+        self.subject = subject
+        self.body = body
+
+
+def _substitute_wl_template(text: str, callsign: str, date_utc: str, time_utc: str) -> str:
+    """Replace {callsign}, {date_utc}, {time_utc} placeholders in a template."""
+    return (
+        text
+        .replace("{callsign}", callsign or "N0CALL")
+        .replace("{date_utc}", date_utc)
+        .replace("{time_utc}", time_utc)
+    )
+
+
+_WL_TEMPLATES: list[_WLTemplate] = [
+    _WLTemplate("(blank)", "", ""),
+    _WLTemplate(
+        "ARRL Radiogram",
+        "ARRL RADIOGRAM — {callsign}",
+        (
+            "ARRL RADIOGRAM\n\n"
+            "Precedence: R (Routine)\n"
+            "Handling Instructions: \n"
+            "Station of Origin: {callsign}\n"
+            "Check: \n"
+            "Place of Origin: \n"
+            "Time Filed: {time_utc} UTC\n"
+            "Date: {date_utc}\n\n"
+            "TO: \n"
+            "STREET: \n"
+            "CITY: \n"
+            "STATE/ZIP: \n"
+            "PHONE: \n\n"
+            "MESSAGE:\n\n\n\n"
+            "End of message. Please confirm receipt. 73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "Health & Welfare",
+        "Health & Welfare — {callsign}",
+        (
+            "HEALTH & WELFARE MESSAGE\n\n"
+            "From: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n\n"
+            "This message certifies the station below is safe and well.\n\n"
+            "Station: \n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "Status: All is well. No special needs at this time.\n\n"
+            "Please relay to the addressee if possible.\n\n"
+            "73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "Activity Report",
+        "Station Activity Report — {callsign} {date_utc}",
+        (
+            "STATION ACTIVITY REPORT\n\n"
+            "Station: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "Bands / Modes Active: \n"
+            "Traffic Handled: \n"
+            "Stations Worked: \n\n"
+            "Status: Operational\n\n"
+            "Comments:\n\n\n"
+            "73 de {callsign}"
+        ),
+    ),
+    _WLTemplate(
+        "EmComm Spot Report",
+        "EmComm Spot Report — {callsign} {time_utc}Z",
+        (
+            "EMCOMM SPOT REPORT\n\n"
+            "From: {callsign}\n"
+            "Date/Time: {date_utc} {time_utc} UTC\n"
+            "Location: \n"
+            "Grid Square: \n\n"
+            "SITUATION:\n\n\n"
+            "RESOURCES NEEDED:\n\n\n"
+            "RESOURCES AVAILABLE:\n\n\n"
+            "CASUALTIES: \n\n"
+            "INFRASTRUCTURE STATUS:\n\n\n"
+            "PRIORITY TRAFFIC:\n\n\n"
+            "Next scheduled contact: \n\n"
+            "73 de {callsign}"
+        ),
+    ),
+]
 
 
 def _cache_age(when: datetime | None) -> str:
@@ -714,6 +818,187 @@ class WinlinkComposeFormScreen(ModalScreen["dict | None"]):
         self.dismiss(None)
 
 
+class WinlinkEmailComposeScreen(ModalScreen["dict | None"]):
+    """Full-screen modal for composing a Winlink email.
+
+    Replaces the single-line + ``\\n`` workaround with a proper multi-line
+    body editor (TextArea) plus To/Cc/Subject fields and optional templates.
+
+    Returns ``{"to", "cc", "subject", "body", "attachments"}`` on submit,
+    ``{"action": "ics_forms"}`` when the user picks ICS Forms from the
+    template picker, or ``None`` on cancel.
+    """
+
+    CSS = """
+    WinlinkEmailComposeScreen { align: center middle; }
+    #wecf-box {
+        width: 84; height: 90%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wecf-title { height: auto; margin-bottom: 1; }
+    #wecf-fields { height: 1fr; }
+    #wecf-fields Input { margin-bottom: 1; }
+    #wecf-fields Label { color: $text-muted; }
+    #wecf-fields Select { margin-bottom: 1; }
+    #wecf-body { height: 10; margin-bottom: 1; }
+    #wecf-attach-row { height: auto; }
+    #wecf-attach-label { width: 1fr; color: $text-muted; }
+    #wecf-error { height: auto; color: $error; }
+    #wecf-buttons { height: auto; align-horizontal: right; margin-top: 1; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    _ICS_SENTINEL = "__ics_forms__"
+
+    def __init__(
+        self,
+        subject: str = "",
+        attachments: list[str] | None = None,
+        callsign: str = "",
+        date_utc: str = "",
+        time_utc: str = "",
+    ) -> None:
+        super().__init__()
+        self._init_subject = subject
+        self._attachments: list[str] = list(attachments or [])
+        self._callsign = callsign
+        self._date_utc = date_utc
+        self._time_utc = time_utc
+        self._last_template_body = ""
+
+    def compose(self) -> ComposeResult:
+        options: list[tuple[str, str]] = [
+            (t.name, str(i)) for i, t in enumerate(_WL_TEMPLATES)
+        ]
+        options.append(("ICS Forms →", self._ICS_SENTINEL))
+        with Vertical(id="wecf-box"):
+            yield Static("[b]✉ Compose Winlink Email[/b]", id="wecf-title")
+            with VerticalScroll(id="wecf-fields"):
+                yield Select(
+                    options,
+                    prompt="— template (optional) —",
+                    id="wecf-template",
+                    allow_blank=True,
+                )
+                yield Label("To:")
+                yield Input(
+                    id="wecf-to",
+                    placeholder="W1AW  (callsign or email address)",
+                )
+                yield Label("Cc:")
+                yield Input(id="wecf-cc", placeholder="optional")
+                yield Label("Subject:")
+                yield Input(id="wecf-subject", value=self._init_subject)
+                yield Label("Body:")
+                yield TextArea(id="wecf-body")
+                yield Label("Attachments:")
+                with Horizontal(id="wecf-attach-row"):
+                    yield Static(self._attach_summary(), id="wecf-attach-label")
+                    yield Button("Clear", id="wecf-attach-clear", classes="modebtn")
+                yield Input(
+                    id="wecf-attach-path",
+                    placeholder="/path/to/attachment  (Enter to add)",
+                )
+            yield Static("", id="wecf-error")
+            with Horizontal(id="wecf-buttons"):
+                yield Button("Cancel", id="wecf-cancel")
+                yield Button(
+                    "Queue to outbox", id="wecf-queue", variant="primary"
+                )
+
+    def on_mount(self) -> None:
+        self.query_one("#wecf-to", Input).focus()
+
+    # -- template picker ------------------------------------------------------
+
+    def on_select_changed(self, event: Select.Changed) -> None:
+        val = event.value
+        if val is Select.BLANK:
+            return
+        if val == self._ICS_SENTINEL:
+            self.dismiss({"action": "ics_forms"})
+            return
+        tmpl = _WL_TEMPLATES[int(val)]
+        body_widget = self.query_one("#wecf-body", TextArea)
+        current_body = body_widget.text
+        if not current_body.strip() or current_body == self._last_template_body:
+            body = _substitute_wl_template(
+                tmpl.body, self._callsign, self._date_utc, self._time_utc
+            )
+            body_widget.load_text(body)
+            self._last_template_body = body
+        subj_widget = self.query_one("#wecf-subject", Input)
+        if not subj_widget.value.strip() and tmpl.subject:
+            subj_widget.value = _substitute_wl_template(
+                tmpl.subject, self._callsign, self._date_utc, self._time_utc
+            )
+
+    # -- attachments ----------------------------------------------------------
+
+    def _attach_summary(self) -> str:
+        if not self._attachments:
+            return "[dim]\U0001f4ce[/dim] None"
+        names = ", ".join(os.path.basename(p) for p in self._attachments)
+        return f"[dim]\U0001f4ce[/dim] {len(self._attachments)}: {names}"
+
+    def _queue_attachment(self, path: str) -> None:
+        path = path.strip()
+        if not path:
+            return
+        if not os.path.exists(path):
+            self.query_one("#wecf-error", Static).update(
+                f"File not found: {path}"
+            )
+            return
+        self._attachments.append(path)
+        self.query_one("#wecf-attach-label", Static).update(
+            self._attach_summary()
+        )
+        self.query_one("#wecf-error", Static).update("")
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        if event.input.id == "wecf-attach-path":
+            self._queue_attachment(event.input.value)
+            event.input.value = ""
+
+    # -- buttons --------------------------------------------------------------
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id
+        if bid == "wecf-cancel":
+            self.dismiss(None)
+        elif bid == "wecf-attach-clear":
+            self._attachments = []
+            self.query_one("#wecf-attach-label", Static).update(
+                self._attach_summary()
+            )
+        elif bid == "wecf-queue":
+            to = self.query_one("#wecf-to", Input).value.strip()
+            if not to:
+                self.query_one("#wecf-error", Static).update(
+                    "To: address is required."
+                )
+                return
+            attach_input = self.query_one("#wecf-attach-path", Input).value
+            if attach_input.strip():
+                self._queue_attachment(attach_input)
+                if not os.path.exists(attach_input.strip()):
+                    return
+            self.dismiss(self._build_result())
+
+    def _build_result(self) -> dict:
+        return {
+            "to": self.query_one("#wecf-to", Input).value.strip(),
+            "cc": self.query_one("#wecf-cc", Input).value.strip() or None,
+            "subject": self.query_one("#wecf-subject", Input).value.strip(),
+            "body": self.query_one("#wecf-body", TextArea).text,
+            "attachments": list(self._attachments),
+        }
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class AboutScreen(ModalScreen[None]):
     """Hidden "about" easter egg: a scrollable technical overview of the app.
 
@@ -1144,6 +1429,9 @@ class RadioTUI(App):
                     yield Button("\u26a1 Start", id="winlink-start", classes="modebtn")
                     yield Button(
                         "\u270e Subject", id="winlink-subject", classes="modebtn"
+                    )
+                    yield Button(
+                        "\u2709 Compose", id="winlink-compose", classes="modebtn"
                     )
                     yield Button(
                         "\U0001f4cb Forms", id="winlink-forms", classes="modebtn"
@@ -2236,6 +2524,8 @@ class RadioTUI(App):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
             self._winlink_subject_prompt()
+        elif bid == "winlink-compose":
+            self._winlink_email_compose()
         elif bid == "winlink-forms":
             self._winlink_open_forms()
         elif bid == "winlink-connect":
@@ -4307,6 +4597,64 @@ class RadioTUI(App):
             "Nothing sent yet; press Connect to transmit."
         )
         self._refresh_active_pane()
+
+    @work
+    async def _winlink_email_compose(self) -> None:
+        """Open the full-screen Winlink email compose modal.
+
+        Pre-fills Subject from any pending /subject, Attachments from the
+        current queue, and Callsign/Date/Time for template substitution.
+        On submit, builds and queues the message to Pat's outbox. If the user
+        picks "ICS Forms →" from the template selector, hands off to the
+        existing Pat form flow instead.
+        """
+        now = datetime.now(UTC)
+        callsign = (self.core.station.callsign or "") if self.core else ""
+        result = await self.push_screen_wait(
+            WinlinkEmailComposeScreen(
+                subject=self._winlink_subject,
+                attachments=list(self._attach_queue),
+                callsign=callsign,
+                date_utc=now.strftime("%d %b %Y"),
+                time_utc=now.strftime("%H%M"),
+            )
+        )
+        if result is None:
+            return
+        if result.get("action") == "ics_forms":
+            self._winlink_open_forms()
+            return
+        to = result.get("to") or ""
+        if not to:
+            return
+        body = result.get("body") or ""
+        if not body.strip():
+            self._log_system("Compose: no message body — nothing queued.")
+            return
+        me = callsign or "unknown"
+        msg = UnifiedMessage.direct(me, to, body)
+        if result.get("subject"):
+            msg.metadata["subject"] = result["subject"]
+        if result.get("cc"):
+            msg.metadata["cc"] = result["cc"]
+        if result.get("attachments"):
+            msg.metadata["attach"] = list(result["attachments"])
+        ok = await self.core.router.send(msg, force_transport="winlink")
+        self._winlink_subject = ""
+        self._attach_queue = []
+        self._update_winlink_bar()
+        if ok:
+            self._log_system(
+                f"Winlink email queued to Pat's outbox — "
+                f"To: {to} · "
+                f"Subj: {result.get('subject') or '(no subject)'}. "
+                "Nothing sent yet; press Connect to transmit."
+            )
+        else:
+            self._log_system(f"Winlink: failed to queue email to {to}.")
+        self._render_message(msg, outgoing=True, ok=ok)
+        self._append_monitor(msg)
+        self._refresh_threads()
 
     def _set_winlink_subject(self, text: str) -> None:
         """Set (or clear) the pending subject for the next Winlink message."""
