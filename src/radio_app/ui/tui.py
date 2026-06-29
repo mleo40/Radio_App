@@ -2145,7 +2145,7 @@ class RadioTUI(App):
         "nomadnet":  "Nomad",
         "js8call":   "JS8",
         "winlink":   "WL",
-        "wsjt_x":   "FT8",
+        "wsjt_x":    "WSJTX",
     }
 
     def _mode_keys(self) -> list[str]:
@@ -4952,9 +4952,6 @@ class RadioTUI(App):
         by_name = {t.name: t for t in self.core.transports}
         for key in self._mode_keys():
             label = self._MODE_SHORT_LABELS.get(key, key)
-            if key != "nomadnet" and key in by_name:
-                # Prefer distributor/user display_name if set, fall back to short label.
-                label = by_name[key].display_name or label
             bar.mount(Button(label, id=f"mode-{key}", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
