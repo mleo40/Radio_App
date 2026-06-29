@@ -2,6 +2,43 @@
 
 Tracked, not-yet-implemented feature requests. Newest at the top.
 
+## Scheduled band changes (JS8Call / HF)
+
+**Requested:** 2026-06-29
+**Status:** Backlog
+**Area:** `core/scheduler.py`, `transports/js8call_transport.py`, `ui/tui.py`
+
+Change the active HF band on a schedule — for example, move to 40m at 20:00 local
+for the evening EmComm net, then back to 20m at 08:00 the next morning.
+
+**Use case:** EmComm nets operate on fixed band/time schedules (e.g. 80m at night,
+20m during the day, 40m for regional coverage). Today the operator must manually
+switch bands or add a separate cron job. A built-in schedule would keep the radio
+on the right frequency for each net window automatically.
+
+**Design notes:**
+- New schedule entry type `kind = "band_change"` alongside existing
+  `kind = "message"` in `store.scheduled_messages`; fields: `transport`, `band`
+  (e.g. `"40m"`), `recurrence` (`"daily"` / `"weekly"` / `"once"`)
+- Scheduler loop (already running in `app.py`) checks for due band-change entries
+  and calls `js8call_transport.set_band(band)` (already wired; the `radioapp js8
+  band <band>` CLI command uses it)
+- TUI: extend `/sched` compose flow with a "band change" option alongside the
+  existing message scheduler; show pending band-change entries in the schedule list
+- CLI: `radioapp schedule band <band> <time> [--daily] [--transport js8call]`
+- The existing `JS8_BAND_DIAL_HZ` lookup and `set_band()` implementation in
+  `js8call_transport.py` already does the heavy lifting; this is primarily a
+  scheduler + UX addition
+
+**Command sketch:**
+```bash
+radioapp schedule band 40m 20:00 --daily        # every night at 20:00 local
+radioapp schedule band 20m 08:00 --daily        # back to 20m at 08:00
+radioapp schedule list                          # shows both message and band entries
+```
+
+---
+
 ## Database merge (`radioapp db merge`)
 
 **Requested:** 2026-06-27

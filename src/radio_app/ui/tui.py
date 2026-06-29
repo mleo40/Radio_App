@@ -624,6 +624,20 @@ class BrowseScreen(ModalScreen[None]):
             return
         link = self._links[idx - 1]
         dest = link.resolve_dest(self._current[0])
+        # If resolve_dest returned a short hex prefix (didn't match the current
+        # node), consult the offline cache before going live. If the cache has a
+        # unique entry for this prefix+path, its stored dest IS the full 32-char
+        # hash — using it avoids "ambiguous prefix" errors when multiple live RNS
+        # nodes happen to share the same leading hex digits.
+        if (
+            dest
+            and len(dest) < 32
+            and all(c in "0123456789abcdef" for c in dest.lower())
+            and getattr(self._browser, "_cache", None) is not None
+        ):
+            hit = self._browser._cache.get(dest, link.path)
+            if hit is not None:
+                dest = hit.dest
         self._load(dest, link.path, link.fields)
 
     def action_back(self) -> None:
