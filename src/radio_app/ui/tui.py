@@ -6234,7 +6234,7 @@ class RadioTUI(App):
         elif cmd == "/roster":
             self._handle_roster_command(arg)
         elif cmd == "/start":
-            await self._handle_start_command(arg)
+            self._handle_start_command(arg)
         else:
             self._log_system(f"unknown command: {cmd}")
 
