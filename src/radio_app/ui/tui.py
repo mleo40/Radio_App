@@ -3175,6 +3175,11 @@ class RadioTUI(App):
                 and hasattr(t, "radio_status_snapshot")
             ):
                 self._render_js8_status(log, t.radio_status_snapshot())
+                if self.core is not None:
+                    bstats = self.core.store.band_stats(transport=t.name)
+                    if bstats:
+                        parts = "  ".join(f"{b} {c}" for b, c in bstats.items())
+                        log.write(f"      [dim]band log: {parts}[/dim]")
             # MeshCore (and any transport exposing device_telemetry) shows its
             # device health: battery + radio parameters.
             if (
@@ -7448,8 +7453,10 @@ class RadioTUI(App):
         tag = ""
         if msg.address_type is AddressType.GROUP and msg.group:
             tag = f" [magenta]@{msg.group}[/magenta]"
+        band = msg.metadata.get("band", "")
+        band_tag = f" [dim]{band}[/dim]" if band else ""
         log.write(
-            f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag} {who}: "
+            f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag}{band_tag} {who}: "
             f"{self._subject_md(msg)}{msg.content}{lock}{status}"
             f"{self._attachments_md(msg)}"
         )
