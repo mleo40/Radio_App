@@ -918,7 +918,8 @@ class RadioTUI(App):
         Binding("q", "quit", "Quit"),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
-        ("f5", "cycle_utility", "Stream/Health/Fav"),
+        ("f5", "cycle_utility", "Stream/Health…"),
+        Binding("ctrl+l", "logs", "Logs", show=False, priority=True),
         ("f", "toggle_nomad_favorite", "Save node"),
         ("s", "sync_nomad", "Sync favs"),
         ("g", "cycle_watch_group", "Group filter"),
@@ -2136,6 +2137,16 @@ class RadioTUI(App):
 
     # Canonical display order for mode chips and F3 cycling.
     _MODE_ORDER = ["meshcore", "reticulum", "nomadnet", "js8call", "winlink", "wsjt_x"]
+
+    # Abbreviated labels shown in the mode-selector bar.
+    _MODE_SHORT_LABELS: dict[str, str] = {
+        "meshcore":  "MC",
+        "reticulum": "RNS",
+        "nomadnet":  "Nomad",
+        "js8call":   "JS8",
+        "winlink":   "WL",
+        "wsjt_x":   "FT8",
+    }
 
     def _mode_keys(self) -> list[str]:
         """Ordered selectable operating modes, matching the selector chips."""
@@ -4938,19 +4949,17 @@ class RadioTUI(App):
         bar = self.query_one("#modebar", Horizontal)
         by_name = {t.name: t for t in self.core.transports}
         for key in self._mode_keys():
-            if key == "nomadnet":
-                bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
-            else:
-                t = by_name[key]
-                label = t.display_name or t.name
-                bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
+            label = self._MODE_SHORT_LABELS.get(key, key)
+            if key != "nomadnet" and key in by_name:
+                # Prefer distributor/user display_name if set, fall back to short label.
+                label = by_name[key].display_name or label
+            bar.mount(Button(label, id=f"mode-{key}", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
         bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
-        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
     def _health_dot(self, name: str) -> str:
