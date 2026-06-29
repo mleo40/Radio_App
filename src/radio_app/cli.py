@@ -509,6 +509,27 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_start.set_defaults(func=_cmd_start)
 
+    p_net = sub.add_parser("net", help="manage net control / roll-call sessions")
+    net_sub = p_net.add_subparsers(dest="net_action")
+
+    p_net_open = net_sub.add_parser("open", help="open a new net session")
+    p_net_open.add_argument("name", nargs="?", default="Net", help="net name")
+    p_net_open.add_argument(
+        "--transport", default="",
+        help="transport this net runs on (e.g. js8call)",
+    )
+
+    p_net_ci = net_sub.add_parser("ci", help="log a check-in")
+    p_net_ci.add_argument("callsign", help="callsign checking in")
+    p_net_ci.add_argument("note", nargs="*", help="optional note (grid, traffic, etc.)")
+
+    net_sub.add_parser("list", help="show current check-in list")
+    net_sub.add_parser("close", help="close the active net session")
+    net_sub.add_parser("status", help="show net open/closed state")
+    net_sub.add_parser("sessions", help="show recent session history")
+
+    p_net.set_defaults(func=_cmd_net)
+
     return parser
 
 
@@ -2746,6 +2767,119 @@ def _cmd_start(args: argparse.Namespace) -> int:
             return 1
 
     return _run(_with_app(args.config, run))
+
+
+def _cmd_net(args: argparse.Namespace) -> int:
+    """Manage net control / roll-call sessions."""
+    from .config import Config
+    from .core.net import NetManager
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+    nm = NetManager(store)
+
+    action = getattr(args, "net_action", None)
+
+    try:
+        if action == "open":
+            nc = cfg.station.get("callsign", "") if hasattr(cfg, "station") else ""
+            session = nm.open(
+                args.name or "Net",
+                transport=getattr(args, "transport", "") or "",
+                net_control=nc,
+            )
+            print(
+                f"Net opened: '{session.name}'  "
+                f"transport: {session.transport or 'any'}  "
+                f"NC: {session.net_control or '—'}"
+            )
+
+        elif action in ("ci", "checkin"):
+            callsign = args.callsign.upper()
+            note = " ".join(args.note) if args.note else ""
+            ci = nm.check_in(callsign, note)
+            ts = ci.checked_in_at.strftime("%H:%M")
+            print(
+                f"Check-in #{len(nm.active.check_ins)}: {callsign}  {ts}Z"  # type: ignore[union-attr]
+                + (f"  {note}" if note else "")
+            )
+
+        elif action in ("list", "ls"):
+            session = nm.active
+            if session is None:
+                print("No open net session.")
+                store.close()
+                return 0
+            print(f"Net: {session.name}  {len(session.check_ins)} check-in(s)")
+            for i, ci in enumerate(session.check_ins, 1):
+                note = f"  {ci.note}" if ci.note else ""
+                print(f"  {i:>3}. {ci.callsign:<12} {ci.checked_in_at.strftime('%H:%M')}Z{note}")
+
+        elif action == "close":
+            closed = nm.close()
+            elapsed = (
+                f"{closed.duration_min:.0f} min"
+                if closed.duration_min is not None
+                else "?"
+            )
+            calls = ", ".join(ci.callsign for ci in closed.check_ins) or "none"
+            print(
+                f"Net closed: '{closed.name}'  "
+                f"{len(closed.check_ins)} check-in(s)  {elapsed}"
+            )
+            print(f"  Roll call: {calls}")
+
+        elif action in ("status", "info"):
+            session = nm.active
+            if session is None:
+                print("No open net session.")
+            else:
+                elapsed_s = (datetime.now(UTC) - session.opened_at).total_seconds()
+                print(
+                    f"Net: {session.name}  OPEN  "
+                    f"{len(session.check_ins)} check-in(s)  "
+                    f"{int(elapsed_s // 60)}m elapsed  "
+                    f"NC: {session.net_control or '—'}"
+                )
+
+        elif action in ("sessions", "history", "log"):
+            sessions = nm.recent_sessions(limit=10)
+            if not sessions:
+                print("No net sessions recorded.")
+                store.close()
+                return 0
+            print(f"  {'DATE':>16}  {'STATUS':>6}  {'NAME':<20}  {'TRANSPORT':<10}  CI")
+            print("  " + "-" * 65)
+            for s in sessions:
+                state = "OPEN" if s.is_open else "closed"
+                dt = s.opened_at.strftime("%m-%d %H:%MZ")
+                print(
+                    f"  {dt:>16}  {state:>6}  {s.name:<20}  "
+                    f"{s.transport:<10}  {len(s.check_ins)}"
+                )
+
+        else:
+            print(
+                "Usage: radioapp net <open|ci|list|close|status|sessions>\n"
+                "  open <name>           — open a new net session\n"
+                "  ci <callsign> [note]  — log a check-in\n"
+                "  list                  — show current check-in list\n"
+                "  close                 — close the session\n"
+                "  status                — show open/closed state\n"
+                "  sessions              — show recent session history",
+                file=sys.stderr,
+            )
+            store.close()
+            return 1
+
+    except ValueError as e:
+        print(f"error: {e}", file=sys.stderr)
+        store.close()
+        return 1
+
+    store.close()
+    return 0
 
 
 if __name__ == "__main__":

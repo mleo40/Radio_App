@@ -89,8 +89,20 @@ _UNIVERSAL_COMMAND_HELP = (
     "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
     "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
-    "/start [transport], /help, /quit"
+    "/start [transport], "
+    "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
+    "/help, /quit"
 )
+
+_CALLSIGN_RE = __import__("re").compile(
+    r"^[A-Z]{1,2}[0-9][A-Z]{1,3}$|^[A-Z]{1,2}[0-9][A-Z]{0,3}/[A-Z0-9]+$",
+    __import__("re").IGNORECASE,
+)
+
+
+def _looks_like_callsign(token: str) -> bool:
+    """True if *token* looks like an amateur callsign (e.g. KE0XYZ, W1AW)."""
+    return bool(_CALLSIGN_RE.match(token.strip()))
 
 # Mode-specific commands, keyed by transport name. /help shows only the active
 # mode's group (plus the universal ones), so each panel lists what's usable
@@ -884,6 +896,12 @@ class RadioTUI(App):
     #archive-spacer { width: 1fr; height: 1; }
     #archive-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
     #archive-list { height: 1fr; }
+    #net-view { height: 1fr; }
+    #net-bar { height: 1; }
+    #net-status { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #net-spacer { width: 1fr; height: 1; }
+    #net-bar Button { height: 1; min-width: 8; border: none; margin: 0 1 0 0; }
+    #net-log { height: 1fr; padding: 0 1; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -1253,6 +1271,16 @@ class RadioTUI(App):
                         "\u21bb Refresh", id="archive-refresh", classes="modebtn"
                     )
                 yield ListView(id="archive-list")
+            with Vertical(id="net-view"):
+                with Horizontal(id="net-bar"):
+                    yield Static("", id="net-status")
+                    yield Static("", id="net-spacer")
+                    yield Button("◎ Open", id="net-open", classes="modebtn")
+                    yield Button("✓ Check-in", id="net-ci-btn", classes="modebtn")
+                    yield Button("✗ Close", id="net-close-btn", classes="modebtn")
+                yield RichLog(
+                    id="net-log", wrap=True, markup=True, highlight=False
+                )
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
         yield Footer()
@@ -2147,6 +2175,8 @@ class RadioTUI(App):
             self.action_logs()
         elif bid == "view-archive":
             self.action_archive()
+        elif bid == "view-net":
+            self._show_net()
         elif bid == "archive-mode":
             self._cycle_archive_filter()
         elif bid == "archive-refresh":
@@ -2205,6 +2235,12 @@ class RadioTUI(App):
             self.action_remove_favorite()
         elif bid == "fav-import-groups":
             self._import_js8_groups()
+        elif bid == "net-open":
+            self._net_open_prompt()
+        elif bid == "net-ci-btn":
+            self._net_ci_self()
+        elif bid == "net-close-btn":
+            self._handle_net_command("close")
 
     def _select_mode(self, name: str) -> None:
         """Switch the active operating mode to a transport and show its surface."""
@@ -2265,7 +2301,7 @@ class RadioTUI(App):
         Stream, then advances Stream -> Health -> History -> Favorites -> Logs
         -> Stream.
         """
-        order = ["monitor", "health", "archive", "favorites", "logs"]
+        order = ["monitor", "health", "archive", "favorites", "net", "logs"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -2278,6 +2314,8 @@ class RadioTUI(App):
             self._show_logs()
         elif nxt == "archive":
             self._show_archive()
+        elif nxt == "net":
+            self._show_net()
         else:
             self._show_favorites()
 
@@ -3333,6 +3371,247 @@ class RadioTUI(App):
         self._update_status()
         composer.focus()
 
+    # -- net surface -----------------------------------------------------------
+
+    def _show_net(self) -> None:
+        """Show the Net control / roll-call surface."""
+        self.view = "net"
+        self.query_one("#main", ContentSwitcher).current = "net-view"
+        self._enable_composer(True)
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = "/net open <name> · /net ci <call> [note] · /net close"
+        self._render_net()
+        self._update_modebar()
+        self._update_status()
+        composer.focus()
+
+    def _render_net(self) -> None:
+        """Redraw the Net surface with current session state."""
+        if self.core is None:
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            return
+        log = self.query_one("#net-log", RichLog)
+        status = self.query_one("#net-status", Static)
+        log.clear()
+
+        session = nm.active
+        if session is None:
+            status.update("[dim]No active net — /net open <name>[/dim]")
+            # Show the most recent closed session for reference.
+            recent = nm.recent_sessions(limit=1)
+            if recent:
+                s = recent[0]
+                elapsed = (
+                    f"{s.duration_min:.0f} min"
+                    if s.duration_min is not None
+                    else "?"
+                )
+                log.write(
+                    f"[dim]Last net: [b]{s.name}[/b]  {s.transport}  "
+                    f"{s.opened_at.strftime('%Y-%m-%d %H:%M')} UTC  "
+                    f"({elapsed})  {len(s.check_ins)} check-in(s)[/dim]"
+                )
+                for i, ci in enumerate(s.check_ins, 1):
+                    note = f"  {ci.note}" if ci.note else ""
+                    log.write(
+                        f"[dim]  {i:>3}.  {ci.callsign:<12} "
+                        f"{ci.checked_in_at.strftime('%H:%M')}Z{note}[/dim]"
+                    )
+        else:
+            elapsed_s = (
+                datetime.now(UTC) - session.opened_at
+            ).total_seconds()
+            elapsed = (
+                f"{int(elapsed_s // 60)}m{int(elapsed_s % 60):02d}s"
+            )
+            status.update(
+                f"[green b]OPEN[/green b]  [b]{session.name}[/b]  "
+                f"{session.transport}  NC:[b]{session.net_control or '—'}[/b]  "
+                f"{len(session.check_ins)} checked in  {elapsed}"
+            )
+            log.write(
+                f"[b]Net:[/b] {session.name}  "
+                f"opened {session.opened_at.strftime('%H:%M')}Z  "
+                f"transport: {session.transport or '(any)'}"
+            )
+            if not session.check_ins:
+                log.write("[dim]  No check-ins yet.[/dim]")
+            else:
+                log.write(f"[b]Check-ins ({len(session.check_ins)}):[/b]")
+                for i, ci in enumerate(session.check_ins, 1):
+                    note = f"  {ci.note}" if ci.note else ""
+                    log.write(
+                        f"  {i:>3}.  [b]{ci.callsign:<12}[/b] "
+                        f"{ci.checked_in_at.strftime('%H:%M')}Z{note}"
+                    )
+
+    def _net_open_prompt(self) -> None:
+        """Open a new net using the current mode as transport."""
+        if self.core is None:
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            return
+        if nm.active and nm.active.is_open:
+            self._log_system(
+                f"Net '{nm.active.name}' is already open — /net close first."
+            )
+            return
+        nc = getattr(self.core.station, "callsign", "") or ""
+        name = "Net"
+        try:
+            nm.open(name, transport=self.active_transport or "", net_control=nc)
+        except ValueError as e:
+            self._log_system(str(e))
+            return
+        self._log_system(
+            f"Net opened: '{name}' on {self.active_transport or 'any'}.  "
+            "Use /net open <custom name> to rename."
+        )
+        self._render_net()
+
+    def _net_ci_self(self) -> None:
+        """Check in own callsign via the ✓ button."""
+        if self.core is None:
+            return
+        nc = getattr(self.core.station, "callsign", "") or "N0CALL"
+        self._handle_net_command(f"ci {nc}")
+
+    def _handle_net_command(self, arg: str) -> None:
+        """Handle /net <subcommand> from the composer."""
+        if self.core is None:
+            self._log_system("Core not ready.")
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            self._log_system("Net manager unavailable.")
+            return
+
+        parts = arg.strip().split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("open", "start"):
+            name = rest or "Net"
+            nc = getattr(self.core.station, "callsign", "") or ""
+            try:
+                nm.open(
+                    name,
+                    transport=self.active_transport or "",
+                    net_control=nc,
+                )
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            self._log_system(
+                f"[b]Net open:[/b] '{name}'  transport: "
+                f"{self.active_transport or 'any'}  NC: {nc or '—'}"
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("ci", "checkin", "check-in", "heard"):
+            # /net ci [callsign] [note]  — bare "ci" checks in own callsign
+            ci_parts = rest.split(maxsplit=1)
+            if ci_parts and _looks_like_callsign(ci_parts[0]):
+                callsign = ci_parts[0].upper()
+                note = ci_parts[1].strip() if len(ci_parts) > 1 else ""
+            else:
+                callsign = (
+                    getattr(self.core.station, "callsign", "") or "N0CALL"
+                ).upper()
+                note = rest
+            try:
+                ci = nm.check_in(callsign, note)
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            ts = ci.checked_in_at.strftime("%H:%M")
+            self._log_system(
+                f"[b]Check-in #{len(nm.active.check_ins)}:[/b] "  # type: ignore[union-attr]
+                f"[b]{callsign}[/b]  {ts}Z"
+                + (f"  {note}" if note else "")
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("close", "end"):
+            try:
+                closed = nm.close()
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            elapsed = (
+                f"{closed.duration_min:.0f} min"
+                if closed.duration_min is not None
+                else "?"
+            )
+            calls = ", ".join(ci.callsign for ci in closed.check_ins) or "none"
+            self._log_system(
+                f"[b]Net closed:[/b] '{closed.name}'  "
+                f"{len(closed.check_ins)} check-in(s)  {elapsed}\n"
+                f"  Roll call: {calls}"
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("list", "ls", "show"):
+            session = nm.active
+            if session is None:
+                self._log_system("No open net.  Recent: /net sessions")
+                return
+            lines = [
+                f"[b]Net:[/b] {session.name}  "
+                f"{len(session.check_ins)} check-in(s)"
+            ]
+            for i, ci in enumerate(session.check_ins, 1):
+                note = f"  {ci.note}" if ci.note else ""
+                lines.append(
+                    f"  {i:>2}. [b]{ci.callsign}[/b]  "
+                    f"{ci.checked_in_at.strftime('%H:%M')}Z{note}"
+                )
+            self._log_system("\n".join(lines))
+
+        elif sub in ("status", "info"):
+            session = nm.active
+            if session is None:
+                self._log_system("No open net session.")
+            else:
+                elapsed_s = (
+                    datetime.now(UTC) - session.opened_at
+                ).total_seconds()
+                self._log_system(
+                    f"[b]Net:[/b] {session.name}  OPEN  "
+                    f"{len(session.check_ins)} check-in(s)  "
+                    f"{int(elapsed_s // 60)}m elapsed  "
+                    f"NC: {session.net_control or '—'}"
+                )
+
+        elif sub in ("sessions", "history", "log"):
+            sessions = nm.recent_sessions(limit=5)
+            if not sessions:
+                self._log_system("No net sessions recorded yet.")
+                return
+            lines = ["[b]Recent net sessions:[/b]"]
+            for s in sessions:
+                state = "[green]OPEN[/green]" if s.is_open else "closed"
+                dt = s.opened_at.strftime("%m-%d %H:%M")
+                lines.append(
+                    f"  {dt}Z  {state}  [b]{s.name}[/b]  "
+                    f"{s.transport}  {len(s.check_ins)} CI"
+                )
+            self._log_system("\n".join(lines))
+
+        else:
+            self._log_system(
+                "Usage: /net open <name> · /net ci [<callsign>] [note] · "
+                "/net list · /net close · /net status · /net sessions"
+            )
+
+    # -- favorites (continued) -------------------------------------------------
+
     def _favorite_kind(self, fav: Favorite) -> str:
         """Classify a favorite as 'node' (NomadNet server), 'hash' or 'callsign'."""
         return self._favorite_kind_by_id(fav.id)
@@ -3860,6 +4139,8 @@ class RadioTUI(App):
                 btn.set_class(self.view == "archive", "-active")
             elif bid == "view-favorites":
                 btn.set_class(self.view == "favorites", "-active")
+            elif bid == "view-net":
+                btn.set_class(self.view == "net", "-active")
         self._update_input_indicator()
         self._update_mesh_bar()
         self._update_js8_bar()
@@ -4668,6 +4949,7 @@ class RadioTUI(App):
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
+        bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
         bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
@@ -6235,6 +6517,8 @@ class RadioTUI(App):
             self._handle_roster_command(arg)
         elif cmd == "/start":
             self._handle_start_command(arg)
+        elif cmd == "/net":
+            self._handle_net_command(arg)
         else:
             self._log_system(f"unknown command: {cmd}")
 

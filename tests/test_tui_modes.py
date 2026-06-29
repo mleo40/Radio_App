@@ -462,6 +462,9 @@ def test_f5_cycles_watch_health_logs_chats_favorites(config_path):
             app.action_cycle_utility()  # -> Favorites
             await pilot.pause()
             assert app.query_one("#main").current == "favorites-view"
+            app.action_cycle_utility()  # -> Net
+            await pilot.pause()
+            assert app.query_one("#main").current == "net-view"
             app.action_cycle_utility()  # -> Logs
             await pilot.pause()
             assert app.query_one("#main").current == "logs-view"

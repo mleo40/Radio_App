@@ -15,6 +15,7 @@ from .core.compliance import ComplianceGuard
 from .core.favorites import Favorites
 from .core.filters import FilterEngine
 from .core.groups import GroupRegistry
+from .core.net import NetManager
 from .core.nomad_cache import NomadPageCache
 from .core.nomadnet import NomadnetBrowser
 from .core.proc_manager import ProcManager
@@ -49,6 +50,7 @@ class App:
         # claims/releases it as the operator switches modes / runs sessions.
         self.radio_interlock = RadioInterlock(self._radio_contenders())
         self.proc_manager = ProcManager(config, self.radio_interlock)
+        self.net = NetManager(self.store)
         # HF transports route inbound traffic by our callsign (a message "TO" us
         # is DIRECT). Push the operator identity from [station] into any transport
         # that accepts it, so users don't have to duplicate it per transport block.
