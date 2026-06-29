@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import uuid
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
+
+from .._compat import UTC
 
 
 def _utcnow() -> datetime:
@@ -26,7 +28,7 @@ class AddressType(str, Enum):
 
     DIRECT = "direct"        # one specific identity
     BROADCAST = "broadcast"  # everyone (e.g. JS8 @ALLCALL)
-    GROUP = "group"          # a named collective (e.g. @TTP, @TTPNE)
+    GROUP = "group"          # a named collective (e.g. @EMS, @EMSNE)
 
 
 class DeliveryStatus(str, Enum):
@@ -118,6 +120,41 @@ class UnifiedMessage:
     def size(self) -> int:
         """Approximate wire size of the body in bytes."""
         return len(self.content.encode("utf-8"))
+
+    @property
+    def groups(self) -> list[str]:
+        """Operator-declared groups this message was aggregated into.
+
+        Stamped by the router from the :class:`GroupRegistry` (by sender
+        membership or tag). Empty unless cross-mode grouping matched.
+        """
+        g = self.metadata.get("groups")
+        return list(g) if isinstance(g, list) else []
+
+    # -- attachments ----------------------------------------------------------
+    # Attachments ride in ``metadata`` using a single cross-transport convention
+    # (shared by Winlink multipart email and Reticulum LXMF file fields):
+    #   metadata["attach"]       -> outbound: local file paths to send
+    #   metadata["attachments"]  -> display names carried by the message
+    #   metadata["attachments_saved"] -> inbound: where received files were saved
+
+    @property
+    def attach_paths(self) -> list[str]:
+        """Local file paths queued to be sent as attachments (outbound)."""
+        v = self.metadata.get("attach")
+        return [str(p) for p in v] if isinstance(v, list) else []
+
+    @property
+    def attachment_names(self) -> list[str]:
+        """Display names of attachments carried by this message."""
+        v = self.metadata.get("attachments")
+        return [str(p) for p in v] if isinstance(v, list) else []
+
+    @property
+    def saved_attachments(self) -> list[str]:
+        """Filesystem paths where received attachments were saved (inbound)."""
+        v = self.metadata.get("attachments_saved")
+        return [str(p) for p in v] if isinstance(v, list) else []
 
     def to_dict(self) -> dict:
         return {

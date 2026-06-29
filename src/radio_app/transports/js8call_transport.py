@@ -2,7 +2,7 @@
 
 We do not drive the modem directly; we talk to a running JS8Call application over
 its TCP/JSON API (default port 2442). JS8Call natively understands ``@``-groups
-(e.g. @TTP), which is the model the rest of the app generalises from.
+(e.g. @EMS), which is the model the rest of the app generalises from.
 
 This adapter connects with the standard library only. The connection + JSON
 framing is implemented, and inbound ``RX.DIRECTED`` events are mapped to a fully
@@ -39,7 +39,7 @@ log = logging.getLogger(__name__)
 _BROADCAST_TARGETS = {"", "@ALLCALL", "ALLCALL", "@HB", "@CQ", "CQ"}
 
 # Matches a leading group/callsign target token in free-form JS8 text, e.g.
-# "@TTP net in 5" or "KE7XYZ hello". Used only as a fallback when the structured
+# "@EMS net in 5" or "KE7XYZ hello". Used only as a fallback when the structured
 # ``TO`` param is absent.
 _LEADING_TARGET_RE = re.compile(r"^\s*(@?[A-Z0-9/]{2,})[\s:,-]+(.*)$", re.DOTALL)
 
@@ -52,8 +52,73 @@ _JS8_COMMANDS = (
     "STATUS?", "STATUS", "HEARING?", "HEARING", "QSL?", "QSL",
     "AGN?", "ACK", "NACK", "73", "YES", "NO",
 )
+# Directed commands the operator may *send* to a station/group (e.g. "W1AW SNR?").
+# JS8Call encodes these in the message text; we transmit them via TX.SEND_MESSAGE.
+JS8_DIRECTED_COMMANDS = frozenset(_JS8_COMMANDS)
 # Decibel value following an SNR token in a report, e.g. "... SNR -07" -> -7.
 _SNR_VALUE_RE = re.compile(r"SNR[\s:]*([+-]?\d{1,2})", re.IGNORECASE)
+
+# --- JS8 -> SMS (APRS-IS gateway) -------------------------------------------
+# JS8Call can relay APRS messages through its built-in ``@APRSIS`` gateway. The
+# free SMSGTE service (https://smsgte.org) turns an APRS message into a phone
+# text: address the message to the callsign ``SMSGTE`` with a body of
+# ``@<phone> <text>``. JS8Call's on-air syntax to inject a raw APRS message is:
+#
+#     @APRSIS CMD :<ADDRESSEE>:<aprs message body>
+#
+# where ``<ADDRESSEE>`` is the recipient callsign left-justified and padded to
+# exactly 9 characters (APRS message format). So an SMS to 12025550133 reading
+# "on my way" becomes:
+#
+#     @APRSIS CMD :SMSGTE   :@12025550133 on my way
+JS8_APRS_GATEWAY = "@APRSIS"
+SMS_GATEWAY_CALLSIGN = "SMSGTE"
+# Keep the whole frame within JS8Call's practical directed-message length so the
+# gateway address + phone + text don't get silently truncated on the air.
+_SMS_MAX_TEXT = 60
+_PHONE_RE = re.compile(r"[^\d+]")
+
+
+def _aprs_addressee(callsign: str) -> str:
+    """APRS message addressee field: callsign upper-cased, padded to 9 chars."""
+    return f"{callsign.strip().upper():<9}"[:9]
+
+
+def normalize_phone(phone: str) -> str:
+    """Reduce a phone number to digits (keeping a single leading ``+``).
+
+    Accepts human formats like ``(202) 555-0133`` or ``+1 202-555-0133`` and
+    returns ``2025550133`` / ``+12025550133``. Raises ``ValueError`` when no
+    digits remain.
+    """
+    raw = (phone or "").strip()
+    plus = raw.startswith("+")
+    digits = _PHONE_RE.sub("", raw).lstrip("+")
+    if not digits:
+        raise ValueError("phone number has no digits")
+    return ("+" + digits) if plus else digits
+
+
+def format_js8_sms(
+    phone: str, text: str, *, gateway: str = SMS_GATEWAY_CALLSIGN
+) -> str:
+    """Build the JS8Call API ``value`` that relays ``text`` to ``phone`` as SMS.
+
+    Pure (no sockets) so it is unit-tested directly. The result is the exact
+    string handed to JS8Call's ``TX.SEND_MESSAGE`` to inject an APRS message to
+    the SMSGTE gateway. Raises ``ValueError`` on an empty phone or message.
+    """
+    number = normalize_phone(phone)
+    body = " ".join((text or "").split())  # collapse whitespace/newlines
+    if not body:
+        raise ValueError("SMS text is empty")
+    if len(body) > _SMS_MAX_TEXT:
+        log.warning(
+            "JS8 SMS text exceeds %d chars (%d); JS8Call/SMSGTE may truncate it.",
+            _SMS_MAX_TEXT,
+            len(body),
+        )
+    return f"{JS8_APRS_GATEWAY} CMD :{_aprs_addressee(gateway)}:@{number} {body}"
 
 
 def _extract_command(params: dict, text: str) -> tuple[str | None, dict]:
@@ -120,7 +185,7 @@ def message_from_event(
         return None
 
     target = str(params.get("TO") or "").strip().upper()
-    # Fallback: some builds fold the target into the text body ("@TTP hello").
+    # Fallback: some builds fold the target into the text body ("@EMS hello").
     if not target:
         m = _LEADING_TARGET_RE.match(text)
         if m:
@@ -236,6 +301,14 @@ _BAND_EDGES: tuple[tuple[str, int, int], ...] = (
     ("6m", 50_000_000, 54_000_000),
 )
 
+# JS8Call submode speeds: STATION.STATUS reports SPEED as a small int.
+_SPEED_NAMES = {
+    "0": "normal",
+    "1": "fast",
+    "2": "turbo",
+    "4": "slow",
+}
+
 
 def band_for_freq(hz: int | None) -> str | None:
     """Return the amateur band name (e.g. ``"20m"``) for a dial frequency in Hz."""
@@ -284,6 +357,12 @@ class JS8CallTransport(Transport):
         # moves). Lets the panel show which band we're on without polling the rig.
         self._dial_freq: int | None = None
         self._audio_offset: int = 1500
+        # Fuller rig snapshot from STATION.STATUS (submode/speed + selected call).
+        self._speed: str = ""
+        self._selected_call: str = ""
+        # JS8Call's store-and-forward inbox, refreshed on demand via
+        # INBOX.GET_MESSAGES and cached from the INBOX.MESSAGES reply.
+        self._inbox: list[dict] = []
 
     def set_identity(self, callsign: str, groups: tuple[str, ...] = ()) -> None:
         """Update the local callsign/groups used for inbound address routing.
@@ -304,12 +383,15 @@ class JS8CallTransport(Transport):
             supports_groups=True,         # native @GROUP support
             supports_encryption=False,    # prohibited on amateur bands
             supports_delivery_confirmation=False,
+            supports_chunking=True,       # router splits long messages into frames
+            supports_position=True,       # STATION.SET_GRID → Maidenhead locator
             is_realtime=False,            # slow turn-taking
             typical_latency_s=30.0,
             needs_internet=False,
             address_scheme="callsign",
             carries_operator_identity=True,  # must ID with callsign on the air
             prohibits_encryption=True,       # encryption prohibited on amateur HF
+            uses_shared_radio=True,          # drives the one HF radio (sound+CAT+PTT)
         )
 
     async def start(self) -> None:
@@ -345,7 +427,7 @@ class JS8CallTransport(Transport):
             return False
         # Build the JS8Call API command. Directed/group text uses the API's
         # TX.SEND_MESSAGE, with the target encoded as a leading token in the body
-        # (JS8Call's on-air convention, e.g. "@TTP net in 5" / "KE7XYZ hello").
+        # (JS8Call's on-air convention, e.g. "@EMS net in 5" / "KE7XYZ hello").
         if msg.address_type is AddressType.GROUP and msg.group:
             target = f"@{msg.group.lstrip('@')}"
         elif msg.address_type is AddressType.DIRECT and msg.recipient:
@@ -424,6 +506,145 @@ class JS8CallTransport(Transport):
             except (TypeError, ValueError):
                 pass
 
+    def _update_status(self, params: dict) -> None:
+        """Cache speed/selected-callsign from a STATION.STATUS event."""
+        speed = params.get("SPEED")
+        if speed is not None:
+            # JS8Call reports the submode as an int (0=normal..3=turbo) or name.
+            self._speed = _SPEED_NAMES.get(str(speed), str(speed)).strip()
+        selected = params.get("SELECTED")
+        if selected is not None:
+            self._selected_call = str(selected).strip().upper()
+
+    async def radio_status(self) -> bool:
+        """Ask JS8Call for a full operating snapshot (STATION.GET_STATUS).
+
+        Passive: this only queries JS8Call's view of the rig (which it knows via
+        CAT/Hamlib). The reply arrives asynchronously as a ``STATION.STATUS``
+        event and updates the cached snapshot. Returns True once the request was
+        handed to JS8Call.
+        """
+        return await self._send_api({"type": "STATION.GET_STATUS", "value": ""})
+
+    def radio_status_snapshot(self) -> dict:
+        """Last-known rig operating state for the Health panel.
+
+        Returns dial/freq/offset/speed/selected-callsign/band plus ``cat`` which
+        is False when JS8Call has no dial frequency (i.e. no CAT/rig control).
+        """
+        offset = self._audio_offset
+        dial = self._dial_freq
+        return {
+            "dial": dial,
+            "offset": offset,
+            "freq": (dial + offset) if dial is not None else None,
+            "band": band_for_freq(dial),
+            "speed": self._speed,
+            "selected": self._selected_call,
+            "cat": dial is not None,
+        }
+
+    # -- inbox (store-and-forward relay) --------------------------------------
+
+    async def request_inbox(self) -> bool:
+        """Ask JS8Call for its stored inbox messages (reply updates the cache)."""
+        return await self._send_api({"type": "INBOX.GET_MESSAGES", "value": ""})
+
+    def inbox_messages(self) -> list[dict]:
+        """Last-known JS8Call inbox as ``[{"id","from","to","text","utc"}]``."""
+        return list(self._inbox)
+
+    async def store_relay_message(self, callsign: str, text: str) -> bool:
+        """Leave a store-and-forward message for ``callsign`` in JS8Call's inbox.
+
+        JS8Call relays it on the air when it next hears that station (its native
+        store-and-forward messaging). Returns True once handed to JS8Call.
+        """
+        call = (callsign or "").strip().upper()
+        body = (text or "").strip()
+        if not call or not body:
+            return False
+        return await self._send_api(
+            {
+                "type": "INBOX.STORE_MESSAGE",
+                "params": {"CALLSIGN": call, "TEXT": body},
+            }
+        )
+
+    def _update_inbox(self, params: dict) -> None:
+        """Cache the JS8Call inbox from an INBOX.MESSAGES reply.
+
+        JS8Call returns ``params["MESSAGES"]`` as a list; each entry carries the
+        stored message fields (directly, or nested under its own ``params``). We
+        normalise to ``{"id","from","to","text","utc"}``.
+        """
+        raw = params.get("MESSAGES")
+        if not isinstance(raw, list):
+            return
+        out: list[dict] = []
+        for item in raw:
+            if not isinstance(item, dict):
+                continue
+            fields = item.get("params") if isinstance(
+                item.get("params"), dict
+            ) else item
+            out.append({
+                "id": str(fields.get("_ID") or fields.get("ID") or ""),
+                "from": str(fields.get("FROM") or "").upper(),
+                "to": str(fields.get("TO") or "").upper(),
+                "text": str(fields.get("TEXT") or fields.get("MESSAGE") or ""),
+                "utc": fields.get("UTC"),
+            })
+        self._inbox = out
+
+    # -- directed commands ----------------------------------------------------
+
+    async def send_directed_command(self, target: str, command: str) -> bool:
+        """Transmit a JS8Call directed command (e.g. ``SNR?``) to a station/group.
+
+        JS8Call encodes directed commands in the message text (``CALL CMD``); we
+        validate the token against :data:`JS8_DIRECTED_COMMANDS` and transmit it
+        via TX.SEND_MESSAGE. ``target`` is a callsign or ``@GROUP``. Returns True
+        once handed to JS8Call.
+        """
+        tgt = (target or "").strip().upper()
+        cmd = (command or "").strip().upper()
+        if not tgt:
+            return False
+        if cmd not in JS8_DIRECTED_COMMANDS:
+            log.warning("JS8Call: unknown directed command %r", command)
+            return False
+        return await self._send_api(
+            {"type": "TX.SEND_MESSAGE", "value": f"{tgt} {cmd}"}
+        )
+
+    async def send_sms(self, phone: str, text: str) -> bool:
+        """Relay ``text`` to a phone number as SMS via JS8Call's APRS gateway.
+
+        Injects an APRS message to the SMSGTE gateway (``@APRSIS CMD
+        :SMSGTE   :@<phone> <text>``) through ``TX.SEND_MESSAGE``. Requires
+        JS8Call's APRS gateway/reporting to be enabled. Returns True once handed
+        to JS8Call, False on a malformed number/empty text or write failure.
+        """
+        try:
+            value = format_js8_sms(phone, text)
+        except ValueError as exc:
+            log.warning("JS8Call SMS not sent: %s", exc)
+            return False
+        return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
+
+    async def send_position_beacon(self, position) -> bool:
+        """Update the station grid square in JS8Call via the STATION.SET_GRID API.
+
+        JS8Call includes the grid square in its normal transmissions once set.
+        ``position`` should be a ``core.position.Position`` instance (or any
+        object with a ``.grid`` attribute).
+        """
+        grid = getattr(position, "grid", None)
+        if not grid or not self._running:
+            return False
+        return await self._send_api({"type": "STATION.SET_GRID", "value": grid})
+
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
             return False
@@ -461,6 +682,18 @@ class JS8CallTransport(Transport):
         # (both the reply to our RIG.GET_FREQ and unsolicited dial-move events).
         if etype == "RIG.FREQ":
             self._update_freq(params)
+            return
+        # Fuller operating snapshot: JS8Call answers STATION.GET_STATUS with the
+        # dial/offset plus the current submode speed and the selected callsign.
+        # Cache it so the Health panel can show the rig's operating state.
+        if etype == "STATION.STATUS":
+            self._update_freq(params)
+            self._update_status(params)
+            return
+        # Store-and-forward inbox: cache the reply to our INBOX.GET_MESSAGES so
+        # the UI can list messages JS8Call is holding for relay.
+        if etype == "INBOX.MESSAGES":
+            self._update_inbox(params)
             return
         # Track stations we hear for the reachability heuristic, and surface a
         # presence "announce" (like RNS) when a station resurfaces, so the UI's

@@ -53,7 +53,6 @@ Announce/advert traffic appears only in **Watch**.
 |------------|--------------------------------------------------------------|
 | Reticulum  | RNS attached to shared instance / has interfaces; rnsd reachable |
 | JS8        | TCP connect to JS8Call API holds                             |
-| Mercury    | Control-socket connect                                       |
 | MeshCore   | USB serial opens / TCP socket connects                       |
 | NomadNet   | N/A (rides Reticulum)                                        |
 
@@ -101,6 +100,11 @@ hardware capability query.
 > - 7 ✅ Watch has Pause/Resume + Clear.
 > - 8 ✅ Health shows a reachability board **and** a "recently heard → add
 >   contact" discovery list (announce-fed; add turns a station into a favorite).
+>   The System section has been significantly extended: UTC clock with
+>   multi-source time consensus (GPS via gpsd → local chrony/ntpd → internet
+>   NTP, refreshed every 60 s; never starts/manages daemons); station position
+>   and Maidenhead grid (from `[position]` config or live gpsd); and host
+>   battery level with estimated runtime (Linux sysfs, no extra deps).
 
 ### Milestone 3 — MeshCore transport (separate)
 9. New `transports/meshcore_transport.py` implementing `Transport` +

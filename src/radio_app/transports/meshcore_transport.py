@@ -119,12 +119,13 @@ class MeshCoreTransport(Transport):
 
     def capabilities(self) -> TransportCapabilities:
         return TransportCapabilities(
-            max_message_size=160,            # LoRa text payload; tune to firmware
+            max_message_size=134,            # MeshCore direct text payload (bytes)
             supports_broadcast=True,
             supports_addressing=True,        # direct messages to a contact
             supports_groups=True,            # MeshCore channels
             supports_encryption=True,        # MeshCore encrypts natively
             supports_delivery_confirmation=True,  # MSG_SENT / ACK
+            supports_chunking=True,          # router splits oversize text payloads
             is_realtime=False,
             typical_latency_s=5.0,
             needs_internet=False,
@@ -141,13 +142,14 @@ class MeshCoreTransport(Transport):
         return self._self_info().get("public_key") or None
 
     def local_display_name(self) -> str:
-        """Our MeshCore node name (as configured on the companion device).
+        """Our MeshCore node name.
 
-        Surfaced in the TUI status bar's ``id:`` fragment so the operator can
-        see which named node they're transmitting as. Blank until the device
-        reports its self-info.
+        Prefers the live device self-info (name the device broadcasts); falls
+        back to ``display_name`` from config so the name shows even when the
+        companion is offline.
         """
-        return str(self._self_info().get("name") or "")
+        device_name = str(self._self_info().get("name") or "")
+        return device_name or str(self.config.get("display_name") or "")
 
     def channels(self) -> list[dict]:
         """Configured group channels as ``[{"index": int, "name": str}]``.
@@ -490,14 +492,15 @@ class MeshCoreTransport(Transport):
         )
 
     def _channel_wire_text(self, content: str) -> str:
-        """Prepend our node name so channel peers see 'Name: message'.
+        """Optionally prepend our node name so channel peers see 'Name: message'.
 
-        MeshCore channels carry no per-sender identity on the wire, so the
-        convention is for the sender to embed its name in the text. Doing this
-        on send means other nodes (and our own second station) can attribute —
-        and reply to — our channel messages instead of seeing an anonymous
-        'chanN'. When our node name is unknown the content is sent as-is.
+        MeshCore channels carry no per-sender identity on the wire; the
+        convention is to embed the sender's name in the text. Enabled via
+        ``[transports.meshcore] prepend_name = true``; defaults to off so the
+        bare message is sent and the receiving node sees content only.
         """
+        if not self.config.get("prepend_name", False):
+            return content
         name = (self._self_info().get("name") or "").strip()
         return f"{name}: {content}" if name else content
 

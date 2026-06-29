@@ -18,7 +18,6 @@ pytest.importorskip("textual")
 from textual.widgets import Button  # noqa: E402
 
 from radio_app.core.message import AddressType, UnifiedMessage  # noqa: E402
-from radio_app.transports.base import TRANSPORT_REGISTRY  # noqa: E402
 from radio_app.ui.tui import RadioTUI  # noqa: E402
 
 CONFIG = """\
@@ -33,9 +32,6 @@ port = 2442
 enabled = true
 connection = "tcp"
 tcp_port = 5000
-[transports.mercury]
-enabled = true
-port = 7373
 """
 
 
@@ -43,11 +39,6 @@ port = 7373
 def config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG)
-    # Mercury is intentionally not registered (its import is commented out in
-    # transports/__init__). Other test modules import the mercury module
-    # directly, which would re-register it globally, so drop it here to mirror
-    # the production import graph where the mode does not exist.
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -112,6 +103,28 @@ def test_favorites_view_add_classify_and_remove(config_path):
             app.action_remove_favorite()
             await pilot.pause()
             assert not app.core.favorites.is_favorite("KD2ABC")
+
+    asyncio.run(run())
+
+
+def test_nomad_bar_buttons_visible_on_home(config_path):
+    """The NomadNet home screen shows its action-bar buttons immediately.
+
+    Regression: the buttons were clipped (no #nomad-bar Button height rule) and
+    only appeared after opening a server forced a relayout.
+    """
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_nomadnet()
+            await pilot.pause()
+            sync = app.query_one("#nomad-sync", Button)
+            fav = app.query_one("#nomad-fav", Button)
+            for btn in (sync, fav):
+                assert btn.display is True
+                assert btn.region.width > 0
+                assert btn.region.height > 0
 
     asyncio.run(run())
 
@@ -212,20 +225,20 @@ def test_js8_group_favorite_classify_and_open(config_path):
             await pilot.pause()
             # A '@'-prefixed favorite is classified as a JS8Call group, and a
             # callsign as a callsign - even without an explicit type keyword.
-            app._add_favorite_from_input("@TTP tactical net")
+            app._add_favorite_from_input("@EMS tactical net")
             app._add_favorite_from_input("KD2ABC Bob")
             await pilot.pause()
-            assert app._favorite_kind_by_id("@TTP") == "group"
+            assert app._favorite_kind_by_id("@EMS") == "group"
             assert app._favorite_kind_by_id("KD2ABC") == "callsign"
             # The group kind persists to config.
             from radio_app.core.favorites import Favorites
             reloaded = Favorites.from_config(app.core.config)
-            assert reloaded.match("@TTP").kind == "group"
-            # Opening the group favorite switches to js8call and targets @TTP.
-            app._open_favorite("@TTP")
+            assert reloaded.match("@EMS").kind == "group"
+            # Opening the group favorite switches to js8call and targets @EMS.
+            app._open_favorite("@EMS")
             await pilot.pause()
             assert app.active_transport == "js8call"
-            assert app.current_target == "@TTP"
+            assert app.current_target == "@EMS"
 
     asyncio.run(run())
 
@@ -241,15 +254,15 @@ def test_import_js8_groups_button_and_apply(config_path):
             ids = [b.id for b in app.query_one("#fav-bar").query(Button)]
             assert "fav-import-groups" in ids
             # Applying fetched groups adds them as group-kind favorites.
-            app._apply_imported_groups(["TTP", "TTPNE"])
+            app._apply_imported_groups(["EMS", "EMSNE"])
             await pilot.pause()
-            assert app.core.favorites.is_favorite("@TTP")
-            assert app.core.favorites.is_favorite("@TTPNE")
-            assert app._favorite_kind_by_id("@TTP") == "group"
+            assert app.core.favorites.is_favorite("@EMS")
+            assert app.core.favorites.is_favorite("@EMSNE")
+            assert app._favorite_kind_by_id("@EMS") == "group"
             # Persisted with the group kind.
             from radio_app.core.favorites import Favorites
             reloaded = Favorites.from_config(app.core.config)
-            assert reloaded.match("@TTPNE").kind == "group"
+            assert reloaded.match("@EMSNE").kind == "group"
 
     asyncio.run(run())
 
@@ -320,7 +333,91 @@ def test_watch_pause_and_clear(config_path):
             await pilot.pause()
             assert len(app._monitor_msgs) == 1
             app._clear_watch()
-            assert app._monitor_msgs == []
+            assert len(app._monitor_msgs) == 0
+
+    asyncio.run(run())
+
+
+def test_search_surface_finds_and_opens_thread(config_path):
+    """Ctrl+F search lists hits; selecting one opens that conversation."""
+    from textual.widgets import ListView
+
+    from radio_app.core.message import AddressType, UnifiedMessage
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            for i, (txt, tr) in enumerate(
+                [("net control bridge", "js8call"), ("hello there", "reticulum")]
+            ):
+                app.core.store.save(
+                    UnifiedMessage(
+                        sender=f"s{i}",
+                        content=txt,
+                        transport=tr,
+                        address_type=AddressType.DIRECT,
+                        recipient="me",
+                    )
+                )
+            app.action_search()
+            await pilot.pause()
+            assert app.query_one("#main").current == "search-view"
+            app._run_search("bridge")
+            await pilot.pause()
+            results = app.query_one("#search-results", ListView)
+            assert len(results.children) == 1
+            assert len(app._search_hits) == 1
+            thread_key, transport = app._search_hits[0]
+            app._open_thread(thread_key, transport)
+            await pilot.pause()
+            assert app.query_one("#main").current == "active-view"
+            assert app.active_transport == "js8call"
+            # Esc from search returns to the prior surface.
+            app.action_search()
+            await pilot.pause()
+            app.action_close_search()
+            await pilot.pause()
+            assert app.query_one("#main").current != "search-view"
+
+    asyncio.run(run())
+
+
+def test_watch_buffer_is_bounded(config_path):
+    """The Watch scrollback (buffer + rendered rows) is capped, not unbounded."""
+    from textual.widgets import ListView
+
+    from radio_app.core.message import AddressType, UnifiedMessage
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # Shrink the cap so the test is fast, mirroring the on_mount sizing.
+            from collections import deque
+
+            app._watch_buffer_limit = 5
+            app._monitor_msgs = deque(maxlen=5)
+            app._show_watch()
+            await pilot.pause()
+            for i in range(20):
+                app._append_monitor(
+                    UnifiedMessage(
+                        sender=f"s{i}",
+                        content=f"m{i}",
+                        transport="js8call",
+                        address_type=AddressType.DIRECT,
+                        recipient="me",
+                    )
+                )
+            await pilot.pause()
+            # Master buffer is exactly capped; the rendered list/index map stays
+            # bounded (≤ 2x cap via hysteresis) and aligned with the widget.
+            assert len(app._monitor_msgs) == 5
+            assert len(app._monitor_entries) <= 10
+            assert len(app._monitor_entries) == len(
+                app.query_one("#monitor", ListView).children
+            )
 
     asyncio.run(run())
 
@@ -330,26 +427,28 @@ def test_f3_cycles_modes(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # Cycle order = transports (js8call, meshcore) then virtual nomadnet.
+            # Cycle order follows _MODE_ORDER: meshcore, reticulum, nomadnet,
+            # js8call, winlink, wsjt_x — only configured transports appear.
+            # The test config enables meshcore and js8call.
             seen = []
             for _ in range(6):
                 app.action_choose_mode()
                 await pilot.pause()
                 seen.append(app._current_mode_key())
             assert seen == [
-                "js8call", "meshcore", "nomadnet",
-                "js8call", "meshcore", "nomadnet",
+                "meshcore", "nomadnet", "js8call",
+                "meshcore", "nomadnet", "js8call",
             ]
 
     asyncio.run(run())
 
 
-def test_f5_cycles_watch_health_favorites(config_path):
+def test_f5_cycles_watch_health_logs_chats_favorites(config_path):
     async def run():
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # From a chat mode, F5 enters the cycle at Watch.
+            # From a chat mode, F5 enters the cycle at Stream.
             app._select_mode("js8call")
             app.action_cycle_utility()
             await pilot.pause()
@@ -357,12 +456,66 @@ def test_f5_cycles_watch_health_favorites(config_path):
             app.action_cycle_utility()  # -> Health
             await pilot.pause()
             assert app.query_one("#main").current == "health-view"
+            app.action_cycle_utility()  # -> History (archive)
+            await pilot.pause()
+            assert app.query_one("#main").current == "archive-view"
             app.action_cycle_utility()  # -> Favorites
             await pilot.pause()
             assert app.query_one("#main").current == "favorites-view"
-            app.action_cycle_utility()  # -> back to Watch
+            app.action_cycle_utility()  # -> Net
+            await pilot.pause()
+            assert app.query_one("#main").current == "net-view"
+            app.action_cycle_utility()  # -> Logs
+            await pilot.pause()
+            assert app.query_one("#main").current == "logs-view"
+            app.action_cycle_utility()  # -> back to Stream
             await pilot.pause()
             assert app.query_one("#main").current == "monitor-view"
+
+    asyncio.run(run())
+
+
+def test_logs_surface_renders_and_filters(config_path):
+    import logging as _logging
+
+    from radio_app.logging_setup import get_ring_handler
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            ring = get_ring_handler()
+            assert ring is not None
+            # Emit one INFO and one WARNING record through the root logger.
+            log = _logging.getLogger("radio_app.test")
+            log.info("hello info")
+            log.warning("careful warning")
+            await pilot.pause()
+            # Opening the Logs surface shows the feed and clears the peak badge.
+            app._show_logs()
+            await pilot.pause()
+            assert app.query_one("#main").current == "logs-view"
+            assert ring.peak_level() == 0  # reset on view
+            # /loglevel error hides the INFO/WARNING rows.
+            app._set_log_level("error")
+            await pilot.pause()
+            assert app._logs_min_level == _logging.ERROR
+
+    asyncio.run(run())
+
+
+def test_log_badge_appears_for_warning(config_path):
+    import logging as _logging
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            # No badge initially (peak below WARNING after startup view).
+            app._select_mode("js8call")
+            _logging.getLogger("radio_app.test").error("boom")
+            await pilot.pause()
+            assert "ERR" in app._log_badge_markup()
 
     asyncio.run(run())
 
@@ -439,7 +592,7 @@ def test_friendly_name_truncates_hash_in_left_pane(config_path):
             assert app._display_id(full) == full[:10] + "\u2026"
             # ...callsigns/@groups are shown unchanged.
             assert app._display_id("KD2ABC") == "KD2ABC"
-            assert app._display_id("@TTP") == "@TTP"
+            assert app._display_id("@EMS") == "@EMS"
 
     asyncio.run(run())
 
@@ -522,9 +675,9 @@ def test_learn_does_not_override_callsign_or_group(config_path):
             await pilot.pause()
             # An explicit group/callsign classification must never be flipped by
             # a (spoofable) announce aspect.
-            app.core.favorites.add("@TTP", kind="group")
-            app._learn_favorite_kind("@TTP", "node")
-            assert app.core.favorites.match("@TTP").kind == "group"
+            app.core.favorites.add("@EMS", kind="group")
+            app._learn_favorite_kind("@EMS", "node")
+            assert app.core.favorites.match("@EMS").kind == "group"
 
     asyncio.run(run())
 
@@ -979,6 +1132,66 @@ def test_meshcore_channels_listed_in_panel(config_path):
     asyncio.run(run())
 
 
+def test_health_board_shows_system_section(config_path):
+    """The Health board includes a host System section + database size line."""
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_health()
+            await pilot.pause()
+            log = app.query_one("#health-sys-log")
+            written = []
+            orig = log.write
+            log.write = lambda *a, **k: written.append(a[0] if a else "")
+            try:
+                app._render_health()
+            finally:
+                log.write = orig
+            joined = "\n".join(str(w) for w in written)
+            assert "System" in joined          # host resources header
+            assert "disk" in joined            # free disk space line
+            assert "data" in joined            # database size / counts line
+
+    asyncio.run(run())
+
+
+def test_health_board_shows_power_line(config_path, monkeypatch):
+    """The Health board shows a battery/power line when a battery is present."""
+    from radio_app.core import syshealth
+
+    def fake_collect(disk_path=None):
+        return syshealth.SystemHealth(
+            disk_total=100, disk_free=50, disk_used_percent=50.0,
+            battery_percent=42.0, power_plugged=False,
+            battery_secs_left=3 * 3600 + 12 * 60, has_battery=True,
+        )
+
+    monkeypatch.setattr(syshealth, "collect", fake_collect)
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 40)) as pilot:
+            await pilot.pause()
+            app.action_health()
+            await pilot.pause()
+            log = app.query_one("#health-sys-log")
+            written = []
+            orig = log.write
+            log.write = lambda *a, **k: written.append(a[0] if a else "")
+            try:
+                app._render_health()
+            finally:
+                log.write = orig
+            joined = "\n".join(str(w) for w in written)
+            assert "power" in joined            # battery/power line present
+            assert "42%" in joined              # charge percentage
+            assert "on battery" in joined       # discharging state
+            assert "3h12m" in joined            # runtime estimate
+
+    asyncio.run(run())
+
+
 def test_health_renders_with_no_rns_interface_stats(config_path):
     """Health view must render even when Reticulum can't be queried (no rnsd).
 
@@ -1007,11 +1220,11 @@ file = ""
 [transports.js8call]
 enabled = true
 port = 2442
-[groups.TTP]
-display_name = "TTP Net"
+[groups.EMS]
+display_name = "EMS Net"
 transports = ["js8call"]
-[groups.TTPNE]
-display_name = "TTP NE"
+[groups.EMSNE]
+display_name = "EMS NE"
 transports = ["js8call"]
 """
 
@@ -1020,7 +1233,6 @@ transports = ["js8call"]
 def groups_config_path(tmp_path):
     p = tmp_path / "config.toml"
     p.write_text(CONFIG_WITH_GROUPS)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -1062,7 +1274,7 @@ def test_js8_query_bar_sends_directed_query(groups_config_path):
                 "js8-query-STATUS",
                 "js8-query-INFO",
             ]
-            await app._handle_command("/to @TTP")
+            await app._handle_command("/to @EMS")
             await pilot.pause()
             sent: list[str] = []
             app._send = lambda text: sent.append(text)  # type: ignore[assignment]
@@ -1104,17 +1316,17 @@ def test_group_favorites_always_show_in_left_pane(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            app.core.favorites.add("@TTP", kind="group")
+            app.core.favorites.add("@EMS", kind="group")
             app.core.favorites.add("@EMCOMM", kind="group")
             app._select_mode("js8call")
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
+            assert "@EMS" in app._thread_keys
             assert "@EMCOMM" in app._thread_keys
             # They also survive the favorites-only filter (groups always show).
             app.current_target = None
             app._toggle_active_fav_only()
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
+            assert "@EMS" in app._thread_keys
             assert "@EMCOMM" in app._thread_keys
 
     asyncio.run(run())
@@ -1138,7 +1350,7 @@ def test_left_pane_three_tier_sort_groups_dialog_then_others(config_path):
             msg.transport = "js8call"
             await app.core.router._handle_inbound(msg)
             # Group favorite + opened-only contacts (no dialog).
-            app.core.favorites.add("@TTP", kind="group")
+            app.core.favorites.add("@EMS", kind="group")
             for tgt in ("AA1AA", "MMM1M"):
                 await app._handle_command(f"/to {tgt}")
             app.current_target = None
@@ -1146,7 +1358,7 @@ def test_left_pane_three_tier_sort_groups_dialog_then_others(config_path):
             await pilot.pause()
             keys = app._thread_keys
             # Tier 0: groups first.
-            assert keys[0] == "@TTP"
+            assert keys[0] == "@EMS"
             # Tier 1: the contact we have dialog with (ZULU) precedes tier-2
             # opened-only contacts even though 'Z' sorts after 'A'/'M'.
             assert keys.index("ZULU") < keys.index("AA1AA")
@@ -1235,8 +1447,8 @@ def test_fav_only_always_shows_configured_groups(groups_config_path):
             app.current_target = None  # so it isn't kept as the open thread
             app._toggle_active_fav_only()
             await pilot.pause()
-            assert "@TTP" in app._thread_keys
-            assert "@TTPNE" in app._thread_keys
+            assert "@EMS" in app._thread_keys
+            assert "@EMSNE" in app._thread_keys
             assert "N0CALL" not in app._thread_keys
 
     asyncio.run(run())
@@ -1470,7 +1682,6 @@ def _home_config_path(tmp_path, home):
     )
     p = tmp_path / "config.toml"
     p.write_text(cfg)
-    TRANSPORT_REGISTRY.pop("mercury", None)
     return str(p)
 
 
@@ -1709,7 +1920,243 @@ def test_outbound_and_anonymous_senders_are_not_clickable(config_path):
     asyncio.run(run())
 
 
+def test_watch_group_filter_cycles_and_filters(groups_config_path):
+    """The Watch [g] filter cycles off -> each group -> off and filters rows."""
+    from radio_app.core.message import DeliveryStatus
+
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            # @EMS net, @EMSNE net, and an unrelated direct message.
+            msgs = [
+                UnifiedMessage.to_group(
+                    "W1AW", "EMS", "ems net", transport="js8call"
+                ),
+                UnifiedMessage.to_group(
+                    "K2ABC", "EMSNE", "ne net", transport="js8call"
+                ),
+                UnifiedMessage(
+                    sender="N0CALL", content="hi", transport="js8call",
+                    recipient="me",
+                ),
+            ]
+            for m in msgs:
+                m.status = DeliveryStatus.RECEIVED
+                app._append_monitor(m)
+            await pilot.pause()
+            assert len(app._monitor_entries) == 3  # no filter: all shown
+
+            app._cycle_watch_group()                # -> first group (EMS)
+            await pilot.pause()
+            assert app._monitor_group_filter == "EMS"
+            assert app._monitor_entries == [("@EMS", "js8call")]
+
+            app._cycle_watch_group()                # -> EMSNE
+            await pilot.pause()
+            assert app._monitor_group_filter == "EMSNE"
+            assert app._monitor_entries == [("@EMSNE", "js8call")]
+
+            app._cycle_watch_group()                # -> off again
+            assert app._monitor_group_filter is None
+            assert len(app._monitor_entries) == 3
+
+    asyncio.run(run())
 
 
+def test_watch_group_and_fav_filters_mutually_exclusive(groups_config_path):
+    """Selecting a group clears favorites-only and vice-versa."""
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            # Favorites on, then pick a group -> favorites clears.
+            app._toggle_fav_only()
+            assert app._monitor_fav_only is True
+            app._cycle_watch_group()
+            assert app._monitor_group_filter == "EMS"
+            assert app._monitor_fav_only is False
+            # Favorites on again -> the group filter clears.
+            app._toggle_fav_only()
+            assert app._monitor_fav_only is True
+            assert app._monitor_group_filter is None
 
+    asyncio.run(run())
+
+
+def test_cycle_watch_group_action_only_on_watch(groups_config_path):
+    """The [g] group-filter action is enabled only on the Watch surface."""
+    async def run():
+        app = RadioTUI(groups_config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._show_watch()
+            await pilot.pause()
+            assert app.check_action("cycle_watch_group", ()) is True
+            app._select_mode("js8call")
+            await pilot.pause()
+            assert app.check_action("cycle_watch_group", ()) is False
+
+    asyncio.run(run())
+
+
+def test_cmd_history_separate_per_mode(config_path):
+    """Up/Down in the composer navigates per-mode history independently."""
+    from textual.widgets import Input
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+
+            # Push history for js8call mode.
+            app._select_mode("js8call")
+            await pilot.pause()
+            app._push_cmd_history("hello js8")
+            app._push_cmd_history("second js8")
+
+            # Push different history for meshcore mode.
+            app._select_mode("meshcore")
+            await pilot.pause()
+            app._push_cmd_history("hello mesh")
+
+            # Back in js8call: Up should recall "second js8" (most recent).
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer.focus()
+            composer.value = ""
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "second js8"
+
+            # Up again: older entry.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello js8"
+
+            # Up at oldest: stays put.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello js8"
+
+            # Down: forward to "second js8".
+            app._navigate_cmd_history(back=False)
+            assert composer.value == "second js8"
+
+            # Down again: back to draft (empty).
+            app._navigate_cmd_history(back=False)
+            assert composer.value == ""
+
+            # meshcore history is untouched.
+            app._select_mode("meshcore")
+            await pilot.pause()
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "hello mesh"
+
+    asyncio.run(run())
+
+
+def test_cmd_history_draft_restored_on_down(config_path):
+    """Navigating back saves the current draft; Down all the way restores it."""
+    from textual.widgets import Input
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+
+            app._push_cmd_history("old entry")
+            composer.value = "draft text"
+
+            # Up saves draft and shows old entry.
+            app._navigate_cmd_history(back=True)
+            assert composer.value == "old entry"
+
+            # Down restores the draft.
+            app._navigate_cmd_history(back=False)
+            assert composer.value == "draft text"
+
+    asyncio.run(run())
+
+
+def test_cmd_history_via_submit(tmp_path):
+    """Submitting text via Enter pushes it to the mode's history."""
+    from textual.widgets import Input
+
+    # Needs a callsign so the setup wizard doesn't appear and steal focus.
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[general]\ndisplay_name = 'T'\n[logging]\nfile = ''\n"
+        "[station]\ncallsign = 'W1TEST'\n"
+        "[transports.js8call]\nenabled = true\nport = 2442\n"
+    )
+
+    async def run():
+        app = RadioTUI(str(cfg))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+            composer = app.query_one("#composer", Input)
+            composer.focus()
+
+            # Submit a slash-command — it should land in history even though it
+            # routes through _handle_command rather than _send.
+            composer.value = "/help"
+            await pilot.press("enter")
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0)
+                if "js8call" in app._cmd_history:
+                    break
+
+            assert "js8call" in app._cmd_history
+            assert "/help" in app._cmd_history["js8call"]
+
+    asyncio.run(run())
+
+
+def test_start_command_does_not_crash(config_path):
+    """/start command must not raise TypeError (regression: @work can't be awaited).
+
+    _handle_start_command is decorated with @work, so calling it returns a
+    Worker, not a coroutine.  The command dispatcher must NOT await it.
+    This test verifies the command dispatches cleanly and logs a status line.
+    """
+    from textual.widgets import RichLog
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+
+            # This must not raise TypeError.
+            await app._handle_command("/start")
+
+            # Let the @work worker tick and log its status message.
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0)
+                text = "\n".join(
+                    s.text for s in app.query_one("#messages", RichLog).lines
+                )
+                if "js8call" in text.lower():
+                    break
+
+            text = "\n".join(
+                s.text for s in app.query_one("#messages", RichLog).lines
+            )
+            # Either "Starting js8call…" (pre-spawn) or an error/ready message
+            # must appear — confirming the worker ran, not that it crashed.
+            assert "js8call" in text.lower(), f"Expected js8call status in log, got: {text!r}"
+
+    asyncio.run(run())
 

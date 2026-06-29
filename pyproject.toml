@@ -5,17 +5,18 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "radio-app"
 version = "0.1.0"
-description = "Unified multi-transport messaging over radio, internet and LoRa (Reticulum, JS8Call, MeshCore, Mercury)."
+description = "Unified multi-transport messaging over radio, internet and LoRa (Reticulum, JS8Call, MeshCore, Winlink, WSJT-X)."
 readme = "README.md"
-requires-python = ">=3.11"
+requires-python = ">=3.10"
 license = { text = "MIT" }
 authors = [{ name = "Radio_App contributors" }]
-keywords = ["reticulum", "js8call", "meshcore", "mercury", "lora", "ham-radio", "messaging"]
+keywords = ["reticulum", "js8call", "meshcore", "winlink", "wsjt-x", "lora", "ham-radio", "messaging"]
 
 # Hard dependencies are intentionally minimal. The core + CLI run on the
 # standard library alone; only the Reticulum transport needs third-party code.
 dependencies = [
     "tomli-w>=1.0",  # write the single TOML config file (tomllib reads, stdlib)
+    "tomli>=2.0; python_version < '3.11'",  # tomllib backport for Python 3.10
 ]
 
 [project.optional-dependencies]
@@ -37,6 +38,12 @@ meshcore = [
 # NomadNet page viewing is built-in (read-only micron renderer over Reticulum);
 # it needs no extra packages beyond the 'reticulum' extra. No 'nomadnet'
 # dependency is required to read pages.
+# Richer host system-health metrics on the Health board (CPU%, memory,
+# temperature) across platforms. Optional: without it, free disk space + load
+# average (and Linux /proc, /sys readings) still work from the standard library.
+health = [
+    "psutil>=5.9",
+]
 # Developer tooling.
 dev = [
     "pytest>=8.0",
@@ -45,7 +52,7 @@ dev = [
 ]
 # Everything.
 all = [
-    "radio-app[reticulum,tui,meshcore]",
+    "radio-app[reticulum,tui,meshcore,health]",
 ]
 
 [project.scripts]

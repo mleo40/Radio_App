@@ -114,28 +114,44 @@ def test_send_direct_rejects_unusable_recipient():
     assert asyncio.run(t.send(msg)) is False
 
 
+def test_capabilities_documented_message_size():
+    """MeshCore caps the per-message payload at its documented 134 bytes."""
+    caps = MeshCoreTransport({}).capabilities()
+    assert caps.max_message_size == 134
+
+
 def test_send_group_uses_channel_index():
     t = _running_transport()
     msg = UnifiedMessage.to_group("me", "2", "net in 5")
     assert asyncio.run(t.send(msg)) is True
-    # Our node name is prepended so channel peers can attribute the message.
-    assert t._mc.commands.chan_sent[-1] == (2, "MeFi: net in 5")
+    # prepend_name defaults to False — bare content is sent.
+    assert t._mc.commands.chan_sent[-1] == (2, "net in 5")
     # Non-numeric group falls back to the public channel 0.
-    msg2 = UnifiedMessage.to_group("me", "TTP", "hello")
+    msg2 = UnifiedMessage.to_group("me", "EMS", "hello")
     asyncio.run(t.send(msg2))
-    assert t._mc.commands.chan_sent[-1] == (0, "MeFi: hello")
+    assert t._mc.commands.chan_sent[-1] == (0, "hello")
 
 
-def test_channel_wire_text_prepends_node_name():
-    """Outbound channel text carries our node name (MeshCore convention)."""
+def test_channel_wire_text_default_sends_raw():
+    """By default (prepend_name=False) outbound channel text is sent unchanged."""
     t = _running_transport()  # fake self_info name = "MeFi"
+    assert t._channel_wire_text("hello") == "hello"
+
+
+def test_channel_wire_text_prepends_node_name_when_enabled():
+    """When prepend_name=True the node name is prefixed (MeshCore convention)."""
+    t = MeshCoreTransport({"connection": "tcp", "prepend_name": True})
+    t._mc = _FakeMC()
+    t._running = True
     assert t._channel_wire_text("hello") == "MeFi: hello"
 
 
 def test_channel_wire_text_without_name_sends_raw():
-    """With no known node name, channel text is sent unchanged."""
-    t = _running_transport()
+    """With prepend_name=True but no known node name, content is sent as-is."""
+    t = MeshCoreTransport({"connection": "tcp", "prepend_name": True})
+    t._mc = _FakeMC()
     t._mc.self_info = {"public_key": "aa" * 32}  # no 'name'
+    t._running = True
     assert t._channel_wire_text("hello") == "hello"
     # And a round-trip parses back to the same body via the named sender.
     sender, body, named = MeshCoreTransport._split_channel_sender("MeFi: hello")

@@ -9,8 +9,12 @@ diverge.
 from __future__ import annotations
 
 import os
-import tomllib
 from pathlib import Path
+
+try:
+    import tomllib
+except ImportError:  # Python 3.10
+    import tomli as tomllib  # type: ignore[no-reuse-stubs]
 from typing import Any
 
 try:
@@ -21,6 +25,7 @@ except ModuleNotFoundError:  # pragma: no cover - writing is optional
 _ENV_VAR = "RADIO_APP_CONFIG"
 _DEFAULT_DIRNAME = "radio_app"
 _DEFAULT_FILENAME = "config.toml"
+_DIST_FILENAME = "config.dist.toml"
 
 
 def default_config_path() -> Path:
@@ -33,9 +38,20 @@ def default_config_path() -> Path:
     return root / _DEFAULT_DIRNAME / _DEFAULT_FILENAME
 
 
+def dist_config_path(user_path: Path | None = None) -> Path:
+    """Package-bundled distribution config: config.dist.toml inside the installed package.
+
+    A distributor forks the repo (or patches the wheel) and ships their own
+    config.dist.toml baked into src/radio_app/. It lands at
+    site-packages/radio_app/config.dist.toml on install and is picked up here
+    via __file__. The upstream repo does not ship one, so standard installs see
+    no change. The user's config.toml always wins on conflict.
+    """
+    return Path(__file__).parent / _DIST_FILENAME
+
+
 _DEFAULTS: dict[str, Any] = {
     "general": {
-        "display_name": "Anonymous",
         "default_mode": "auto",
         "history_retention_days": 0,
     },
@@ -56,11 +72,28 @@ _DEFAULTS: dict[str, Any] = {
         # lawful in your jurisdiction and service.
         "allow_encrypted_on_hf": False,
     },
-    "storage": {"database": "conversations.db"},
-    "transports": {},
+    "storage": {
+        "database": "conversations.db",
+        # Single directory where ALL downloadable content is saved locally
+        # (Winlink attachments, Reticulum/LXMF file attachments, etc.). Asked
+        # for during first-run setup and used by every mode. Empty = default
+        # XDG data dir (…/radio_app/downloads).
+        "download_dir": "",
+    },
+    "transports": {
+        # Per-transport keys (merged with whatever the user sets):
+        #   launch_cmd   – command to spawn the backing app (e.g. "pat http").
+        #                  Leave blank to use the built-in default.
+        #   launch_wait_s – seconds to wait for the port to open after spawn.
+    },
     "groups": {},
     "subscriptions": {"groups": [], "show_unsubscribed": False},
     "filters": [],
+    "templates": {},
+    "position": {},
+    "power": {
+        "warn_threshold": 20,  # percent; show red below this level
+    },
     "ui": {
         # Textual theme/palette selected from the command palette, persisted here.
         "theme": "",
@@ -68,6 +101,22 @@ _DEFAULTS: dict[str, Any] = {
         # a transport name (e.g. "meshcore"/"js8call"/"reticulum"), "nomadnet",
         # "watch", "health", or "favorites".
         "home": "",
+        # Max number of rows the Watch live feed retains in memory. The feed is
+        # NOT persisted history (that lives in the database); this is just the
+        # in-memory scrollback, bounded so a long session on a busy band can't
+        # grow without limit. 0 = unbounded (not recommended on small devices).
+        "watch_buffer_limit": 1000,
+        # Number of previously-submitted messages/commands to remember per mode.
+        # Up/Down in the composer navigates the history for the active mode.
+        "command_history_limit": 100,
+        # Distributor branding — set via config.dist.toml, not by the end-user.
+        # app_title replaces "Radio_App" in the TUI header; banner is a short
+        # ASCII/Unicode art string shown above the active-mode panel in muted color.
+        # Terminal UIs cannot render raster images; block/text art only.
+        "branding": {
+            "app_title": "",
+            "banner": "",
+        },
     },
 }
 
@@ -84,10 +133,20 @@ class Config:
     @classmethod
     def load(cls, path: str | Path | None = None) -> Config:
         resolved = Path(path).expanduser() if path else default_config_path()
-        data = _deep_merge(_DEFAULTS, {})
+
+        # Layer 2: package-bundled distribution config (optional, shipped by packager)
+        dist_path = dist_config_path()
+        dist_data: dict[str, Any] = {}
+        if dist_path.exists():
+            with dist_path.open("rb") as fh:
+                dist_data = tomllib.load(fh)
+
+        # Merge: layer 1 (built-in defaults) → layer 2 (dist) → layer 3 (user)
+        base = _deep_merge(_DEFAULTS, dist_data)
+        data = base
         if resolved.exists():
             with resolved.open("rb") as fh:
-                data = _deep_merge(_DEFAULTS, tomllib.load(fh))
+                data = _deep_merge(base, tomllib.load(fh))
         return cls(data, resolved)
 
     def save(self) -> None:
@@ -101,6 +160,11 @@ class Config:
         with tmp.open("wb") as fh:
             tomli_w.dump(self._data, fh)
         tmp.replace(self.path)
+
+    @property
+    def dist_path(self) -> Path:
+        """Path where a distribution config.dist.toml would live (may not exist)."""
+        return dist_config_path()
 
     # -- raw access -----------------------------------------------------------
 
@@ -154,8 +218,21 @@ class Config:
         return self._data.get("ui", {})
 
     @property
-    def display_name(self) -> str:
-        return self.general.get("display_name", "Anonymous")
+    def power(self) -> dict[str, Any]:
+        return self._data.get("power", {})
+
+    @property
+    def branding(self) -> dict[str, Any]:
+        return self._data.get("ui", {}).get("branding", {})
+
+    @property
+    def templates(self) -> dict[str, str]:
+        raw = self._data.get("templates", {})
+        return {str(k): str(v) for k, v in raw.items()} if isinstance(raw, dict) else {}
+
+    @property
+    def position(self) -> dict:
+        return self._data.get("position", {})
 
     @property
     def default_mode(self) -> str:
@@ -167,6 +244,23 @@ class Config:
         if db_path.is_absolute():
             return db_path
         return self.path.parent / db_path
+
+    def download_dir(self) -> Path:
+        """Central directory for ALL downloaded content, used by every mode.
+
+        Resolves ``[storage].download_dir`` (asked during setup): expands ``~``,
+        treats a relative path as relative to the config dir, and falls back to
+        the XDG data home (``…/radio_app/downloads``) when unset. This is the one
+        place every transport saves attachments/files, so downloads from any mode
+        land together.
+        """
+        configured = str(self.storage.get("download_dir", "") or "").strip()
+        if configured:
+            p = Path(os.path.expandvars(configured)).expanduser()
+            return p if p.is_absolute() else (self.path.parent / p)
+        base = os.environ.get("XDG_DATA_HOME")
+        root = Path(base).expanduser() if base else Path.home() / ".local" / "share"
+        return root / _DEFAULT_DIRNAME / "downloads"
 
     def enabled_transports(self) -> dict[str, dict[str, Any]]:
         """Return only transports whose block has ``enabled = true``."""

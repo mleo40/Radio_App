@@ -73,6 +73,17 @@ class TransportCapabilities:
     supports_groups: bool = False        # native named-group support?
     supports_encryption: bool = False    # end-to-end?
     supports_delivery_confirmation: bool = False
+    #: Opt in to the router's app-level chunking/reassembly for messages that
+    #: exceed ``max_message_size``. Only meaningful for small-MTU text media
+    #: (JS8Call, MeshCore); larger transports carry whole messages natively.
+    supports_chunking: bool = False
+    #: Whether this transport can carry file attachments alongside a message
+    #: (Winlink multipart email; Reticulum LXMF file fields). Drives whether the
+    #: TUI offers its ``/attach`` affordance for the active mode.
+    supports_attachments: bool = False
+    #: Whether this transport can send position/grid-square beacons (JS8Call
+    #: supports STATION.SET_GRID to broadcast the operator's Maidenhead locator).
+    supports_position: bool = False
     is_realtime: bool = False            # suitable for live keyboard chat?
     typical_latency_s: float = 30.0
     needs_internet: bool = False         # excluded when off-grid
@@ -86,6 +97,12 @@ class TransportCapabilities:
     #: Whether transmitting encrypted/obscured payloads is prohibited on this
     #: medium (true for amateur HF). The compliance guard enforces this.
     prohibits_encryption: bool = False
+    #: Whether this transport drives the single physical HF radio (sound card +
+    #: CAT + PTT). Two such transports (e.g. JS8Call and Pat/Winlink over an RF
+    #: modem) cannot transmit at once — the radio interlock gates them so they
+    #: don't key up over each other. Internet-only paths (Winlink telnet) are
+    #: False since they never touch the radio.
+    uses_shared_radio: bool = False
 
 
 class Transport(abc.ABC):
@@ -93,6 +110,11 @@ class Transport(abc.ABC):
 
     #: Unique short name, e.g. "reticulum". Setting it registers the subclass.
     name: str = ""
+
+    #: Human-readable label shown in the mode-selector chip. Defaults to
+    #: ``name``; override when the internal name is an ugly slug (e.g. "wsjt_x"
+    #: → "WSJT-X"). The TUI uses this; the router always uses ``name``.
+    display_name: str = ""
 
     #: What the UI should render for this transport's mode workspace. "chat" is
     #: a contacts + conversation surface; "browse" is a page browser (NomadNet).

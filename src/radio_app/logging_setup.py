@@ -16,11 +16,108 @@ from __future__ import annotations
 
 import logging
 import os
+from collections import deque
+from dataclasses import dataclass
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
+from threading import Lock
 
 from .config import Config
 
 _CONFIGURED = False
+
+# Default number of records the in-process Logs surface retains. Bounded so a
+# long-running, chatty session can't grow memory without limit.
+_RING_CAPACITY = 2000
+
+# Default size-based rotation for the on-disk log file (see _build_file_handler).
+_DEFAULT_MAX_BYTES = 1_048_576  # ~1 MiB per file
+_DEFAULT_BACKUP_COUNT = 3       # keep radio_app.log.1 .. .3
+
+
+@dataclass(frozen=True)
+class LogRecordView:
+    """Immutable, UI-friendly snapshot of a single log record.
+
+    Kept deliberately small (no exc traceback objects, no live record refs) so
+    the ring buffer can hold thousands of entries cheaply and hand them to the
+    TUI without risk of mutating logging state.
+    """
+
+    created: float
+    level_no: int
+    level_name: str
+    name: str
+    message: str
+
+
+class RingBufferHandler(logging.Handler):
+    """A logging handler that retains the most recent records in memory.
+
+    The TUI takes over the terminal, so the only "live" view of what the app is
+    doing has historically been ``tail -f`` on the log file. This handler keeps
+    a bounded, thread-safe ring of recent records so a dedicated in-app **Logs**
+    surface can render them live (level-filterable, follow/pause) without
+    re-reading the file. ``max_level_no`` tracks the highest severity observed
+    since the last :meth:`reset_peak`, powering the status-bar WARN/ERR badge.
+    """
+
+    def __init__(self, capacity: int = _RING_CAPACITY) -> None:
+        super().__init__()
+        self._buf: deque[LogRecordView] = deque(maxlen=capacity)
+        self._lock = Lock()
+        self.max_level_no = 0
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                message = f"{message}\n{self.format(record)}"
+        except Exception:  # noqa: BLE001 - never let logging crash the app
+            message = str(getattr(record, "msg", ""))
+        view = LogRecordView(
+            created=record.created,
+            level_no=record.levelno,
+            level_name=record.levelname,
+            name=record.name,
+            message=message,
+        )
+        with self._lock:
+            self._buf.append(view)
+            if record.levelno > self.max_level_no:
+                self.max_level_no = record.levelno
+
+    def snapshot(self, min_level: int = 0) -> list[LogRecordView]:
+        """Return a copy of retained records at or above ``min_level``."""
+        with self._lock:
+            records = list(self._buf)
+        if min_level <= 0:
+            return records
+        return [r for r in records if r.level_no >= min_level]
+
+    def peak_level(self) -> int:
+        """Highest severity seen since the last :meth:`reset_peak`."""
+        with self._lock:
+            return self.max_level_no
+
+    def reset_peak(self) -> None:
+        """Clear the high-water severity mark (e.g. when the operator views Logs)."""
+        with self._lock:
+            self.max_level_no = 0
+
+    def clear(self) -> None:
+        """Drop all retained records and reset the peak severity."""
+        with self._lock:
+            self._buf.clear()
+            self.max_level_no = 0
+
+
+_RING_HANDLER: RingBufferHandler | None = None
+
+
+def get_ring_handler() -> RingBufferHandler | None:
+    """Return the process-wide in-memory log handler, if logging is configured."""
+    return _RING_HANDLER
 
 
 def _strip_console_handlers(root: logging.Logger) -> None:
@@ -38,6 +135,33 @@ def _strip_console_handlers(root: logging.Logger) -> None:
             handler, logging.FileHandler
         ):
             root.removeHandler(handler)
+
+
+def _build_file_handler(path: Path, section: dict) -> logging.Handler:
+    """Build the file log handler, with size-based rotation unless disabled.
+
+    Rotation is controlled by ``[logging]``:
+
+        max_bytes    = 1048576   # rotate after ~1 MiB; 0 disables rotation
+        backup_count = 3         # keep radio_app.log.1 .. .3
+
+    Rotation keeps the on-disk log bounded on small/long-running field devices
+    (the in-app Logs surface is in-memory and unaffected). With ``max_bytes=0``
+    we fall back to a plain, ever-growing ``FileHandler`` (previous behaviour).
+    """
+    try:
+        max_bytes = int(section.get("max_bytes", _DEFAULT_MAX_BYTES))
+    except (TypeError, ValueError):
+        max_bytes = _DEFAULT_MAX_BYTES
+    try:
+        backup_count = int(section.get("backup_count", _DEFAULT_BACKUP_COUNT))
+    except (TypeError, ValueError):
+        backup_count = _DEFAULT_BACKUP_COUNT
+    if max_bytes <= 0:
+        return logging.FileHandler(path)
+    return RotatingFileHandler(
+        path, maxBytes=max_bytes, backupCount=max(0, backup_count)
+    )
 
 
 def configure_logging(config: Config, *, stderr: bool = True) -> Path | None:
@@ -61,13 +185,23 @@ def configure_logging(config: Config, *, stderr: bool = True) -> Path | None:
         datefmt="%Y-%m-%d %H:%M:%S",
     )
 
+    # Always install the in-memory ring buffer so the TUI's Logs surface has a
+    # live feed regardless of whether file logging is enabled. It captures
+    # everything at the root level; the surface filters by level on read.
+    global _RING_HANDLER
+    ring = RingBufferHandler()
+    ring.setLevel(logging.DEBUG)
+    ring.setFormatter(fmt)
+    root.addHandler(ring)
+    _RING_HANDLER = ring
+
     log_path: Path | None = None
     if file_setting:
         candidate = Path(str(file_setting)).expanduser()
         if not candidate.is_absolute():
             candidate = config.path.parent / candidate
         candidate.parent.mkdir(parents=True, exist_ok=True)
-        fh = logging.FileHandler(candidate)
+        fh = _build_file_handler(candidate, section)
         fh.setLevel(level)
         fh.setFormatter(fmt)
         root.addHandler(fh)

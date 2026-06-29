@@ -19,7 +19,10 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+from datetime import datetime
+
+from .nomad_cache import NomadPageCache
 
 log = logging.getLogger(__name__)
 
@@ -76,6 +79,30 @@ class PageResult:
     error: str = ""
     dest: str = ""
     path: str = ""
+    #: True when ``content`` was served from the offline cache rather than live.
+    from_cache: bool = False
+    #: When a cached page was originally fetched (only set when ``from_cache``).
+    fetched_at: datetime | None = None
+
+
+@dataclass
+class FavoritesSyncResult:
+    """Outcome of :meth:`NomadnetBrowser.sync_favorites`.
+
+    ``ok``/``failed`` count individual *pages* fetched (a node's index plus any
+    followed same-node links); ``skipped`` counts node favorites that couldn't be
+    attempted (e.g. the stack was offline). ``pages`` records a per-page
+    ``(label, status)`` for surfacing in the CLI/TUI.
+    """
+
+    ok: int = 0
+    failed: int = 0
+    skipped: int = 0
+    pages: list[tuple[str, str]] = field(default_factory=list)
+
+    @property
+    def total(self) -> int:
+        return self.ok + self.failed + self.skipped
 
 
 def _decode(resp) -> str:
@@ -94,11 +121,14 @@ def _decode(resp) -> str:
 class NomadnetBrowser:
     """Fetches NomadNet pages over the already-running Reticulum stack."""
 
-    def __init__(self, transport=None) -> None:
+    def __init__(self, transport=None, cache: NomadPageCache | None = None) -> None:
         # Optional ReticulumTransport: used only to gate availability. RNS state
         # is process-global once Reticulum() has been initialised, so we talk to
         # RNS.Transport / RNS.Link directly.
         self._transport = transport
+        # Optional offline page cache. Successful fetches are upserted here and
+        # served back when the stack is offline or a live fetch fails.
+        self._cache = cache
 
     @property
     def available(self) -> bool:
@@ -108,6 +138,28 @@ class NomadnetBrowser:
             return bool(self._transport.running)
         return True
 
+    async def reachable(self) -> bool:
+        """True iff a live link is actually usable right now.
+
+        ``available`` only reflects whether the transport *thinks* it is running;
+        it stays ``True`` even if rnsd dies mid-session (the transport doesn't
+        proactively notice the shared instance vanished). The transport's
+        ``check_reachable`` probe is the authoritative signal — when rnsd dies its
+        local client interface tears down, so this flips to ``False`` and callers
+        can fall straight back to cached pages instead of waiting on a doomed
+        live fetch.
+        """
+        if not self.available:
+            return False
+        check = getattr(self._transport, "check_reachable", None)
+        if check is None:
+            return True
+        try:
+            status = await check()
+        except Exception:  # noqa: BLE001 - a flaky probe shouldn't block browsing
+            return True
+        return getattr(status, "value", str(status)) == "ok"
+
     async def fetch(
         self,
         dest_hex: str,
@@ -115,8 +167,156 @@ class NomadnetBrowser:
         *,
         field_data: dict | None = None,
         timeout: float = 20.0,
+        prefer_cache: bool = False,
+        cache_first: bool = False,
+        allow_cache: bool = True,
     ) -> PageResult:
-        """Fetch one page. ``field_data`` carries request vars (dynamic pages)."""
+        """Fetch one page, with transparent offline caching.
+
+        ``field_data`` carries request vars (dynamic pages); such pages are never
+        cached or served from cache, since a snapshot of one variable combination
+        would be misleading.
+
+        Cache modes (most to least aggressive about avoiding the network):
+
+        - ``prefer_cache`` (or Reticulum offline): serve a cached snapshot without
+          touching the network; error if there is no cached copy.
+        - ``cache_first``: serve a cached snapshot if one exists (instant, no
+          traffic); otherwise fall through to a live fetch. This is the default
+          browsing mode — it keeps round-trips off the air for pages already seen.
+        - neither: always fetch live; on success cache it, and on failure
+          ``allow_cache`` lets a stale snapshot stand in (flagged with its age).
+        """
+        cacheable = self._cache is not None and not field_data
+
+        # Serve from cache up-front when explicitly asked or when offline.
+        if cacheable and (prefer_cache or not self.available):
+            hit = self._cache.get(dest_hex, path)
+            if hit is not None:
+                return self._cached_result(hit)
+            if prefer_cache:
+                return PageResult(
+                    False,
+                    error="no cached copy of this page",
+                    dest=dest_hex,
+                    path=path,
+                )
+
+        # Cache-first: a cached snapshot wins (no traffic); otherwise go live.
+        if cacheable and cache_first:
+            hit = self._cache.get(dest_hex, path)
+            if hit is not None:
+                return self._cached_result(hit)
+
+        result = await self._fetch_live(
+            dest_hex, path, field_data=field_data, timeout=timeout
+        )
+
+        if not cacheable:
+            return result
+        if result.ok:
+            self._cache.put(result.dest or dest_hex, path, result.content)
+            return result
+        if allow_cache:
+            hit = self._cache.get(result.dest or dest_hex, path)
+            if hit is not None:
+                return self._cached_result(hit)
+        return result
+
+    @staticmethod
+    def _cached_result(page) -> PageResult:
+        return PageResult(
+            True,
+            content=page.content,
+            dest=page.dest,
+            path=page.path,
+            from_cache=True,
+            fetched_at=page.fetched_at,
+        )
+
+    async def sync_favorites(
+        self,
+        favorites,
+        *,
+        path: str = "/page/index.mu",
+        timeout: float = 20.0,
+        follow_links: bool = False,
+    ) -> FavoritesSyncResult:
+        """Refresh the offline cache for every ``kind == "node"`` favorite.
+
+        Iterates the given favorites (an iterable of objects with ``id``/``kind``
+        attributes, e.g. ``Favorites.all()``), fetches each node's ``path`` live,
+        and caches the result. Non-node favorites are ignored. When the stack is
+        offline every node favorite is reported as ``skipped`` (we can't refresh
+        without a live link). With ``follow_links`` we additionally cache the
+        same-node ``/page/*.mu`` links found on the index, one level deep — off by
+        default since each link is another round-trip (expensive over LoRa).
+        """
+        result = FavoritesSyncResult()
+        if self._cache is None:
+            return result
+        nodes = [f for f in favorites if getattr(f, "kind", "") == "node"]
+        if not self.available:
+            for fav in nodes:
+                result.skipped += 1
+                result.pages.append((fav.id, "skipped (offline)"))
+            return result
+        for fav in nodes:
+            res = await self._fetch_live(fav.id, path, timeout=timeout)
+            label = fav.display if hasattr(fav, "display") else fav.id
+            if res.ok:
+                self._cache.put(res.dest or fav.id, path, res.content)
+                result.ok += 1
+                result.pages.append((label, "ok"))
+                if follow_links:
+                    await self._sync_same_node_links(res, timeout, result)
+            else:
+                result.failed += 1
+                result.pages.append((label, res.error or "failed"))
+        return result
+
+    async def _sync_same_node_links(
+        self, index: PageResult, timeout: float, result: FavoritesSyncResult
+    ) -> None:
+        """Cache same-node ``/page/*.mu`` links on an already-fetched index page."""
+        from .micron import render_micron
+
+        base = index.dest
+        try:
+            rendered = render_micron(index.content, base_dest=base)
+        except Exception:  # noqa: BLE001 - a malformed page just yields no links
+            return
+        base_l = (base or "").lower()
+        seen: set[str] = {index.path}
+        for link in rendered.links:
+            lpath = link.path or ""
+            if not lpath.startswith("/page/") or not lpath.endswith(".mu"):
+                continue
+            if lpath in seen:
+                continue
+            dest = link.resolve_dest(base)
+            if (dest or "").lower() != base_l:
+                continue  # only mirror pages on the same node
+            seen.add(lpath)
+            sub = await self._fetch_live(dest, lpath, timeout=timeout)
+            tag = f"{(dest or '')[:12]}:{lpath}"
+            if sub.ok:
+                self._cache.put(sub.dest or dest, lpath, sub.content)
+                result.ok += 1
+                result.pages.append((tag, "ok"))
+            else:
+                result.failed += 1
+                result.pages.append((tag, sub.error or "failed"))
+
+    async def _fetch_live(
+        self,
+        dest_hex: str,
+        path: str = "/page/index.mu",
+        *,
+        field_data: dict | None = None,
+        timeout: float = 20.0,
+    ) -> PageResult:
+        """Fetch one page over the wire. ``field_data`` carries request vars."""
         if not self.available:
             return PageResult(
                 False,

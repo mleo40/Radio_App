@@ -1,8 +1,8 @@
 """Textual terminal UI (TUI) for Radio_App — a single pane of glass.
 
 A persistent **mode selector** (top bar) is the primary control: each configured
-transport is one operating **mode** with its own workspace, plus two utility
-views — **Watch** and **Health**. Selecting a mode re-skins the workspace and
+transport is one operating **mode** with its own workspace, plus utility views —
+**Watch**, **Health** and **Logs**. Selecting a mode re-skins the workspace and
 binds sending to that transport. See DESIGN.md for the full model.
 
 Surfaces:
@@ -15,21 +15,30 @@ Surfaces:
   mode to its transport.
 * HEALTH (verify): passive per-transport reachability probes (no transmission) —
   "can we reach rnsd / the JS8Call API / the modem socket right now?".
+* LOGS (diagnose): a live, level-filterable view of the in-memory application
+  log (follow/pause). A WARN/ERR badge in the status bar flags new problems and
+  jumps here when clicked.
+* CHATS (recall): the "All chats" archive — every conversation across all
+  modes, newest first, read-only. A Mode button filters to a single transport;
+  Enter on a row opens that conversation (switching to its mode).
 
 Mode selector shows a health dot per mode: ● up · ○ down · · n/a · ◌ unknown.
 
-Keys:  F3 = cycle mode   F4 = Fav-only (Watch + every mode)
-       F5 = cycle Watch/Health/Favorites   Ctrl+R = refresh
-       Ctrl+C / Ctrl+Q / q = quit
+Keys:  F3 = cycle mode   F4 = Fav-only (Stream + every mode)
+       F5 = cycle Stream/Health/History/Favorites/Logs   Ctrl+R = refresh
+       Ctrl+F = search history   Ctrl+C / Ctrl+Q / q = quit
 Composer commands:  /to <callsign|@GROUP>,  /monitor,  /fav add|rm|list|only,
-  /favorites,  /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
+  /favorites,  /logs,  /loglevel <level>,  /search <text>,  /chats,
+  /browse <hash>[:/page/x.mu],  /nodes,  /peers,  /help,  /quit
 """
 
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 from collections import deque
-from datetime import UTC, datetime, timedelta
+from datetime import datetime, timedelta
 
 from textual import work
 from textual.app import App, ComposeResult
@@ -46,10 +55,12 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    Markdown,
     RichLog,
     Static,
 )
 
+from .._compat import UTC
 from ..app import App as CoreApp
 from ..config import Config
 from ..core.favorites import Favorite
@@ -62,6 +73,86 @@ from ..transports.js8call_transport import (
     band_for_freq,
     dial_for_band,
 )
+from .about import ABOUT_MD
+
+# Default cap for the in-memory Watch scrollback (rows). Overridable via
+# [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
+_WATCH_BUFFER_DEFAULT = 1000
+
+
+# Commands that work in every mode (they drive the UI/state, not a transport).
+# Shown by /help under "Everywhere" regardless of the active mode.
+_UNIVERSAL_COMMAND_HELP = (
+    "/to <callsign|@GROUP> [message], /monitor (Watch), "
+    "/favorites (F6), /fav add|rm|list|only [<id> [label]], "
+    "/mode (cycle, F3), /refresh, /logs, "
+    "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
+    "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
+    "/roster [Nh], /name <friendly name>, /close [<id>], "
+    "/start [transport], "
+    "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
+    "/help, /quit"
+)
+
+_CALLSIGN_RE = __import__("re").compile(
+    r"^[A-Z]{1,2}[0-9][A-Z]{1,3}$|^[A-Z]{1,2}[0-9][A-Z]{0,3}/[A-Z0-9]+$",
+    __import__("re").IGNORECASE,
+)
+
+
+def _looks_like_callsign(token: str) -> bool:
+    """True if *token* looks like an amateur callsign (e.g. KE0XYZ, W1AW)."""
+    return bool(_CALLSIGN_RE.match(token.strip()))
+
+# Mode-specific commands, keyed by transport name. /help shows only the active
+# mode's group (plus the universal ones), so each panel lists what's usable
+# there instead of the whole command surface. Each command is gated in
+# _handle_command's handlers, so this map mirrors that gating.
+_MODE_COMMAND_HELP: dict[str, tuple[str, ...]] = {
+    "winlink": (
+        "/subject <text> \u2014 set the email subject for the next message",
+        "type \\n in the body \u2014 inserts a line break (multi-line email)",
+        "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
+        "/save \u2014 save attachments from the open message",
+        "/connect [gateway] \u2014 open a forwarding session (send + receive)",
+        "/gateway <CALL> \u2014 set the RMS gateway; /gateways lists configured",
+    ),
+    "js8call": (
+        "/freq [<MHz|Hz>] \u2014 show or set the dial frequency",
+        "/band [<name>] \u2014 list bands or switch (e.g. /band 20m)",
+        "/inbox \u2014 list JS8Call store-and-forward messages",
+        "/relay <CALL> <text> \u2014 leave a store-and-forward message",
+        "/sms <phone> <text> \u2014 send an APRS SMS",
+        "/cmd [<CALL>] <SNR?|GRID?|...> \u2014 send a directed query",
+    ),
+    "reticulum": (
+        "/whoami \u2014 show your Reticulum address",
+        "/announce \u2014 re-announce your LXMF identity",
+        "/path [<id>] \u2014 request a network path to a contact",
+        "/peers \u2014 list messageable LXMF peers",
+        "/nodes \u2014 list discovered NomadNet nodes",
+        "/browse <hash>[:/page/x.mu] \u2014 open a NomadNet page",
+        "/attach <path> \u2014 queue a file attachment (/attach clear empties)",
+    ),
+    "meshcore": (
+        "/announce \u2014 broadcast a node advert",
+        "/channel list|add <index> <#name> [secret] \u2014 manage channels",
+    ),
+}
+
+
+def _cache_age(when: datetime | None) -> str:
+    """Coarse human age (``3m``/``5h``/``2d``) for a cached NomadNet page."""
+    if when is None:
+        return "?"
+    secs = max(0.0, (datetime.now(UTC) - when).total_seconds())
+    if secs < 90:
+        return f"{secs:.0f}s"
+    if secs < 5400:
+        return f"{secs / 60:.0f}m"
+    if secs < 172800:
+        return f"{secs / 3600:.0f}h"
+    return f"{secs / 86400:.0f}d"
 
 
 def _parse_freq_to_hz(text: str) -> int | None:
@@ -111,10 +202,12 @@ class SetupScreen(ModalScreen[dict | None]):
     #setup-buttons { height: auto; align-horizontal: right; }
     """
 
-    def __init__(self, station: Station, source_note: str = "") -> None:
+    def __init__(self, station: Station, source_note: str = "",
+                 download_dir: str = "") -> None:
         super().__init__()
         self._station = station
         self._source_note = source_note
+        self._download_dir = download_dir
 
     def compose(self) -> ComposeResult:
         with Vertical(id="setup-box"):
@@ -131,6 +224,16 @@ class SetupScreen(ModalScreen[dict | None]):
                 value=self._station.grid_square,
                 placeholder="Grid square (e.g. FN31pr)",
                 id="s-grid",
+            )
+            yield Static(
+                "Where to save downloaded files (attachments, etc.) — used by "
+                "every mode:",
+                id="s-download-label",
+            )
+            yield Input(
+                value=self._download_dir,
+                placeholder="Download folder (blank = default app data dir)",
+                id="s-download",
             )
             yield Static("", id="setup-error")
             with Horizontal(id="setup-buttons"):
@@ -155,6 +258,7 @@ class SetupScreen(ModalScreen[dict | None]):
             {
                 "callsign": station.callsign,
                 "grid_square": station.grid_square,
+                "download_dir": self.query_one("#s-download", Input).value.strip(),
             }
         )
 
@@ -186,11 +290,59 @@ class ConfirmEncryptScreen(ModalScreen[bool]):
         self.dismiss(event.button.id == "c-yes")
 
 
-class ModeScreen(ModalScreen[str | None]):
-    """Deprecated: the mode menu was replaced by the persistent selector + F3
-    cycling. Kept as a thin stub only to avoid breaking any external imports;
-    no longer used by the app. Safe to delete once nothing references it.
+
+class PasswordPromptScreen(ModalScreen[str | None]):
+    """Masked, per-session password prompt (e.g. Winlink secure login).
+
+    The value is returned to the caller via ``dismiss`` and is never written to
+    disk or config — it lives only for the duration of the session that asked
+    for it. Submitting an empty field (or Cancel/Esc) declines the prompt.
     """
+
+    CSS = """
+    PasswordPromptScreen { align: center middle; }
+    #pw-box {
+        width: 64; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #pw-msg { height: auto; }
+    #pw-hint { height: auto; color: $text-muted; }
+    #pw-input { height: 3; }
+    #pw-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, message: str) -> None:
+        super().__init__()
+        self._message = message or "Enter password"
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="pw-box"):
+            yield Static(f"[b]{self._message}[/b]", id="pw-msg")
+            yield Static(
+                "[dim]Used for this session only — never saved to disk.[/dim]",
+                id="pw-hint",
+            )
+            yield Input(password=True, id="pw-input")
+            with Horizontal(id="pw-buttons"):
+                yield Button("Cancel", id="pw-cancel")
+                yield Button("Send", id="pw-ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#pw-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value or None)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "pw-ok":
+            self.dismiss(self.query_one("#pw-input", Input).value or None)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
+        self.dismiss(None)
+
 
 
 class BrowseScreen(ModalScreen[None]):
@@ -204,13 +356,16 @@ class BrowseScreen(ModalScreen[None]):
     }
     #browse-addr { height: 1; color: $accent; }
     #browse-body { height: 1fr; border: solid $panel; padding: 0 1; }
-    #browse-status { height: 1; color: $text-muted; }
+    #browse-actions { height: 1; }
+    #browse-status { width: 1fr; height: 1; color: $text-muted; }
+    #browse-getlive { height: 1; min-width: 12; border: none; margin: 0 0 0 1; }
     #browse-input { height: 3; }
     """
     BINDINGS = [
         ("escape", "close", "Close"),
         ("ctrl+b", "back", "Back"),
         ("ctrl+r", "reload", "Reload"),
+        ("ctrl+l", "get_live", "Get live"),
     ]
 
     def __init__(
@@ -219,22 +374,28 @@ class BrowseScreen(ModalScreen[None]):
         dest: str,
         path: str = "/page/index.mu",
         fields: dict | None = None,
+        prefer_cache: bool = False,
     ) -> None:
         super().__init__()
         self._browser = browser
         self._current = (dest, path, fields or {})
         self._history: list[tuple[str, str, dict]] = []
         self._links: list = []
+        # When the stack is offline, serve cached snapshots directly instead of
+        # waiting on a live fetch that is doomed to time out.
+        self._prefer_cache = prefer_cache
 
     def compose(self) -> ComposeResult:
         with Vertical(id="browse-box"):
             yield Static("", id="browse-addr")
             with VerticalScroll(id="browse-body"):
                 yield Static("", id="browse-content", markup=True)
-            yield Static("", id="browse-status")
+            with Horizontal(id="browse-actions"):
+                yield Static("", id="browse-status")
+                yield Button("\u21bb Get live", id="browse-getlive")
             yield Input(
                 placeholder="link # to follow · <hash>:/page/x.mu · "
-                "Ctrl+B back · Ctrl+R reload · Esc close",
+                "Ctrl+L live · Ctrl+B back · Ctrl+R reload · Esc close",
                 id="browse-input",
             )
 
@@ -244,17 +405,40 @@ class BrowseScreen(ModalScreen[None]):
 
     @work
     async def _load(
-        self, dest: str, path: str, fields: dict, push: bool = True
+        self, dest: str, path: str, fields: dict, push: bool = True,
+        force_live: bool = False,
     ) -> None:
         addr = self.query_one("#browse-addr", Static)
         status = self.query_one("#browse-status", Static)
         content = self.query_one("#browse-content", Static)
-        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
-        status.update("loading...")
-        res = await self._browser.fetch(dest, path, field_data=fields or None)
+        loc = f"[b]{(dest or '?')[:16]}[/]:{path}"
+        addr.update(f"[dim]\u2026 loading[/] {loc}")
+        # Default browsing is cache-first: a page we've already seen is served
+        # straight from the local cache (instant, zero traffic on the air), and
+        # only an uncached page hits the network. The "Get live" button (Ctrl+L)
+        # forces a fresh fetch when the operator actually wants the latest.
+        # Offline mode (``_prefer_cache``) stays cache-only; dynamic pages
+        # (field_data) can never be cached, so they always go live.
+        prefer = self._prefer_cache and not force_live
+        cache_first = not force_live and not prefer and not fields
+        if force_live:
+            status.update("loading (live)...")
+        elif prefer:
+            status.update("loading (cached)...")
+        elif cache_first:
+            status.update("loading (cache-first)...")
+        else:
+            status.update("loading...")
+        res = await self._browser.fetch(
+            dest, path, field_data=fields or None,
+            prefer_cache=prefer, cache_first=cache_first,
+        )
+        getlive = self.query_one("#browse-getlive", Button)
         if not res.ok:
+            addr.update(f"[b white on red] OFFLINE [/] {loc}")
             content.update(f"[red]Error:[/red] {res.error}")
-            status.update("failed")
+            status.update("[red]failed[/] — no live link and no cached copy")
+            getlive.display = False
             return
         # Canonicalise to the *resolved* full destination hash. The caller may
         # have passed a short prefix (node lists show truncated hashes; the
@@ -264,7 +448,17 @@ class BrowseScreen(ModalScreen[None]):
         # silently land on a *different* node that shares the prefix. Pinning to
         # the full hash keeps in-node links on the same node.
         dest = res.dest or dest
-        addr.update(f"[b]{(dest or '?')[:16]}[/]:{path}")
+        loc = f"[b]{(dest or '?')[:16]}[/]:{path}"
+        age = getattr(res, "fetched_at", None) if res.from_cache else None
+        if res.from_cache:
+            badge = (
+                f"[b black on yellow] CACHED {_cache_age(age)} [/]"
+                if age
+                else "[b black on yellow] CACHED [/]"
+            )
+        else:
+            badge = "[b black on green] LIVE [/]"
+        addr.update(f"{badge} {loc}")
         page = render_micron(res.content, base_dest=dest)
         content.update(page.markup or "[dim](empty page)[/dim]")
         self._links = page.links
@@ -274,7 +468,22 @@ class BrowseScreen(ModalScreen[None]):
         self.query_one("#browse-body", VerticalScroll).scroll_home(animate=False)
         nlinks = len(self._links)
         hint = " · type a number to follow" if nlinks else ""
-        status.update(f"ok · {nlinks} link(s){hint}")
+        if res.from_cache:
+            # Offer a one-press upgrade to the live page (only worthwhile online).
+            getlive.display = self._browser.available
+            stale = f" — fetched {_cache_age(age)} ago, may be stale" if age else ""
+            live_hint = " · Ctrl+L for live" if self._browser.available else ""
+            status.update(
+                f"[yellow]\u25cf cached[/]{stale} · {nlinks} link(s){hint}{live_hint}"
+            )
+        else:
+            getlive.display = False
+            status.update(f"[green]\u25cf live[/] · {nlinks} link(s){hint}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "browse-getlive":
+            event.stop()
+            self.action_get_live()
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         text = event.value.strip()
@@ -289,6 +498,8 @@ class BrowseScreen(ModalScreen[None]):
             self.action_back()
         elif low in ("r", "reload"):
             self.action_reload()
+        elif low in ("l", "live"):
+            self.action_get_live()
         elif low in ("q", "quit", "close"):
             self.dismiss(None)
         else:
@@ -317,20 +528,299 @@ class BrowseScreen(ModalScreen[None]):
     def action_reload(self) -> None:
         self._load(*self._current, push=False)
 
+    def action_get_live(self) -> None:
+        """Force a live fetch of the current page, bypassing the cache."""
+        self._load(*self._current, push=False, force_live=True)
+
     def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class WinlinkFormsScreen(ModalScreen["str | None"]):
+    """Picker for an installed Winlink form template.
+
+    Lists the flattened form catalog (folder/name) and returns the selected
+    template ``path`` (or ``None`` if cancelled). A small filter box narrows long
+    catalogs by substring.
+    """
+
+    CSS = """
+    WinlinkFormsScreen { align: center middle; }
+    #wlf-box {
+        width: 80; height: 80%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wlf-title { height: 1; }
+    #wlf-filter { height: 3; margin-bottom: 1; }
+    #wlf-list { height: 1fr; border: solid $panel; }
+    #wlf-hint { height: 1; color: $text-muted; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(self, forms: list[dict]) -> None:
+        super().__init__()
+        self._forms = forms
+        self._visible: list[dict] = list(forms)
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="wlf-box"):
+            yield Static(
+                f"[b]Winlink forms[/b] ({len(self._forms)} installed)",
+                id="wlf-title",
+            )
+            yield Input(placeholder="filter (type to narrow)…", id="wlf-filter")
+            yield ListView(id="wlf-list")
+            yield Static(
+                "Enter/tap a form to fill it · Esc to cancel", id="wlf-hint"
+            )
+
+    def on_mount(self) -> None:
+        self._rebuild()
+        self.query_one("#wlf-filter", Input).focus()
+
+    def _rebuild(self) -> None:
+        lst = self.query_one("#wlf-list", ListView)
+        lst.clear()
+        for f in self._visible:
+            folder = f.get("folder") or ""
+            name = f.get("name") or f.get("path") or "?"
+            label = f"{folder}/{name}" if folder else name
+            lst.append(ListItem(Label(label)))
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        self._visible = self.filter_forms(self._forms, event.value)
+        self._rebuild()
+
+    @staticmethod
+    def filter_forms(forms: list[dict], term: str) -> list[dict]:
+        """Forms whose name/folder/path contains ``term`` (case-insensitive)."""
+        term = term.strip().lower()
+        if not term:
+            return list(forms)
+        return [
+            f
+            for f in forms
+            if term in (f.get("name") or "").lower()
+            or term in (f.get("folder") or "").lower()
+            or term in (f.get("path") or "").lower()
+        ]
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        # Enter in the filter selects the only/first remaining match.
+        if self._visible:
+            self.dismiss(self._visible[0]["path"])
+
+    def on_list_view_selected(self, event: ListView.Selected) -> None:
+        idx = event.list_view.index
+        if idx is not None and 0 <= idx < len(self._visible):
+            self.dismiss(self._visible[idx]["path"])
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class WinlinkComposeFormScreen(ModalScreen["dict | None"]):
+    """Fill in a Winlink form: per-field inputs + To/Cc/Subject overrides.
+
+    Returns ``{"template", "responses", "to", "cc", "subject"}`` on submit (empty
+    overrides are sent as ``None`` so the form's computed values win), or ``None``
+    if cancelled. The actual build/queue (``compose_form``) is done by the app so
+    this screen stays a pure data collector.
+    """
+
+    CSS = """
+    WinlinkComposeFormScreen { align: center middle; }
+    #wcf-box {
+        width: 84; height: 90%; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #wcf-title { height: auto; margin-bottom: 1; }
+    #wcf-fields { height: 1fr; }
+    #wcf-fields Input { margin-bottom: 1; }
+    #wcf-fields Static { color: $text-muted; }
+    #wcf-error { height: auto; color: $error; }
+    #wcf-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "close", "Close")]
+
+    def __init__(self, template_path: str, field_names: list[str]) -> None:
+        super().__init__()
+        self._template = template_path
+        self._fields = field_names
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="wcf-box"):
+            yield Static(
+                f"[b]Compose form[/b]\n[dim]{self._template}[/dim]", id="wcf-title"
+            )
+            with VerticalScroll(id="wcf-fields"):
+                yield Static("[b]Message[/b] (override the form's defaults)")
+                yield Input(placeholder="To (address) — blank uses form default",
+                            id="wcf-to")
+                yield Input(placeholder="Cc — optional", id="wcf-cc")
+                yield Input(placeholder="Subject — blank uses form default",
+                            id="wcf-subject")
+                if self._fields:
+                    yield Static("[b]Fields[/b]")
+                    for name in self._fields:
+                        yield Input(placeholder=name, id=f"wcf-f-{name}")
+                else:
+                    yield Static(
+                        "(No prompt fields detected — submit to build with the "
+                        "form's defaults, or add fields the form asks for.)"
+                    )
+            yield Static("", id="wcf-error")
+            with Horizontal(id="wcf-buttons"):
+                yield Button("Cancel", id="wcf-cancel")
+                yield Button("Queue to outbox", id="wcf-submit", variant="primary")
+
+    def on_mount(self) -> None:
+        try:
+            self.query_one("#wcf-to", Input).focus()
+        except Exception:  # noqa: BLE001
+            pass
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "wcf-cancel":
+            self.dismiss(None)
+            return
+        if event.button.id != "wcf-submit":
+            return
+        self.dismiss(self._build_result())
+
+    def _build_result(self) -> dict:
+        """Collect field responses + To/Cc/Subject overrides into a result dict.
+
+        Empty fields are dropped (so the form's defaults stand); empty overrides
+        become ``None`` so :meth:`compose_form` uses the form's computed values.
+        """
+        responses: dict[str, str] = {}
+        for name in self._fields:
+            val = self.query_one(f"#wcf-f-{name}", Input).value.strip()
+            if val:
+                responses[name] = val
+        to = self.query_one("#wcf-to", Input).value.strip()
+        cc = self.query_one("#wcf-cc", Input).value.strip()
+        subject = self.query_one("#wcf-subject", Input).value.strip()
+        return {
+            "template": self._template,
+            "responses": responses,
+            "to": to or None,
+            "cc": cc or None,
+            "subject": subject or None,
+        }
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class AboutScreen(ModalScreen[None]):
+    """Hidden "about" easter egg: a scrollable technical overview of the app.
+
+    Undocumented: opened by the Ctrl+G chord (suppressed from the footer) or by
+    typing the magic word ``xyzzy`` into the composer. 73!
+    """
+
+    CSS = """
+    AboutScreen { align: center middle; }
+    #about-box {
+        width: 86%; height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #about-body { height: 1fr; }
+    #about-hint { height: 1; color: $text-muted; text-align: center; }
+    """
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+        ("enter", "close", "Close"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="about-box"):
+            with VerticalScroll(id="about-body"):
+                yield Markdown(ABOUT_MD)
+            yield Static("Esc / q to close · 73", id="about-hint")
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
+class LaunchCmdScreen(ModalScreen):
+    """One-shot prompt to customise the launch command for a transport's backing app.
+
+    Shown the first time the operator runs /start for a transport that has no
+    ``launch_cmd`` in config.  Pressing Enter with an empty field accepts the
+    default.  The result is the command string chosen (possibly the default), or
+    None if the operator pressed Escape / Cancel.
+    """
+
+    CSS = """
+    LaunchCmdScreen { align: center middle; }
+    #lc-box {
+        width: 72; height: auto; padding: 1 2;
+        border: thick $primary; background: $surface;
+    }
+    #lc-title { height: auto; }
+    #lc-hint  { height: auto; color: $text-muted; }
+    #lc-input { height: 3; }
+    #lc-buttons { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, transport_name: str, default_cmd: str) -> None:
+        super().__init__()
+        self._transport_name = transport_name
+        self._default_cmd = default_cmd
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="lc-box"):
+            yield Static(
+                f"[b]Launch command for {self._transport_name}[/b]", id="lc-title"
+            )
+            yield Static(
+                f"[dim]Default: {self._default_cmd!r}. "
+                "Press Enter to accept, or type a custom path/flags.[/dim]",
+                id="lc-hint",
+            )
+            yield Input(placeholder=self._default_cmd, id="lc-input")
+            with Horizontal(id="lc-buttons"):
+                yield Button("Cancel", id="lc-cancel")
+                yield Button("Use this command", id="lc-ok", variant="primary")
+
+    def on_mount(self) -> None:
+        self.query_one("#lc-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        self.dismiss(event.value.strip() or self._default_cmd)
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id == "lc-ok":
+            val = self.query_one("#lc-input", Input).value.strip()
+            self.dismiss(val or self._default_cmd)
+        else:
+            self.dismiss(None)
+
+    def action_cancel(self) -> None:
         self.dismiss(None)
 
 
 class RadioTUI(App):
     """The Textual application."""
 
+    # Transports whose per-message size cap is advisory rather than a hard
+    # protocol limit. JS8Call has no documented character cap — it auto-frames
+    # long text into successive transmissions — so we warn instead of blocking.
+    _SOFT_LIMIT_TRANSPORTS = frozenset({"js8call"})
+
     CSS = """
     #modebar { height: 3; background: $boost; padding: 0 1; }
     #modebar Button {
-        height: 1; min-width: 6; margin: 0 1 0 0; border: none;
+        height: 1; min-width: 6; margin: 0; border: none;
         padding: 0 1;
     }
     #modebar Button.-active { text-style: bold reverse; }
+    #modebar Button.-down { color: $text-muted; opacity: 40%; }
     #modebar #modebar-spacer { width: 1fr; height: 1; }
     #modebar #input-ind { width: auto; height: 1; color: $text-muted; padding: 0 1; }
     .-touch #modebar { height: 5; }
@@ -338,6 +828,7 @@ class RadioTUI(App):
     #main { height: 1fr; }
     #active-view { height: 1fr; }
     #active-banner { height: auto; color: $warning; padding: 0 1; }
+    #brand-banner { height: auto; color: $text-muted; padding: 0 1; display: none; }
     #mesh-bar { height: 1; padding: 0 1; display: none; }
     #mesh-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
     #mesh-bar-label { width: auto; color: $accent; }
@@ -376,16 +867,41 @@ class RadioTUI(App):
     #nomadnet-view { height: 1fr; }
     #nomad-help { height: 1; color: $text-muted; padding: 0 1; }
     #nomad-bar { height: 1; padding: 0 1; }
-    #nomad-spacer { width: 1fr; }
+    #nomad-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #nomad-spacer { width: 1fr; height: 1; }
     #nomad-nodes { height: 1fr; }
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
-    #health-log { height: 1fr; padding: 0 1; }
+    #health-body { height: 1fr; }
+    #health-log { height: 1fr; width: 1fr; padding: 0 1; }
+    #health-sys-log { height: 1fr; width: 1fr; padding: 0 1; border-left: tall $panel; }
+    #logs-view { height: 1fr; }
+    #logs-bar { height: 1; }
+    #logs-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #logs-spacer { width: 1fr; height: 1; }
+    #logs-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #logs-log { height: 1fr; padding: 0 1; }
     #favorites-view { height: 1fr; }
     #fav-help { height: auto; color: $text-muted; padding: 0 1; }
     #fav-bar { height: 1; padding: 0 1; }
     #fav-spacer { width: 1fr; }
     #favorites-list { height: 1fr; }
+    #search-view { height: 1fr; }
+    #search-input { height: 3; margin: 0 1; }
+    #search-help { height: 1; color: $text-muted; padding: 0 1; }
+    #search-results { height: 1fr; }
+    #archive-view { height: 1fr; }
+    #archive-bar { height: 1; }
+    #archive-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #archive-spacer { width: 1fr; height: 1; }
+    #archive-bar Button { height: 1; min-width: 6; border: none; margin: 0 1 0 0; }
+    #archive-list { height: 1fr; }
+    #net-view { height: 1fr; }
+    #net-bar { height: 1; }
+    #net-status { height: 1; width: auto; color: $text-muted; padding: 0 1; }
+    #net-spacer { width: 1fr; height: 1; }
+    #net-bar Button { height: 1; min-width: 8; border: none; margin: 0 1 0 0; }
+    #net-log { height: 1fr; padding: 0 1; }
     #statusbar { height: 1; background: $panel; color: $text-muted; padding: 0 1; }
     #composer { height: 3; }
     """
@@ -402,8 +918,10 @@ class RadioTUI(App):
         Binding("q", "quit", "Quit"),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
-        ("f5", "cycle_utility", "Watch/Health/Fav"),
+        ("f5", "cycle_utility", "Stream/Health/Fav"),
         ("f", "toggle_nomad_favorite", "Save node"),
+        ("s", "sync_nomad", "Sync favs"),
+        ("g", "cycle_watch_group", "Group filter"),
         ("i", "identity", "My address"),
         ("ctrl+n", "announce", "Announce"),
         ("ctrl+p", "find_path", "Find path"),
@@ -411,6 +929,13 @@ class RadioTUI(App):
         ("delete", "remove_favorite", "Remove fav"),
         Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
         ("ctrl+r", "refresh", "Refresh"),
+        # Full-text history search palette. Priority so it fires even while the
+        # composer (or another Input) has focus.
+        Binding("ctrl+f", "search", "Search", priority=True),
+        Binding("escape", "close_search", "Close search", show=False, priority=True),
+        # Hidden easter egg: technical "about" overview. show=False keeps it out
+        # of the footer; priority lets it fire even while the composer is focused.
+        Binding("ctrl+g", "about", "About", show=False, priority=True),
     ]
 
     def check_action(
@@ -440,6 +965,16 @@ class RadioTUI(App):
         # Close-chat only applies when a conversation is open in a chat mode.
         if action == "close_chat":
             return self.view == "active" and self.current_target is not None
+        # Sync favorite NomadNet pages: only on the NomadNet surface.
+        if action == "sync_nomad":
+            return self.view == "nomadnet"
+        # Cycle the Watch stream group filter: only on the Watch surface.
+        if action == "cycle_watch_group":
+            return self.view == "monitor"
+        # Escape only closes the search palette while it's open (otherwise let
+        # the key pass through to focused widgets).
+        if action == "close_search":
+            return self.view == "search"
         return True
 
     def __init__(self, config_path: str | None = None) -> None:
@@ -455,14 +990,30 @@ class RadioTUI(App):
         # conversations with no stored messages yet. transport -> ordered keys.
         self._opened_threads: dict[str, list[str]] = {}
         self._monitor_entries: list[tuple[str, str]] = []
-        # Full history of non-announce Monitor messages so the list can be
-        # rebuilt when the favorites-only filter is toggled.
-        self._monitor_msgs: list[UnifiedMessage] = []
+        # Bounded in-memory scrollback of non-announce Watch messages so the list
+        # can be rebuilt when a filter is toggled. The Watch feed is NOT stored
+        # history (that lives in the database) — capping it keeps a long session
+        # on a busy band from growing memory without limit. The maxlen is set
+        # from [ui].watch_buffer_limit once config loads (on_mount); the default
+        # here covers the pre-config window and tests.
+        self._monitor_msgs: deque[UnifiedMessage] = deque(
+            maxlen=_WATCH_BUFFER_DEFAULT
+        )
+        # Effective row cap for the master buffer AND the rendered list (0 =
+        # unbounded). Set from [ui].watch_buffer_limit in on_mount.
+        self._watch_buffer_limit = _WATCH_BUFFER_DEFAULT
         self._monitor_fav_only = False
+        # Watch stream group filter: when set to a group name, the feed is
+        # restricted to that group's cross-mode traffic. Mutually exclusive with
+        # the favorites-only filter (selecting one clears the other).
+        self._monitor_group_filter: str | None = None
         # Per-mode favorites-only filter: when on, the active mode's thread list
         # is restricted to conversations with favorite peers (F4 in chat modes).
         self._active_fav_only = False
         self._encrypt_approved = False
+        # Documented per-message size cap (bytes) for the active mode's
+        # transport; drives the composer guard + live counter. 0 = no limit.
+        self._compose_limit: int = 0
         self._theme_ready = False
         # Per-transport announce telemetry. Announces are intentionally NOT
         # rendered as Monitor rows (too noisy), but we keep a rolling count and
@@ -488,6 +1039,16 @@ class RadioTUI(App):
         # battery + radio params), shown on the Health board. Updated by the
         # same passive probe timer as the reachability dots.
         self._device_telemetry: dict[str, dict] = {}
+        # Time-consensus state: best reading from GPS → local NTP → internet NTP →
+        # system. Updated in _refresh_health (thread); read by _render_system_health.
+        self._time_reading = None  # TimeReading | None
+        self._time_queried: bool = False
+        self._last_time_check: float = -999.0
+        # HF propagation conditions fetched once at launch via _fetch_propagation().
+        self._solar_data = None   # PropagationData | None
+        self._solar_fetched: bool = False
+        # Cached GPS/config position for the Health board display.
+        self._position = None
         # Last input method seen ("key" or "pointer"), shown as a glyph and used
         # to offer a touch-friendly (larger) layout.
         self._input_mode = "key"
@@ -508,9 +1069,38 @@ class RadioTUI(App):
         # Pending subject line for the next Winlink message (set via the Subject
         # button or /subject). Cleared after a Winlink send consumes it.
         self._winlink_subject: str = ""
+        # Pending outbound attachment file paths for the next message (set via
+        # /attach). Works on any transport whose capabilities advertise
+        # supports_attachments (Winlink email, Reticulum LXMF). Cleared after a
+        # send consumes them.
+        self._attach_queue: list[str] = []
         # Latest per-path probe for the Winlink transport (telnet/varahf/ardop
         # endpoint up/down), shown under its line on the Health board.
         self._winlink_paths: list[dict] = []
+        # Search palette: row index -> (thread_key, transport) for opening a hit,
+        # plus the surface to restore when the palette is closed with Esc.
+        self._search_hits: list[tuple[str, str]] = []
+        self._search_prev_view: str = "active"
+        # "All chats" archive: row index -> (thread_key, transport) for opening a
+        # conversation, plus an optional transport (mode) filter cycled by the
+        # Mode button (None = every mode).
+        self._archive_rows: list[tuple[str, str]] = []
+        self._archive_mode_filter: str | None = None
+        # Logs surface state. ``_logs_min_level`` is the severity floor the live
+        # log feed renders at (cycled by the Level button / set by /loglevel).
+        # ``_logs_paused`` freezes the live feed so the operator can scroll back
+        # without new lines pushing the view.
+        self._logs_min_level = logging.INFO
+        self._logs_paused = False
+        # Per-mode command history. Keyed by active_transport name when in a
+        # transport mode, or by view name otherwise (e.g. "nomadnet").
+        # Up/Down in the composer navigates backwards/forwards within the
+        # history for the current mode. Cap set from [ui].command_history_limit
+        # in on_mount.
+        self._cmd_history: dict[str, deque] = {}
+        self._cmd_hist_pos: dict[str, int] = {}   # -1 = not browsing
+        self._cmd_hist_draft: dict[str, str] = {} # saved partial input while browsing
+        self._cmd_hist_limit: int = 100
 
     # -- layout ---------------------------------------------------------------
     def compose(self) -> ComposeResult:
@@ -519,9 +1109,13 @@ class RadioTUI(App):
         with ContentSwitcher(initial="active-view", id="main"):
             with Vertical(id="active-view"):
                 yield Static("", id="active-banner")
+                yield Static("", id="brand-banner")
                 with Horizontal(id="mesh-bar"):
                     yield Static("MeshCore", id="mesh-bar-label")
                     yield Static("", id="mesh-spacer")
+                    yield Button(
+                        "\u26a1 Start", id="mesh-start", classes="modebtn"
+                    )
                     yield Button(
                         "\u2605 Favorite", id="mesh-fav", classes="modebtn"
                     )
@@ -534,16 +1128,24 @@ class RadioTUI(App):
                 with Horizontal(id="js8-bar"):
                     yield Static("JS8Call", id="js8-bar-label")
                     yield Static("", id="js8-spacer")
+                    yield Button("\u26a1 Start", id="js8-start", classes="modebtn")
                     for _band in ("80m", "40m", "30m", "20m", "17m", "15m", "10m"):
                         yield Button(
                             _band, id=f"js8-band-{_band}", classes="modebtn"
                         )
                     yield Button("\u21bb", id="js8-freq-refresh", classes="modebtn")
+                    yield Button(
+                        "\u2709 SMS", id="js8-sms", classes="modebtn"
+                    )
                 with Horizontal(id="winlink-bar"):
                     yield Static("Winlink", id="winlink-bar-label")
                     yield Static("", id="winlink-spacer")
+                    yield Button("\u26a1 Start", id="winlink-start", classes="modebtn")
                     yield Button(
                         "\u270e Subject", id="winlink-subject", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4cb Forms", id="winlink-forms", classes="modebtn"
                     )
                     yield Button(
                         "\U0001f4e1 Connect", id="winlink-connect", classes="modebtn"
@@ -576,6 +1178,7 @@ class RadioTUI(App):
                         id="monitor-help",
                     )
                     yield Static("", id="watch-spacer")
+                    yield Button("\u25cb Group", id="watch-group", classes="modebtn")
                     yield Button("⏸ Pause", id="watch-pause", classes="modebtn")
                     yield Button("\u21c5 By mode", id="watch-sort", classes="modebtn")
                     yield Button("✖ Clear", id="watch-clear", classes="modebtn")
@@ -583,11 +1186,15 @@ class RadioTUI(App):
             with Vertical(id="nomadnet-view"):
                 yield Static(
                     "NomadNet pages (read-only) — Enter/tap a node to browse, "
-                    "or type an address below. [f] save/unsave · [F4] favorites.",
+                    "or type an address below. [f] save/unsave · [s] sync favs · "
+                    "[F4] favorites.",
                     id="nomad-help",
                 )
                 with Horizontal(id="nomad-bar"):
                     yield Static("", id="nomad-spacer")
+                    yield Button(
+                        "\u21bb Sync favs", id="nomad-sync", classes="modebtn"
+                    )
                     yield Button(
                         "\u2605 Save/Unsave", id="nomad-fav", classes="modebtn"
                     )
@@ -598,8 +1205,26 @@ class RadioTUI(App):
                     "[F5] re-check · [Ctrl+R] refresh",
                     id="health-help",
                 )
+                with Horizontal(id="health-body"):
+                    yield RichLog(
+                        id="health-log", wrap=True, markup=True, highlight=False
+                    )
+                    yield RichLog(
+                        id="health-sys-log", wrap=True, markup=True, highlight=False
+                    )
+            with Vertical(id="logs-view"):
+                with Horizontal(id="logs-bar"):
+                    yield Static(
+                        "Logs - live application log (in-memory). "
+                        "[F5] cycle · '/loglevel <level>' to filter.",
+                        id="logs-help",
+                    )
+                    yield Static("", id="logs-spacer")
+                    yield Button("\u23f8 Pause", id="logs-pause", classes="modebtn")
+                    yield Button("\u2191 Level", id="logs-level", classes="modebtn")
+                    yield Button("\u2716 Clear", id="logs-clear", classes="modebtn")
                 yield RichLog(
-                    id="health-log", wrap=True, markup=True, highlight=False
+                    id="logs-log", wrap=True, markup=True, highlight=False
                 )
             with Vertical(id="favorites-view"):
                 yield Static(
@@ -607,7 +1232,7 @@ class RadioTUI(App):
                     "groups, MeshCore channels/contacts & hashes. Add (works "
                     "offline): type "
                     "'[node|peer|call|group|channel|contact] <id> [label]' below "
-                    "+ Enter — e.g. 'node a1b2... HomeNode', '@TTP net' for a "
+                    "+ Enter — e.g. 'node a1b2... HomeNode', '@EMS net' for a "
                     "JS8Call group, 'channel ops Ops net', or 'contact a1b2c3... "
                     "Bob'. Enter on a row opens it. Delete: select a row, then "
                     "Remove (or Ctrl+D, or '/fav rm <id>').",
@@ -621,6 +1246,41 @@ class RadioTUI(App):
                     )
                     yield Button("\u2716 Remove", id="fav-remove", classes="modebtn")
                 yield ListView(id="favorites-list")
+            with Vertical(id="search-view"):
+                yield Static(
+                    "Search history — type to find messages across every mode "
+                    "(full-text). Enter on a result opens that conversation. "
+                    "[Esc] closes.",
+                    id="search-help",
+                )
+                yield Input(
+                    placeholder="Search messages…  (e.g. 'net control', 'brid')",
+                    id="search-input",
+                )
+                yield ListView(id="search-results")
+            with Vertical(id="archive-view"):
+                with Horizontal(id="archive-bar"):
+                    yield Static(
+                        "All chats — every conversation across all modes "
+                        "(read-only). Enter opens one.",
+                        id="archive-help",
+                    )
+                    yield Static("", id="archive-spacer")
+                    yield Button("\u25cb Mode", id="archive-mode", classes="modebtn")
+                    yield Button(
+                        "\u21bb Refresh", id="archive-refresh", classes="modebtn"
+                    )
+                yield ListView(id="archive-list")
+            with Vertical(id="net-view"):
+                with Horizontal(id="net-bar"):
+                    yield Static("", id="net-status")
+                    yield Static("", id="net-spacer")
+                    yield Button("◎ Open", id="net-open", classes="modebtn")
+                    yield Button("✓ Check-in", id="net-ci-btn", classes="modebtn")
+                    yield Button("✗ Close", id="net-close-btn", classes="modebtn")
+                yield RichLog(
+                    id="net-log", wrap=True, markup=True, highlight=False
+                )
         yield Static("", id="statusbar")
         yield Input(placeholder="Type a message or /help ...", id="composer")
         yield Footer()
@@ -634,10 +1294,32 @@ class RadioTUI(App):
 
         log_path = configure_logging(cfg, stderr=False)
         self.core = CoreApp(cfg)
-        await self.core.start()
+        # Size the Watch in-memory scrollback from config (0 = unbounded). Safe
+        # to recreate here: no messages have been buffered before mount.
+        try:
+            limit = int(cfg.ui.get("watch_buffer_limit", _WATCH_BUFFER_DEFAULT))
+        except (TypeError, ValueError):
+            limit = _WATCH_BUFFER_DEFAULT
+        limit = max(0, limit)
+        self._watch_buffer_limit = limit
+        self._monitor_msgs = deque(maxlen=limit if limit > 0 else None)
+        try:
+            self._cmd_hist_limit = max(
+                0, int(cfg.ui.get("command_history_limit", 100))
+            )
+        except (TypeError, ValueError):
+            self._cmd_hist_limit = 100
+        # These don't need transports started, so wire them up immediately.
         self.core.router.add_ui_callback(self._on_router_message)
         self.core.compliance.set_confirm(lambda _w: self._encrypt_approved)
-        self.title = f"Radio_App - {cfg.display_name}"
+        branding = cfg.branding
+        app_title = str(branding.get("app_title", "") or "").strip()
+        self.title = app_title if app_title else "Radio_App"
+        brand_banner = str(branding.get("banner", "") or "").strip()
+        if brand_banner:
+            bb = self.query_one("#brand-banner", Static)
+            bb.update(brand_banner)
+            bb.display = True
         self._build_mode_selector()
         self._update_modebar()
         self._update_status()
@@ -657,7 +1339,41 @@ class RadioTUI(App):
         # Passively probe each transport's reachability for the health dots.
         self.set_interval(5.0, self._refresh_health)
         self.call_after_refresh(self._refresh_health)
+        self.set_interval(30.0, self._check_scheduled)
+        # Keep the live Logs feed flowing and the status-bar WARN/ERR badge
+        # current even when the operator is on another surface.
+        self.set_interval(1.0, self._refresh_logs)
+        self.set_interval(2.0, self._update_status)
         self.call_after_refresh(self._initial_flow)
+        # Start transports in the background so the UI is interactive immediately
+        # — a slow/unreachable transport (e.g. an offline JS8Call host whose TCP
+        # connect sits in a multi-second timeout) no longer delays first paint.
+        self._start_core()
+        # Fetch HF propagation conditions once; updates health panel when done.
+        self._fetch_propagation()
+
+    @work(thread=True)
+    def _fetch_propagation(self) -> None:
+        """Fetch HF propagation conditions once at launch in a thread worker."""
+        from ..core.propagation import fetch_sync
+        try:
+            data = fetch_sync(timeout=10.0)
+        except Exception:
+            data = None
+        self._solar_data = data
+        self._solar_fetched = True
+        self.call_from_thread(self._refresh_health)
+
+    @work
+    async def _start_core(self) -> None:
+        """Bring transports online without blocking the initial UI paint."""
+        if self.core is None:
+            return
+        await self.core.start()
+        # Reflect any transports that have now come up.
+        self._update_status()
+        self._update_modebar()
+        self.call_after_refresh(self._refresh_health)
 
     def watch_theme(self, theme: str) -> None:
         """Persist the theme/palette selection to the single config file."""
@@ -743,17 +1459,32 @@ class RadioTUI(App):
                     grid_square=info.grid or station.grid_square,
                 )
                 source_note = "Pre-filled from JS8Call - edit if needed."
-        result = await self.push_screen_wait(SetupScreen(station, source_note))
+        current_dl = str(self.core.config.storage.get("download_dir", "") or "")
+        result = await self.push_screen_wait(
+            SetupScreen(station, source_note, current_dl)
+        )
         if not result:
             self._log_system("Station not set. HF transports need a callsign.")
             return
         cfg = self.core.config
+        # The download location lives in [storage], not [station]; pull it out
+        # before the rest of the result is written as station identity.
+        download_dir = result.pop("download_dir", "")
         for key, value in result.items():
             cfg.set("station", key, value)
+        if download_dir:
+            cfg.set("storage", "download_dir", download_dir)
         cfg.save()
         self.core.station = Station(**result)
         self.core.router._station = self.core.station
+        # Push the chosen download location to every running transport so all
+        # modes save downloads there from now on.
+        self.core.apply_download_dir()
         self._log_system(f"Station saved: {self.core.station.callsign}")
+        if download_dir:
+            self._log_system(
+                f"Downloads will be saved to {self.core.config.download_dir()}"
+            )
 
 
     async def on_unmount(self) -> None:
@@ -971,8 +1702,21 @@ class RadioTUI(App):
 
     # -- actions --------------------------------------------------------------
     def action_refresh(self) -> None:
-        self._refresh_threads()
+        if self.view == "archive":
+            self._render_archive()
+        else:
+            self._refresh_threads()
         self._update_status()
+
+    def action_about(self) -> None:
+        """Hidden easter egg: show the technical 'about' overview.
+
+        Reachable via the undocumented Ctrl+G chord or the ``xyzzy`` magic word.
+        Guarded so a second press while it's open doesn't stack screens.
+        """
+        if isinstance(self.screen, AboutScreen):
+            return
+        self.push_screen(AboutScreen())
 
     def action_copy_address(self, value: str = "") -> None:
         """Copy a value (e.g. your Reticulum address) to the clipboard.
@@ -1315,11 +2059,65 @@ class RadioTUI(App):
 
     def _toggle_fav_only(self) -> None:
         self._monitor_fav_only = not self._monitor_fav_only
+        # Favorites and the group filter are mutually exclusive.
+        if self._monitor_fav_only:
+            self._monitor_group_filter = None
         self._rebuild_monitor()
         self._update_monitor_help()
+        self._update_watch_filter_buttons()
         state = "ON" if self._monitor_fav_only else "OFF"
         self._log_system(f"Monitor favorites-only filter: {state}")
         self._update_status()
+
+    def _cycle_watch_group(self) -> None:
+        """Cycle the Watch stream group filter: off -> group1 -> ... -> off.
+
+        Selecting a group clears the favorites filter (the two are mutually
+        exclusive). With no groups configured this is a no-op with a hint.
+        """
+        if self.core is None:
+            return
+        names = [g.name for g in self.core.groups.all()]
+        if not names:
+            self._log_system(
+                "No groups configured. Add one with "
+                "'radioapp group <name> add <transport:id>'."
+            )
+            return
+        current = self._monitor_group_filter
+        if current is None:
+            nxt: str | None = names[0]
+        else:
+            try:
+                idx = names.index(current)
+            except ValueError:
+                idx = -1
+            nxt = names[idx + 1] if idx + 1 < len(names) else None
+        self._monitor_group_filter = nxt
+        if nxt is not None:
+            self._monitor_fav_only = False
+        self._rebuild_monitor()
+        self._update_monitor_help()
+        self._update_watch_filter_buttons()
+        label = f"@{nxt}" if nxt else "OFF"
+        self._log_system(f"Monitor group filter: {label}")
+        self._update_status()
+
+    def action_cycle_watch_group(self) -> None:
+        """Cycle the Watch group filter (key 'g', Watch view only)."""
+        if self.view == "monitor":
+            self._cycle_watch_group()
+
+    def _update_watch_filter_buttons(self) -> None:
+        """Reflect the active group filter on the Watch bar's Group button."""
+        try:
+            btn = self.query_one("#watch-group", Button)
+        except Exception:  # noqa: BLE001 - button may not be mounted (tests)
+            return
+        if self._monitor_group_filter:
+            btn.label = f"\u25c9 @{self._monitor_group_filter}"
+        else:
+            btn.label = "\u25cb Group"
 
     def action_choose_mode(self) -> None:
         """Cycle to the next mode (no menu): each transport, then NomadNet."""
@@ -1336,11 +2134,17 @@ class RadioTUI(App):
             nxt = keys[0]
         self._activate_mode_key(nxt)
 
+    # Canonical display order for mode chips and F3 cycling.
+    _MODE_ORDER = ["meshcore", "reticulum", "nomadnet", "js8call", "winlink", "wsjt_x"]
+
     def _mode_keys(self) -> list[str]:
         """Ordered selectable operating modes, matching the selector chips."""
-        keys = [t.name for t in self.core.transports] if self.core else []
-        keys.append("nomadnet")
-        return keys
+        if not self.core:
+            return []
+        transport_names = {t.name for t in self.core.transports}
+        ordered = [n for n in self._MODE_ORDER if n == "nomadnet" or n in transport_names]
+        ordered += [t.name for t in self.core.transports if t.name not in self._MODE_ORDER]
+        return ordered
 
     def _current_mode_key(self) -> str | None:
         if self.view == "nomadnet":
@@ -1367,14 +2171,44 @@ class RadioTUI(App):
             self.action_health()
         elif bid == "view-favorites":
             self._show_favorites()
+        elif bid == "view-logs":
+            self.action_logs()
+        elif bid == "view-archive":
+            self.action_archive()
+        elif bid == "view-net":
+            self._show_net()
+        elif bid == "archive-mode":
+            self._cycle_archive_filter()
+        elif bid == "archive-refresh":
+            self._render_archive()
+            self._update_status()
+        elif bid == "logs-pause":
+            self._toggle_logs_pause()
+        elif bid == "logs-level":
+            self._cycle_log_level()
+        elif bid == "logs-clear":
+            ring = self._log_ring()
+            if ring is not None:
+                ring.clear()
+            self._render_logs()
+            self._update_status()
         elif bid == "watch-pause":
             self._toggle_watch_pause()
         elif bid == "watch-sort":
             self._toggle_watch_sort()
+        elif bid == "watch-group":
+            self._cycle_watch_group()
         elif bid == "watch-clear":
             self._clear_watch()
         elif bid == "nomad-fav":
             self.action_toggle_nomad_favorite()
+        elif bid == "nomad-sync":
+            self.action_sync_nomad()
+        elif bid in ("mesh-start", "js8-start", "winlink-start"):
+            transport_name = bid.split("-")[0]
+            if transport_name == "mesh":
+                transport_name = "meshcore"
+            self._handle_start_command(transport_name)
         elif bid == "mesh-fav":
             self._favorite_current_conversation()
         elif bid == "mesh-announce":
@@ -1385,10 +2219,14 @@ class RadioTUI(App):
             self._js8_switch_band(bid[len("js8-band-"):])
         elif bid == "js8-freq-refresh":
             self._js8_refresh_freq()
+        elif bid == "js8-sms":
+            self._js8_sms_prompt()
         elif bid.startswith("js8-query-"):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
             self._winlink_subject_prompt()
+        elif bid == "winlink-forms":
+            self._winlink_open_forms()
         elif bid == "winlink-connect":
             self._winlink_connect()
         elif bid == "winlink-gateways":
@@ -1397,12 +2235,19 @@ class RadioTUI(App):
             self.action_remove_favorite()
         elif bid == "fav-import-groups":
             self._import_js8_groups()
+        elif bid == "net-open":
+            self._net_open_prompt()
+        elif bid == "net-ci-btn":
+            self._net_ci_self()
+        elif bid == "net-close-btn":
+            self._handle_net_command("close")
 
     def _select_mode(self, name: str) -> None:
         """Switch the active operating mode to a transport and show its surface."""
         if self.core is None:
             return
         self.active_transport = name
+        self._update_radio_claim()
         self._show_active()
         self._apply_mode()
         self.query_one("#composer", Input).focus()
@@ -1444,16 +2289,19 @@ class RadioTUI(App):
         self._enable_composer(False)
         self._refresh_monitor_ticker()
         self._update_monitor_help()
+        self._update_watch_filter_buttons()
         self._update_modebar()
         self._update_status()
 
     def action_cycle_utility(self) -> None:
-        """Cycle the utility surfaces with F5: Watch -> Health -> Favorites.
+        """Cycle the utility surfaces with F5: Stream -> Health -> History
+        -> Favorites -> Logs.
 
         From an operating (chat/NomadNet) mode, F5 jumps into the cycle at
-        Watch. Pressing it again advances Watch -> Health -> Favorites -> Watch.
+        Stream, then advances Stream -> Health -> History -> Favorites -> Logs
+        -> Stream.
         """
-        order = ["monitor", "health", "favorites"]
+        order = ["monitor", "health", "archive", "favorites", "net", "logs"]
         if self.view in order:
             nxt = order[(order.index(self.view) + 1) % len(order)]
         else:
@@ -1462,6 +2310,12 @@ class RadioTUI(App):
             self._show_watch()
         elif nxt == "health":
             self._show_health()
+        elif nxt == "logs":
+            self._show_logs()
+        elif nxt == "archive":
+            self._show_archive()
+        elif nxt == "net":
+            self._show_net()
         else:
             self._show_favorites()
 
@@ -1478,6 +2332,304 @@ class RadioTUI(App):
         self._refresh_health()
         self._update_modebar()
         self._update_status()
+
+    # -- logs surface ---------------------------------------------------------
+
+    # Severity floors the Logs surface can cycle through (with the Level button).
+    _LOG_LEVELS = (
+        logging.DEBUG,
+        logging.INFO,
+        logging.WARNING,
+        logging.ERROR,
+    )
+
+    def action_logs(self) -> None:
+        """Open the Logs surface directly (used by the Logs chip / status badge)."""
+        self._show_logs()
+
+    def _show_logs(self) -> None:
+        """Show the Logs surface: the live, in-memory application log feed.
+
+        Viewing the logs is treated as "acknowledging" any WARN/ERR that has
+        accumulated, so the status-bar badge resets when the surface is opened.
+        """
+        self.view = "logs"
+        self.query_one("#main", ContentSwitcher).current = "logs-view"
+        self._enable_composer(False)
+        ring = self._log_ring()
+        if ring is not None:
+            ring.reset_peak()
+        self._render_logs()
+        self._update_logs_buttons()
+        self._update_modebar()
+        self._update_status()
+
+    def _log_ring(self):
+        """Return the process-wide in-memory log handler, or None if absent."""
+        from ..logging_setup import get_ring_handler
+
+        return get_ring_handler()
+
+    def _log_level_colour(self, level_no: int) -> str:
+        if level_no >= logging.ERROR:
+            return "red"
+        if level_no >= logging.WARNING:
+            return "yellow"
+        if level_no >= logging.INFO:
+            return "green"
+        return "dim"
+
+    def _render_logs(self) -> None:
+        """Render the retained log records at/above the current severity floor."""
+        try:
+            log = self.query_one("#logs-log", RichLog)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        log.clear()
+        ring = self._log_ring()
+        if ring is None:
+            log.write("[dim]In-memory logging is not active.[/dim]")
+            return
+        records = ring.snapshot(self._logs_min_level)
+        if not records:
+            level_name = logging.getLevelName(self._logs_min_level)
+            log.write(
+                f"[dim]No log records at {level_name} or above yet.[/dim]"
+            )
+            return
+        for r in records:
+            ts = datetime.fromtimestamp(r.created).strftime("%H:%M:%S")
+            colour = self._log_level_colour(r.level_no)
+            log.write(
+                f"[dim]{ts}[/dim] [{colour}]{r.level_name:<7}[/{colour}] "
+                f"[dim]{r.name}:[/dim] {r.message}"
+            )
+
+    def _refresh_logs(self) -> None:
+        """Timer hook: redraw the Logs feed when visible and not paused.
+
+        Re-rendering the whole bounded buffer is cheap and side-steps tracking a
+        per-record cursor; pausing simply skips the redraw so the operator can
+        scroll back without the view jumping.
+        """
+        if self.view != "logs" or self._logs_paused:
+            return
+        self._render_logs()
+
+    def _update_logs_buttons(self) -> None:
+        """Sync the Logs toolbar labels with the pause + level-filter state."""
+        try:
+            pause = self.query_one("#logs-pause", Button)
+            level = self.query_one("#logs-level", Button)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        pause.label = "\u25b6 Follow" if self._logs_paused else "\u23f8 Pause"
+        level.label = f"\u2191 {logging.getLevelName(self._logs_min_level)}"
+
+    def _cycle_log_level(self) -> None:
+        """Advance the Logs severity floor (DEBUG -> INFO -> WARNING -> ERROR)."""
+        idx = (
+            self._LOG_LEVELS.index(self._logs_min_level)
+            if self._logs_min_level in self._LOG_LEVELS
+            else 1
+        )
+        self._logs_min_level = self._LOG_LEVELS[
+            (idx + 1) % len(self._LOG_LEVELS)
+        ]
+        self._update_logs_buttons()
+        self._render_logs()
+        self._update_status()
+
+    def _toggle_logs_pause(self) -> None:
+        self._logs_paused = not self._logs_paused
+        self._update_logs_buttons()
+        if not self._logs_paused:
+            self._render_logs()
+
+    def _set_log_level(self, arg: str) -> None:
+        """Handle ``/loglevel [<level>]``: set the Logs severity floor.
+
+        With no argument, reports the current floor. Accepts DEBUG/INFO/WARNING
+        (or WARN)/ERROR, case-insensitively.
+        """
+        arg = arg.strip().upper()
+        if not arg:
+            self._log_system(
+                "Log filter: "
+                f"{logging.getLevelName(self._logs_min_level)}. "
+                "Usage: /loglevel <debug|info|warning|error>"
+            )
+            return
+        alias = {"WARN": "WARNING", "ERR": "ERROR"}
+        arg = alias.get(arg, arg)
+        level = logging.getLevelName(arg)
+        if not isinstance(level, int):
+            self._log_system(
+                f"unknown level: {arg} (use debug|info|warning|error)"
+            )
+            return
+        self._logs_min_level = level
+        if self.view == "logs":
+            self._update_logs_buttons()
+            self._render_logs()
+        else:
+            self._show_logs()
+        self._log_system(f"Log filter set to {arg}.")
+        self._update_status()
+
+    def _transport_identity(self, t) -> str:
+        """Human description of the on-air identity a transport uses.
+
+        Callsign-carrying media (HF: js8call/winlink) identify with a
+        callsign — from the transport's own config if set, else the station
+        callsign. Anonymous media (Reticulum/MeshCore) expose a non-identifying
+        address via ``local_identity()``. Mirrors ``radioapp status``.
+        """
+        caps = t.capabilities()
+        if caps.carries_operator_identity:
+            own = ""
+            cfg = getattr(t, "config", None)
+            if isinstance(cfg, dict):
+                own = str(cfg.get("callsign", "") or "").strip()
+            callsign = own or (
+                self.core.station.callsign if self.core is not None else ""
+            )
+            if callsign:
+                return f"[dim]id:[/dim] callsign [b]{callsign}[/b]"
+            return "[dim]id:[/dim] callsign [yellow](unset — run setup)[/yellow]"
+        anon = None
+        getter = getattr(t, "local_identity", None)
+        if callable(getter):
+            try:
+                anon = getter()
+            except Exception:  # noqa: BLE001
+                anon = None
+        display = ""
+        display_getter = getattr(t, "local_display_name", None)
+        if callable(display_getter):
+            try:
+                display = display_getter() or ""
+            except Exception:  # noqa: BLE001
+                display = ""
+        if display:
+            suffix = f" [dim]({anon})[/dim]" if anon else ""
+            return f"[dim]id:[/dim] [b]{display}[/b]{suffix}"
+        return f"[dim]id:[/dim] anonymous{f' ({anon})' if anon else ''}"
+
+    def _transport_endpoint(self, t) -> str | None:
+        """The control endpoint (host:port / URL) a transport dials, from config.
+
+        Shown on the Health board even when the transport is **down**, so the
+        operator can verify *where* the app is trying to connect (e.g. the
+        JS8Call TCP API host, or Pat's HTTP URL) without digging in the config.
+        Returns ``None`` for transports without a simple IP endpoint (Reticulum
+        rides rnsd's local RPC socket; MeshCore may be USB-serial).
+        """
+        cfg = getattr(t, "config", None)
+        if not isinstance(cfg, dict):
+            return None
+        if t.name == "js8call":
+            host = str(cfg.get("host", "127.0.0.1") or "127.0.0.1")
+            port = cfg.get("port", 2442)
+            return f"[dim]endpoint:[/dim] {host}:{port} [dim](JS8Call TCP API)[/dim]"
+        if t.name == "winlink":
+            url = str(cfg.get("pat_url", "http://127.0.0.1:8080") or "")
+            return f"[dim]endpoint:[/dim] {url} [dim](Pat HTTP API)[/dim]"
+        return None
+
+    # -- radio interlock (one HF radio, one transmitter) ----------------------
+
+    def _continuous_radio_modes(self) -> set[str]:
+        """Radio transports that hold the radio whenever their mode is active.
+
+        JS8Call/Mercury occupy the sound card + CAT continuously while in use, so
+        they claim the radio on mode entry. Winlink is excluded: it only keys the
+        radio during an RF *session*, so it claims per-session, not on mode entry.
+        """
+        out: set[str] = set()
+        if self.core is None:
+            return out
+        for t in self.core.transports:
+            try:
+                if t.capabilities().uses_shared_radio and t.name != "winlink":
+                    out.add(t.name)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _update_radio_claim(self) -> None:
+        """Sync the radio interlock token with the active mode (handoff on switch).
+
+        Entering a continuous radio mode (JS8Call/Mercury) claims the radio;
+        leaving it for a non-radio or Winlink mode releases that claim so a later
+        Winlink RF session can take the radio. Warns when more than one radio
+        transport is running and could key up over each other.
+        """
+        if self.core is None:
+            return
+        il = self.core.radio_interlock
+        name = self.active_transport or ""
+        continuous = self._continuous_radio_modes()
+        if name in continuous:
+            prev = il.transfer(name)
+            if prev and prev != name and prev in continuous:
+                self._log_system(f"\U0001f4fb radio: handed to {name} (was {prev}).")
+        else:
+            # Moving to Winlink / a non-radio mode frees a continuous holder.
+            holder = il.holder
+            if holder in continuous:
+                il.release(holder)
+        self._warn_radio_contention(name)
+
+    def _running_radio_contenders(self, exclude: str = "") -> list[str]:
+        """Running transports that share the one HF radio (minus ``exclude``)."""
+        if self.core is None:
+            return []
+        out: list[str] = []
+        for t in self.core.transports:
+            if t.name == exclude or not getattr(t, "running", False):
+                continue
+            try:
+                if t.capabilities().uses_shared_radio:
+                    out.append(t.name)
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
+    def _warn_radio_contention(self, name: str) -> None:
+        """Warn when another radio transport could fight ``name`` for the radio."""
+        if self.core is None or not self.core.radio_interlock.is_contender(name):
+            return
+        others = self._running_radio_contenders(exclude=name)
+        if others:
+            verb = "is" if len(others) == 1 else "are"
+            self._log_system(
+                f"\u26a0 radio: {', '.join(others)} {verb} also running and "
+                f"share the one radio with {name}. Only one can transmit at a "
+                "time — keep the others idle (or use Winlink telnet)."
+            )
+
+    def _render_radio_interlock(self, log: RichLog) -> None:
+        """Render the radio-interlock status (who owns the shared HF radio)."""
+        if self.core is None:
+            return
+        il = self.core.radio_interlock
+        contenders = [
+            t.name for t in self.core.transports
+            if t.capabilities().uses_shared_radio
+        ]
+        if len(contenders) < 2:
+            return  # nothing contends — no interlock to show
+        log.write("")
+        log.write("[b]Radio interlock[/b] (one HF radio — one transmitter)")
+        log.write(f"  owner: [b]{il.holder or '(free)'}[/b]")
+        log.write(f"  shares the radio: {', '.join(contenders)}")
+        running = self._running_radio_contenders()
+        if len(running) > 1:
+            log.write(
+                f"  [yellow]\u26a0 {', '.join(running)} are all running — keep all "
+                "but one idle so they don't key over each other.[/yellow]"
+            )
 
     def _render_health(self) -> None:
         """Render the reachability board from the latest probe results.
@@ -1517,6 +2669,15 @@ class RadioTUI(App):
                 else ""
             )
             log.write(f"  {dot} [b]{t.name}[/b]  {word}{vol}")
+            # Show the actual on-air identity this transport uses (callsign for
+            # HF media, an anonymous address for Reticulum/MeshCore) so it's
+            # obvious which callsign goes out — matching `radioapp status`.
+            log.write(f"       {self._transport_identity(t)}")
+            # Show the configured control endpoint (host:port / URL) even when
+            # the transport is down, so the operator can confirm *where* we dial.
+            endpoint = self._transport_endpoint(t)
+            if endpoint:
+                log.write(f"       {endpoint}")
             if (
                 t.name == "reticulum"
                 and status is ReachabilityStatus.OK
@@ -1528,6 +2689,14 @@ class RadioTUI(App):
             # down even while Pat (telnet) is reachable.
             if t.name == "winlink":
                 self._render_winlink_paths(log)
+            # JS8Call: show the rig operating state (dial/band/offset/speed and
+            # the selected callsign) that JS8Call learns from the radio via CAT.
+            if (
+                t.name == "js8call"
+                and status is ReachabilityStatus.OK
+                and hasattr(t, "radio_status_snapshot")
+            ):
+                self._render_js8_status(log, t.radio_status_snapshot())
             # MeshCore (and any transport exposing device_telemetry) shows its
             # device health: battery + radio parameters.
             if (
@@ -1537,7 +2706,199 @@ class RadioTUI(App):
                 self._render_device_telemetry(
                     log, self._device_telemetry.get(t.name)
                 )
+        self._render_radio_interlock(log)
         log.write("[dim]Press F5 to re-check now.[/dim]")
+        self._render_system_health()
+
+    def _render_system_health(self) -> None:
+        """Render host system health into the right Health pane.
+
+        Covers: UTC clock + time-source offset, position/grid, CPU, memory,
+        temperature, power/battery, disk, and database stats. All metrics are
+        best-effort — anything unknown is simply omitted.
+        """
+        from ..core.syshealth import collect, format_bytes, format_duration
+
+        if self.core is None:
+            return
+        try:
+            log = self.query_one("#health-sys-log", RichLog)
+        except Exception:  # noqa: BLE001 - widget may not be mounted yet
+            return
+        log.clear()
+        db_path = self.core.config.database_path()
+        health = collect(str(db_path))
+        log.write("[b]System[/b] (host resources)")
+
+        # UTC clock + time-source consensus (GPS → local NTP → internet NTP → system).
+        ts = datetime.now(UTC).strftime("%H:%M:%S UTC")
+        tr = self._time_reading
+        if tr is not None and tr.offset_ms is not None:
+            off = tr.offset_ms
+            colour = (
+                "red" if abs(off) > 1000
+                else "yellow" if abs(off) > 100
+                else "green"
+            )
+            src_label = {
+                "gps": "GPS",
+                "wsjtx_ft8": "WSJT-X/JS8Call DT",
+                "local_ntp": "local NTP",
+                "ntp": "NTP",
+                "system": "system",
+            }.get(tr.source.value, tr.source.value)
+            sync = f"  [{colour}]{off:+.0f} ms[/{colour}]  [dim]({src_label})[/dim]"
+        elif tr is not None and tr.error:
+            sync = f"  [dim]({tr.error})[/dim]"
+        elif self._time_queried:
+            sync = "  [dim](all time sources unavailable)[/dim]"
+        else:
+            sync = "  [dim](checking…)[/dim]"
+        log.write(f"  time  : {ts}{sync}")
+
+        # Position display — from config [position] or a cached GPS reading.
+        pos = self._position
+        if pos is None and self.core is not None:
+            from ..core.position import position_from_config
+            pos = position_from_config(self.core.config)
+        if pos is not None:
+            source_tag = f"[dim]({pos.source})[/dim]"
+            log.write(
+                f"  pos   : {pos.lat:+.4f}°  {pos.lon:+.4f}°  "
+                f"grid [b]{pos.grid}[/b]  {source_tag}"
+            )
+
+        cpu_bits: list[str] = []
+        if health.cpu_percent is not None:
+            cpu_bits.append(f"{health.cpu_percent:.0f}%")
+        if health.load_avg is not None:
+            la = health.load_avg
+            cpu_bits.append(
+                f"load {la[0]:.2f} {la[1]:.2f} {la[2]:.2f}"
+                + (f" / {health.cpu_count} cpu" if health.cpu_count else "")
+            )
+        if cpu_bits:
+            log.write(f"  cpu   : {'  '.join(cpu_bits)}")
+        if health.mem_total:
+            log.write(
+                f"  mem   : {format_bytes(health.mem_used)} / "
+                f"{format_bytes(health.mem_total)}"
+                + (
+                    f"  ({health.mem_percent:.0f}%)"
+                    if health.mem_percent is not None
+                    else ""
+                )
+            )
+        if health.temp_c is not None:
+            colour = (
+                "red" if health.temp_c >= 80
+                else "yellow" if health.temp_c >= 65
+                else "green"
+            )
+            log.write(f"  temp  : [{colour}]{health.temp_c:.0f}°C[/{colour}]")
+        if health.has_battery or health.power_plugged is not None:
+            self._render_power_line(log, health, format_duration)
+        if health.disk_free is not None:
+            colour = (
+                "red" if (health.disk_used_percent or 0) >= 95
+                else "yellow" if (health.disk_used_percent or 0) >= 85
+                else "green"
+            )
+            pct = (
+                f"  ({health.disk_used_percent:.0f}% used)"
+                if health.disk_used_percent is not None
+                else ""
+            )
+            log.write(
+                f"  disk  : [{colour}]{format_bytes(health.disk_free)} free[/{colour}]"
+                f" of {format_bytes(health.disk_total)}{pct}"
+            )
+
+        # Database size + history extent — the "is my history bloating?" signal.
+        try:
+            s = self.core.store.stats()
+            c = self.core.nomad_cache.stats()
+            retention = int(
+                self.core.config.general.get("history_retention_days", 0) or 0
+            )
+            keep = f"{retention}d retention" if retention > 0 else "kept forever"
+            log.write(
+                f"  data  : {format_bytes(s['size_bytes'])} db · "
+                f"{s['messages']} msgs / {s['threads']} threads · "
+                f"{c['pages']} cached pages · {keep}"
+            )
+        except Exception:  # noqa: BLE001 - never let stats break the board
+            pass
+
+        self._render_propagation(log)
+
+    def _render_power_line(self, log: RichLog, health, format_duration) -> None:
+        """Render a battery/power line: charge %, AC/battery, time remaining.
+
+        On a desktop/SBC with no battery we still show the mains state (so an
+        operator running off a power supply knows AC is present); on a laptop or
+        battery-backed field rig we colour the charge by how low it is and add a
+        runtime estimate when discharging.
+        """
+        bits: list[str] = []
+        if health.battery_percent is not None:
+            pct = health.battery_percent
+            colour = (
+                "red" if pct < 15
+                else "yellow" if pct < 40
+                else "green"
+            )
+            bits.append(f"[{colour}]{pct:.0f}%[/{colour}]")
+        if health.power_plugged is True:
+            bits.append("\u26a1 on AC" if health.has_battery else "\u26a1 AC power")
+        elif health.power_plugged is False:
+            bits.append("on battery")
+            if health.battery_secs_left:
+                bits.append(f"~{format_duration(health.battery_secs_left)} left")
+        if bits:
+            log.write(f"  power : {'  '.join(bits)}")
+
+    def _render_propagation(self, log: RichLog) -> None:
+        """Render a compact solar conditions block in the System health pane."""
+        if self.core is None:
+            return
+        solar = self._solar_data
+        log.write("")
+        log.write("[b]HF Conditions[/b] (hamqsl.com)")
+        if solar is None:
+            if self._solar_fetched:
+                log.write("  [dim](unavailable — no internet at launch)[/dim]")
+            else:
+                log.write("  [dim](fetching…)[/dim]")
+            return
+
+        age_s = int((datetime.now(UTC) - solar.fetched_at).total_seconds())
+        age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
+        geo = f"  {solar.geo_field}" if solar.geo_field else ""
+        log.write(
+            f"  solar : SFI=[b]{solar.sfi}[/b]  SSN=[b]{solar.ssn}[/b]"
+            f"  A=[b]{solar.a_index}[/b]  K=[b]{solar.k_index}[/b]"
+            f"[dim]{geo}  ({age})[/dim]"
+        )
+
+        _C = {"Good": "green", "Fair": "yellow", "Poor": "red"}
+
+        def _fmt(val: str) -> str:
+            col = _C.get(val, "")
+            return f"[{col}]{val}[/{col}]" if col else val
+
+        # One compact line per band group: "Day/Night"
+        groups = [
+            ("80-40m", "80m-40m"),
+            ("30-20m", "30m-20m"),
+            ("17-15m", "17m-15m"),
+            ("12-10m", "12m-10m"),
+        ]
+        for label, key in groups:
+            cond = solar.conditions.get(key, {})
+            d = _fmt(cond.get("day", "?"))
+            n = _fmt(cond.get("night", "?"))
+            log.write(f"  [b]{label:<7}[/b]  day {d}  night {n}")
 
     def _render_winlink_paths(self, log: RichLog) -> None:
         """Render Winlink connection-path availability under its status line.
@@ -1561,6 +2922,37 @@ class RadioTUI(App):
             label = p.get("label", p.get("name", "?"))
             detail = p.get("detail", "")
             log.write(f"      {dot} {label}  {word}  [dim]{detail}[/dim]")
+
+    def _render_js8_status(self, log: RichLog, snap: dict | None) -> None:
+        """Render the JS8Call rig operating state under its status line.
+
+        Shows dial frequency / band / audio offset / submode speed and the
+        selected callsign, all of which JS8Call learns from the radio via CAT.
+        When there is no dial frequency JS8Call has no CAT/rig control, so we say
+        so rather than implying the rig state is known.
+        """
+        if not snap or not snap.get("cat"):
+            log.write(
+                "      [dim](no CAT/rig control — JS8Call can't read the radio)[/dim]"
+            )
+            return
+        bits: list[str] = []
+        dial = snap.get("dial")
+        if dial:
+            mhz = dial / 1_000_000
+            band = snap.get("band")
+            bits.append(f"{mhz:.6f} MHz" + (f" ({band})" if band else ""))
+        offset = snap.get("offset")
+        if offset:
+            bits.append(f"offset {int(offset)} Hz")
+        speed = snap.get("speed")
+        if speed:
+            bits.append(f"speed {speed}")
+        sel = snap.get("selected")
+        if sel:
+            bits.append(f"selected {sel}")
+        if bits:
+            log.write(f"      [dim]{'  ·  '.join(bits)}[/dim]")
 
     def _render_device_telemetry(self, log: RichLog, tel: dict | None) -> None:
         """Render a MeshCore companion's device telemetry under its status line.
@@ -1844,12 +3236,26 @@ class RadioTUI(App):
         self, dest: str, path: str = "/page/index.mu", fields: dict | None = None
     ) -> None:
         if self.core is None or not getattr(self.core, "browser", None):
-            self._log_system("NomadNet browser unavailable (Reticulum not running).")
+            self._log_system("NomadNet browser unavailable.")
             return
-        if not self.core.browser.available:
-            self._log_system("Reticulum is not running; cannot browse NomadNet.")
-            return
-        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields or {}))
+        # Even with Reticulum down we can still serve cached snapshots, so open
+        # the viewer in offline mode rather than refusing outright. Dynamic pages
+        # (with field_data) can't be cached, so those still need a live link.
+        offline = not self.core.browser.available
+        if offline:
+            if fields:
+                self._log_system(
+                    "Reticulum is down; dynamic pages need a live link."
+                )
+                return
+            self._log_system(
+                "Reticulum is down — showing cached page (if any)."
+            )
+        self.push_screen(
+            BrowseScreen(
+                self.core.browser, dest, path, fields or {}, prefer_cache=offline
+            )
+        )
 
     def action_toggle_nomad_favorite(self) -> None:
         """Bookmark / un-bookmark the highlighted NomadNet node (key 'f').
@@ -1886,6 +3292,38 @@ class RadioTUI(App):
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"could not save favorites: {exc}")
         self._refresh_nomad_nodes()
+
+    @work
+    async def action_sync_nomad(self) -> None:
+        """Cache every favorite NomadNet node's page for offline viewing ('s').
+
+        Fetches each ``kind == "node"`` favorite's index page live and stores it
+        in the offline cache, so the pages stay readable once Reticulum drops.
+        Runs as a worker so the UI stays responsive during the round-trips.
+        """
+        if self.core is None or self.view != "nomadnet":
+            return
+        browser = getattr(self.core, "browser", None)
+        if browser is None:
+            self._log_system("NomadNet browser unavailable.")
+            return
+        node_favs = [f for f in self.core.favorites.all() if f.kind == "node"]
+        if not node_favs:
+            self._log_system("No favorite nodes to sync (save one with 'f').")
+            return
+        if not browser.available:
+            self._log_system("Reticulum is not running; cannot sync favorites.")
+            return
+        self._log_system(f"\u21bb syncing {len(node_favs)} favorite node(s)...")
+        try:
+            res = await browser.sync_favorites(node_favs)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"sync failed: {exc}")
+            return
+        self._log_system(
+            f"\u2713 sync done: {res.ok} cached, {res.failed} failed, "
+            f"{res.skipped} skipped"
+        )
 
     # -- Watch pause / clear --------------------------------------------------
     def _toggle_watch_pause(self) -> None:
@@ -1933,12 +3371,253 @@ class RadioTUI(App):
         self._update_status()
         composer.focus()
 
+    # -- net surface -----------------------------------------------------------
+
+    def _show_net(self) -> None:
+        """Show the Net control / roll-call surface."""
+        self.view = "net"
+        self.query_one("#main", ContentSwitcher).current = "net-view"
+        self._enable_composer(True)
+        composer = self.query_one("#composer", Input)
+        composer.placeholder = "/net open <name> · /net ci <call> [note] · /net close"
+        self._render_net()
+        self._update_modebar()
+        self._update_status()
+        composer.focus()
+
+    def _render_net(self) -> None:
+        """Redraw the Net surface with current session state."""
+        if self.core is None:
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            return
+        log = self.query_one("#net-log", RichLog)
+        status = self.query_one("#net-status", Static)
+        log.clear()
+
+        session = nm.active
+        if session is None:
+            status.update("[dim]No active net — /net open <name>[/dim]")
+            # Show the most recent closed session for reference.
+            recent = nm.recent_sessions(limit=1)
+            if recent:
+                s = recent[0]
+                elapsed = (
+                    f"{s.duration_min:.0f} min"
+                    if s.duration_min is not None
+                    else "?"
+                )
+                log.write(
+                    f"[dim]Last net: [b]{s.name}[/b]  {s.transport}  "
+                    f"{s.opened_at.strftime('%Y-%m-%d %H:%M')} UTC  "
+                    f"({elapsed})  {len(s.check_ins)} check-in(s)[/dim]"
+                )
+                for i, ci in enumerate(s.check_ins, 1):
+                    note = f"  {ci.note}" if ci.note else ""
+                    log.write(
+                        f"[dim]  {i:>3}.  {ci.callsign:<12} "
+                        f"{ci.checked_in_at.strftime('%H:%M')}Z{note}[/dim]"
+                    )
+        else:
+            elapsed_s = (
+                datetime.now(UTC) - session.opened_at
+            ).total_seconds()
+            elapsed = (
+                f"{int(elapsed_s // 60)}m{int(elapsed_s % 60):02d}s"
+            )
+            status.update(
+                f"[green b]OPEN[/green b]  [b]{session.name}[/b]  "
+                f"{session.transport}  NC:[b]{session.net_control or '—'}[/b]  "
+                f"{len(session.check_ins)} checked in  {elapsed}"
+            )
+            log.write(
+                f"[b]Net:[/b] {session.name}  "
+                f"opened {session.opened_at.strftime('%H:%M')}Z  "
+                f"transport: {session.transport or '(any)'}"
+            )
+            if not session.check_ins:
+                log.write("[dim]  No check-ins yet.[/dim]")
+            else:
+                log.write(f"[b]Check-ins ({len(session.check_ins)}):[/b]")
+                for i, ci in enumerate(session.check_ins, 1):
+                    note = f"  {ci.note}" if ci.note else ""
+                    log.write(
+                        f"  {i:>3}.  [b]{ci.callsign:<12}[/b] "
+                        f"{ci.checked_in_at.strftime('%H:%M')}Z{note}"
+                    )
+
+    def _net_open_prompt(self) -> None:
+        """Open a new net using the current mode as transport."""
+        if self.core is None:
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            return
+        if nm.active and nm.active.is_open:
+            self._log_system(
+                f"Net '{nm.active.name}' is already open — /net close first."
+            )
+            return
+        nc = getattr(self.core.station, "callsign", "") or ""
+        name = "Net"
+        try:
+            nm.open(name, transport=self.active_transport or "", net_control=nc)
+        except ValueError as e:
+            self._log_system(str(e))
+            return
+        self._log_system(
+            f"Net opened: '{name}' on {self.active_transport or 'any'}.  "
+            "Use /net open <custom name> to rename."
+        )
+        self._render_net()
+
+    def _net_ci_self(self) -> None:
+        """Check in own callsign via the ✓ button."""
+        if self.core is None:
+            return
+        nc = getattr(self.core.station, "callsign", "") or "N0CALL"
+        self._handle_net_command(f"ci {nc}")
+
+    def _handle_net_command(self, arg: str) -> None:
+        """Handle /net <subcommand> from the composer."""
+        if self.core is None:
+            self._log_system("Core not ready.")
+            return
+        nm = getattr(self.core, "net", None)
+        if nm is None:
+            self._log_system("Net manager unavailable.")
+            return
+
+        parts = arg.strip().split(maxsplit=1)
+        sub = parts[0].lower() if parts else ""
+        rest = parts[1].strip() if len(parts) > 1 else ""
+
+        if sub in ("open", "start"):
+            name = rest or "Net"
+            nc = getattr(self.core.station, "callsign", "") or ""
+            try:
+                nm.open(
+                    name,
+                    transport=self.active_transport or "",
+                    net_control=nc,
+                )
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            self._log_system(
+                f"[b]Net open:[/b] '{name}'  transport: "
+                f"{self.active_transport or 'any'}  NC: {nc or '—'}"
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("ci", "checkin", "check-in", "heard"):
+            # /net ci [callsign] [note]  — bare "ci" checks in own callsign
+            ci_parts = rest.split(maxsplit=1)
+            if ci_parts and _looks_like_callsign(ci_parts[0]):
+                callsign = ci_parts[0].upper()
+                note = ci_parts[1].strip() if len(ci_parts) > 1 else ""
+            else:
+                callsign = (
+                    getattr(self.core.station, "callsign", "") or "N0CALL"
+                ).upper()
+                note = rest
+            try:
+                ci = nm.check_in(callsign, note)
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            ts = ci.checked_in_at.strftime("%H:%M")
+            self._log_system(
+                f"[b]Check-in #{len(nm.active.check_ins)}:[/b] "  # type: ignore[union-attr]
+                f"[b]{callsign}[/b]  {ts}Z"
+                + (f"  {note}" if note else "")
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("close", "end"):
+            try:
+                closed = nm.close()
+            except ValueError as e:
+                self._log_system(str(e))
+                return
+            elapsed = (
+                f"{closed.duration_min:.0f} min"
+                if closed.duration_min is not None
+                else "?"
+            )
+            calls = ", ".join(ci.callsign for ci in closed.check_ins) or "none"
+            self._log_system(
+                f"[b]Net closed:[/b] '{closed.name}'  "
+                f"{len(closed.check_ins)} check-in(s)  {elapsed}\n"
+                f"  Roll call: {calls}"
+            )
+            if self.view == "net":
+                self._render_net()
+
+        elif sub in ("list", "ls", "show"):
+            session = nm.active
+            if session is None:
+                self._log_system("No open net.  Recent: /net sessions")
+                return
+            lines = [
+                f"[b]Net:[/b] {session.name}  "
+                f"{len(session.check_ins)} check-in(s)"
+            ]
+            for i, ci in enumerate(session.check_ins, 1):
+                note = f"  {ci.note}" if ci.note else ""
+                lines.append(
+                    f"  {i:>2}. [b]{ci.callsign}[/b]  "
+                    f"{ci.checked_in_at.strftime('%H:%M')}Z{note}"
+                )
+            self._log_system("\n".join(lines))
+
+        elif sub in ("status", "info"):
+            session = nm.active
+            if session is None:
+                self._log_system("No open net session.")
+            else:
+                elapsed_s = (
+                    datetime.now(UTC) - session.opened_at
+                ).total_seconds()
+                self._log_system(
+                    f"[b]Net:[/b] {session.name}  OPEN  "
+                    f"{len(session.check_ins)} check-in(s)  "
+                    f"{int(elapsed_s // 60)}m elapsed  "
+                    f"NC: {session.net_control or '—'}"
+                )
+
+        elif sub in ("sessions", "history", "log"):
+            sessions = nm.recent_sessions(limit=5)
+            if not sessions:
+                self._log_system("No net sessions recorded yet.")
+                return
+            lines = ["[b]Recent net sessions:[/b]"]
+            for s in sessions:
+                state = "[green]OPEN[/green]" if s.is_open else "closed"
+                dt = s.opened_at.strftime("%m-%d %H:%M")
+                lines.append(
+                    f"  {dt}Z  {state}  [b]{s.name}[/b]  "
+                    f"{s.transport}  {len(s.check_ins)} CI"
+                )
+            self._log_system("\n".join(lines))
+
+        else:
+            self._log_system(
+                "Usage: /net open <name> · /net ci [<callsign>] [note] · "
+                "/net list · /net close · /net status · /net sessions"
+            )
+
+    # -- favorites (continued) -------------------------------------------------
+
     def _favorite_kind(self, fav: Favorite) -> str:
         """Classify a favorite as 'node' (NomadNet server), 'hash' or 'callsign'."""
         return self._favorite_kind_by_id(fav.id)
 
     def _favorite_kind_by_id(self, fid: str) -> str:
-        # A leading '@' is a JS8Call group, by convention (e.g. @TTP) - this is
+        # A leading '@' is a JS8Call group, by convention (e.g. @EMS) - this is
         # syntactic so it wins over any stored kind.
         if (fid or "").strip().startswith("@"):
             return "group"
@@ -2315,11 +3994,71 @@ class RadioTUI(App):
             None,
         )
 
+    def _refresh_compose_limit(self) -> None:
+        """Cache the active mode's documented per-message size cap (bytes)."""
+        t = self._active_transport_obj()
+        self._compose_limit = (
+            t.capabilities().max_message_size if t is not None else 0
+        )
+
+    def _check_compose_limit(self, text: str) -> bool:
+        """Whether ``text`` may be sent on the active transport.
+
+        Measures the UTF-8 *byte* length (one accented/emoji char can be several
+        bytes, which is what the on-air framing counts). Hard-blocks anything
+        over a transport's documented cap; for soft-limit transports (JS8Call,
+        which has no published cap and auto-frames) it only warns and allows it.
+        """
+        limit = self._compose_limit
+        if not limit:
+            return True
+        size = len(text.encode("utf-8"))
+        if size <= limit:
+            return True
+        over = size - limit
+        if self.active_transport in self._SOFT_LIMIT_TRANSPORTS:
+            self._log_system(
+                f"{size} bytes — JS8Call will send this as several "
+                "transmissions (it has no hard length limit)."
+            )
+            return True
+        self._log_system(
+            f"Too long for {self.active_transport}: {over} byte(s) over the "
+            f"{limit}-byte limit. Trim the message and resend."
+        )
+        return False
+
+    def _compose_counter_markup(self) -> str:
+        """A live ``124/134`` size counter for the active mode's composer.
+
+        Empty unless an operating mode with a size cap is active and the composer
+        holds a non-command message. Turns red past a hard cap, yellow past a
+        soft (advisory) one.
+        """
+        limit = self._compose_limit
+        if not limit or self.view != "active":
+            return ""
+        try:
+            val = self.query_one("#composer", Input).value
+        except Exception:  # noqa: BLE001
+            return ""
+        if not val or val.lstrip().startswith("/"):
+            return ""  # commands are not size-limited
+        size = len(val.encode("utf-8"))
+        if size <= limit:
+            return f"    [dim]{size}/{limit}[/dim]"
+        color = (
+            "yellow" if self.active_transport in self._SOFT_LIMIT_TRANSPORTS
+            else "red"
+        )
+        return f"    [{color}]{size}/{limit}[/{color}]"
+
     def _apply_mode(self) -> None:
         # Switching mode resets the open conversation (sending is mode-bound).
         # Channel-based transports (MeshCore) default to their primary channel
         # (the public channel 0) so the panel is ready to send straight away.
         self.current_target = self._default_channel_target()
+        self._refresh_compose_limit()
         self.query_one("#messages", RichLog).clear()
         self._refresh_threads()
         self._update_active_banner()
@@ -2375,6 +4114,10 @@ class RadioTUI(App):
             if bid == "mode-nomadnet":
                 btn.label = f"{self._health_dot('nomadnet')} nomadnet"
                 btn.set_class(current == "nomadnet", "-active")
+                btn.set_class(
+                    self._health.get("nomadnet") is ReachabilityStatus.DOWN,
+                    "-down",
+                )
             elif bid.startswith("mode-"):
                 name = bid[len("mode-"):]
                 btn.label = f"{self._health_dot(name)} {name}"
@@ -2382,12 +4125,22 @@ class RadioTUI(App):
                     self.view == "active" and current == name,
                     "-active",
                 )
+                btn.set_class(
+                    self._health.get(name) is ReachabilityStatus.DOWN,
+                    "-down",
+                )
             elif bid == "view-watch":
                 btn.set_class(self.view == "monitor", "-active")
             elif bid == "view-health":
                 btn.set_class(self.view == "health", "-active")
+            elif bid == "view-logs":
+                btn.set_class(self.view == "logs", "-active")
+            elif bid == "view-archive":
+                btn.set_class(self.view == "archive", "-active")
             elif bid == "view-favorites":
                 btn.set_class(self.view == "favorites", "-active")
+            elif bid == "view-net":
+                btn.set_class(self.view == "net", "-active")
         self._update_input_indicator()
         self._update_mesh_bar()
         self._update_js8_bar()
@@ -2405,6 +4158,12 @@ class RadioTUI(App):
         bar.display = (
             self.view == "active" and self.active_transport == "meshcore"
         )
+        down = self._health.get("meshcore") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            if btn.id == "mesh-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
 
     def _winlink_transport(self) -> Transport | None:
         """The live WinlinkTransport instance, or None when not configured."""
@@ -2428,6 +4187,12 @@ class RadioTUI(App):
             return
         show = self.view == "active" and self.active_transport == "winlink"
         bar.display = show
+        down = self._health.get("winlink") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            if btn.id == "winlink-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
         if not show:
             return
         t = self._winlink_transport()
@@ -2446,6 +4211,8 @@ class RadioTUI(App):
             if len(subj) > 24:
                 subj = subj[:21] + "..."
             parts.append(f"[dim]subj:[/dim]\u201c{subj}\u201d")
+        if self._attach_queue:
+            parts.append(f"[dim]\U0001f4ce[/dim]{len(self._attach_queue)}")
         label.update("  ".join(parts))
 
     def _winlink_subject_prompt(self) -> None:
@@ -2457,6 +4224,76 @@ class RadioTUI(App):
         composer.value = "/subject "
         composer.cursor_position = len(composer.value)
         composer.focus()
+
+    @work
+    async def _winlink_open_forms(self) -> None:
+        """End-to-end Winlink form flow: pick → fill → build → queue to outbox.
+
+        Drives three steps without blocking the UI: a forms picker, a generated
+        field form, then ``compose_form`` (which queues to Pat's outbox). Nothing
+        is transmitted — the operator presses Connect to send, which is the
+        natural review gate (mirrors the ``winlink compose-form`` CLI).
+        """
+        from ..transports.winlink_transport import detect_form_fields
+
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "list_forms"):
+            self._log_system("Winlink is not enabled.")
+            return
+        self._log_system("Winlink: loading form catalog \u2026")
+        try:
+            forms = await t.list_forms()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form catalog failed: {exc}")
+            return
+        if not forms:
+            self._log_system(
+                "No Winlink forms installed. Run 'radioapp winlink forms-update' "
+                "to download them."
+            )
+            return
+        template = await self.push_screen_wait(WinlinkFormsScreen(forms))
+        if not template:
+            return
+        try:
+            text = await t.get_form_template(template)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink template fetch failed: {exc}")
+            return
+        fields = detect_form_fields(text or "")
+        result = await self.push_screen_wait(
+            WinlinkComposeFormScreen(template, fields)
+        )
+        if not result:
+            return
+        if not getattr(t, "running", False):
+            self._log_system("Winlink transport is not running (is Pat reachable?).")
+            return
+        self._log_system(f"Winlink: building form {template} \u2026")
+        try:
+            built = await t.compose_form(
+                result["template"],
+                result["responses"],
+                to=result["to"],
+                cc=result["cc"],
+                subject=result["subject"],
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form build failed: {exc}")
+            return
+        if built is None:
+            self._log_system(
+                "Winlink form build failed (check the template and that Pat is "
+                "reachable)."
+            )
+            return
+        self._log_system(
+            "Winlink form queued to Pat's outbox \u2014 "
+            f"To: {built.get('to') or '(none)'} \u00b7 "
+            f"Subj: {built.get('subject') or '(none)'}. "
+            "Nothing sent yet; press Connect to transmit."
+        )
+        self._refresh_active_pane()
 
     def _set_winlink_subject(self, text: str) -> None:
         """Set (or clear) the pending subject for the next Winlink message."""
@@ -2482,6 +4319,110 @@ class RadioTUI(App):
         else:
             self._log_system("Winlink gateway cleared (telnet uses default CMS).")
 
+    def _add_attachment(self, arg: str) -> None:
+        """Queue (or list/clear) attachment file paths for the next message.
+
+        ``/attach <path>`` queues a file; ``/attach`` lists the queue;
+        ``/attach clear`` empties it. Paths are validated up front so the
+        operator finds out immediately if a file is missing. Available on any
+        active mode whose transport advertises ``supports_attachments`` (Winlink
+        email, Reticulum LXMF); other modes get a hint instead.
+        """
+        arg = arg.strip()
+        t = self._active_transport_obj()
+        caps = t.capabilities() if t is not None else None
+        if not (caps and caps.supports_attachments):
+            self._log_system(
+                f"no attachment support on '{self.active_transport or '(none)'}'."
+            )
+            return
+        if not arg:
+            if self._attach_queue:
+                names = ", ".join(os.path.basename(p) for p in self._attach_queue)
+                self._log_system(f"Attachments queued: {names}")
+            else:
+                self._log_system(
+                    "No attachments queued. Use /attach <path> to add one."
+                )
+            return
+        if arg.lower() == "clear":
+            self._attach_queue = []
+            self._update_winlink_bar()
+            self._log_system("Attachments cleared.")
+            return
+        path = os.path.expanduser(arg)
+        if not os.path.isfile(path):
+            self._log_system(f"Attachment not found: {arg}")
+            return
+        self._attach_queue.append(path)
+        self._update_winlink_bar()
+        self._log_system(
+            f"Attachment queued: {os.path.basename(path)} "
+            f"({len(self._attach_queue)} total). Send to deliver."
+        )
+
+    def _winlink_download_dir(self) -> str:
+        """Where saved inbound attachments go.
+
+        A per-transport ``download_dir`` override wins; otherwise the central
+        ``[storage].download_dir`` chosen at setup is used, so Winlink downloads
+        land with every other mode's.
+        """
+        t = self._winlink_transport()
+        if t is not None:
+            configured = str(t.config.get("download_dir", "")).strip()
+            if configured:
+                return os.path.expanduser(configured)
+        if self.core is not None:
+            return str(self.core.config.download_dir())
+        return os.path.join(
+            os.path.expanduser("~"), ".local", "share", "radio_app", "downloads"
+        )
+
+    @work(exclusive=True)
+    async def _winlink_save_attachments(self) -> None:
+        """Download attachments of the latest received mail in the open thread."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "save_attachments"):
+            self._log_system("Winlink is not enabled.")
+            return
+        if self.core is None or not self.current_target:
+            self._log_system("Open a Winlink conversation first.")
+            return
+        # Find the most recent received message (in this thread) that both has a
+        # Pat MID and lists attachments.
+        mid = None
+        names: list[str] = []
+        for msg in reversed(self.core.store.read_thread(self.current_target)):
+            if msg.transport != "winlink":
+                continue
+            m = msg.metadata.get("mid")
+            atts = msg.metadata.get("attachments") or []
+            if m and atts:
+                mid, names = str(m), [str(a) for a in atts]
+                break
+        if not mid:
+            self._log_system("No received attachments in this conversation.")
+            return
+        dest = self._winlink_download_dir()
+        self._log_system(f"Saving {len(names)} attachment(s) to {dest} \u2026")
+        try:
+            saved = await t.save_attachments(mid, dest)
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Attachment download failed: {exc}")
+            return
+        if saved:
+            self._log_system("Saved: " + ", ".join(saved))
+        else:
+            self._log_system("No attachments were saved.")
+
+    def action_pick_gateway(self, call: str = "") -> None:
+        """Pick an RMS gateway (clicked in the /gateways list) and connect."""
+        if not call:
+            return
+        self._set_winlink_gateway(call)
+        self._winlink_connect(call)
+
     @work(exclusive=True)
     async def _winlink_connect(self, gateway: str | None = None) -> None:
         """Trigger a Pat session to deliver the outbox and receive new mail."""
@@ -2498,16 +4439,217 @@ class RadioTUI(App):
             t.connect_summary() if hasattr(t, "connect_summary")
             else t.build_connect_url()
         )
+        # Radio interlock: a Winlink RF session keys the shared radio. Refuse to
+        # start one while JS8Call/Mercury holds the radio, and warn if another
+        # radio app is still running (it would key over this session).
+        session_rf = bool(t.capabilities().uses_shared_radio)
+        if session_rf and self.core is not None:
+            il = self.core.radio_interlock
+            dec = il.acquire("winlink")
+            if not dec.granted:
+                self._log_system(
+                    f"\u26d4 radio busy: {dec.blocked_by} is using the radio. "
+                    f"Switch away from {dec.blocked_by} (or stop its TX) before an "
+                    "RF Winlink session — or use a telnet path."
+                )
+                return
+            others = self._running_radio_contenders(exclude="winlink")
+            if others:
+                self._log_system(
+                    f"\u26a0 radio: {', '.join(others)} still running — make sure "
+                    "it's idle during this RF session so it doesn't key over Winlink."
+                )
         self._log_system(f"Winlink: connecting via {target} \u2026")
+        # Report how many messages are queued to send, so the operator knows a
+        # send is expected (and we can summarise how many actually went out).
+        queued_before: int | None = None
+        if hasattr(t, "outbox_count"):
+            try:
+                queued_before = await t.outbox_count()
+            except Exception:  # noqa: BLE001
+                queued_before = None
+        if queued_before:
+            self._log_system(
+                f"Winlink: {queued_before} message(s) queued to send."
+            )
+        elif queued_before == 0:
+            self._log_system("Winlink: outbox empty — checking for new mail.")
+        # Best-effort live progress from Pat's WebSocket while the session runs.
+        stop = asyncio.Event()
+        stream_task = None
+        # Track per-message transfers seen so we can summarise send/receive even
+        # if Pat's final counts are terse.
+        seen: dict[str, set[str]] = {"sent": set(), "recv": set()}
+        # Suppress Pat's replayed log backlog (it tails its log file to new WS
+        # clients) until the session is actually live.
+        log_state: dict[str, bool] = {"live": False}
+        # The raw Pat log transcript (LogLine) is both verbose and replayed to
+        # new WS clients (so it shows outdated backlog). Hide it by default and
+        # rely on the concise structured Status/Progress/Notification events plus
+        # the final "sent N, received M" summary. Operators who want the full
+        # Pat transcript can opt in with [transports.winlink] verbose_session_log.
+        verbose = bool(
+            (getattr(t, "config", {}) or {}).get("verbose_session_log", False)
+        )
+        if hasattr(t, "stream_events"):
+            def _on_event(ev: dict) -> None:
+                if not self._winlink_event_is_live(ev, log_state):
+                    return
+                if "LogLine" in ev and not verbose:
+                    return
+                prog = ev.get("Progress")
+                if isinstance(prog, dict) and prog.get("done"):
+                    mid = str(prog.get("mid") or "").strip()
+                    if prog.get("sending"):
+                        seen["sent"].add(mid or f"s{len(seen['sent'])}")
+                    elif prog.get("receiving"):
+                        seen["recv"].add(mid or f"r{len(seen['recv'])}")
+                line = self._format_winlink_event(ev)
+                if line:
+                    self._log_system(line)
+
+            async def _pump() -> None:
+                try:
+                    await t.stream_events(
+                        _on_event, stop.is_set,
+                        on_prompt=self._winlink_password_prompt,
+                    )
+                except Exception:  # noqa: BLE001 - feedback is optional
+                    pass
+
+            stream_task = asyncio.create_task(_pump())
         try:
             received = await t.connect_now(url)
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"Winlink connect failed: {exc}")
             return
+        finally:
+            stop.set()
+            if stream_task is not None:
+                stream_task.cancel()
+            # Release the radio claim taken for this RF session.
+            if session_rf and self.core is not None:
+                self.core.radio_interlock.release("winlink")
+        # Work out how many messages actually went out: the outbox delta is the
+        # authoritative "sent" count (forwarded messages leave the outbox); fall
+        # back to the per-message transfers we watched stream by.
+        queued_after: int | None = None
+        if hasattr(t, "outbox_count"):
+            try:
+                queued_after = await t.outbox_count()
+            except Exception:  # noqa: BLE001
+                queued_after = None
+        if queued_before is not None and queued_after is not None:
+            sent = max(0, queued_before - queued_after)
+        else:
+            sent = len(seen["sent"])
+        # connect_now's NumReceived is authoritative for received; cross-check
+        # with the transfers we saw.
+        got = max(int(received or 0), len(seen["recv"]))
         self._log_system(
-            f"Winlink session done \u2014 {received} message(s) received."
+            f"\u2713 Winlink session complete \u2014 sent {sent}, received {got}."
         )
+        if queued_after:
+            self._log_system(
+                f"[dim]Winlink: {queued_after} message(s) still queued "
+                "(not forwarded this session).[/dim]"
+            )
         self._refresh_active_pane()
+
+    async def _winlink_password_prompt(self, prompt: dict) -> str | None:
+        """Answer Pat's mid-session secure-login password prompt (option A).
+
+        Pops a masked input and returns what the operator types, kept in memory
+        only for this session (never written to config/disk). Returns ``None`` on
+        cancel or if the operator doesn't respond before Pat's ~60s timeout, so
+        Pat falls back to its own handling. Mirrors Pat's prompt message so the
+        operator sees exactly which callsign/account is being authenticated.
+        """
+        message = str(prompt.get("message") or "Enter Winlink secure-login password")
+        loop = asyncio.get_event_loop()
+        future: asyncio.Future[str | None] = loop.create_future()
+
+        def _done(value: str | None) -> None:
+            if not future.done():
+                future.set_result(value)
+
+        self.push_screen(PasswordPromptScreen(message), _done)
+        try:
+            # Stay within Pat's 60s prompt window; decline if it elapses.
+            return await asyncio.wait_for(future, timeout=55)
+        except TimeoutError:
+            self._log_system("Winlink: password prompt timed out.")
+            return None
+
+    @staticmethod
+    def _winlink_event_is_live(ev: dict, state: dict) -> bool:
+        """Filter Pat's replayed log backlog from genuine live session events.
+
+        When a WebSocket client connects, Pat *tails its log file* and replays
+        recent historical lines (``LogLine``) before the session begins — that's
+        old data, not this session. Real-time events (``Status`` dialing/connected
+        and ``Progress``) are pushed live, never replayed, so the first of those
+        marks the session as live (``state['live'] = True``). LogLines are shown
+        only once live; every non-LogLine event always passes. (Timestamps in the
+        log can't be trusted to filter — the Pat host's clock/timezone may differ
+        from ours.)
+        """
+        status = ev.get("Status")
+        if isinstance(status, dict) and (
+            status.get("dialing") or status.get("connected")
+        ):
+            state["live"] = True
+        if ev.get("Progress") is not None or ev.get("Notification") is not None:
+            state["live"] = True
+        if "LogLine" in ev:
+            return bool(state.get("live"))
+        return True
+
+    @staticmethod
+    def _format_winlink_event(ev: dict) -> str | None:
+        """Turn one Pat ``/ws`` event into a progress line (or None to suppress).
+
+        Surfaces the session in detail: per-message transfer progress (with an
+        up/down arrow for send vs receive), connection state, notifications, and
+        the live Pat log transcript (``LogLine``) so the operator sees exactly
+        what the session is doing. Keepalive pings and mailbox-changed events are
+        suppressed.
+        """
+        prog = ev.get("Progress")
+        if isinstance(prog, dict):
+            subj = str(prog.get("subject") or "").strip() or "(no subject)"
+            if prog.get("sending"):
+                arrow, verb = "\u2191", "send"
+            elif prog.get("receiving"):
+                arrow, verb = "\u2193", "recv"
+            else:
+                arrow, verb = "\u2022", ""
+            head = f"Winlink {arrow} {verb}".rstrip()
+            if prog.get("done"):
+                return f"{head} done: {subj}"
+            total = int(prog.get("bytes_total") or 0)
+            xfer = int(prog.get("bytes_transferred") or 0)
+            amount = f"{(100 * xfer // total)}% of {total}B" if total else f"{xfer}B"
+            return f"{head} {amount}: {subj}"
+        status = ev.get("Status")
+        if isinstance(status, dict):
+            if status.get("dialing"):
+                return "Winlink: dialing\u2026"
+            if status.get("connected"):
+                ra = str(status.get("remote_addr") or "").strip()
+                return f"Winlink: connected{(' to ' + ra) if ra else ''}"
+            return None
+        note = ev.get("Notification")
+        if isinstance(note, dict):
+            text = " \u2014 ".join(
+                x for x in (note.get("title"), note.get("body")) if x
+            )
+            return f"Winlink \U0001f4e8 {text}" if text else None
+        # The live Pat log transcript — the verbose, Pat-terminal-style detail.
+        line = ev.get("LogLine")
+        if isinstance(line, str) and line.strip():
+            return f"[dim]pat\u2502 {line.strip()}[/dim]"
+        return None
 
     @work(exclusive=True)
     async def _winlink_list_gateways(self) -> None:
@@ -2528,14 +4670,22 @@ class RadioTUI(App):
             )
             return
         self._log_system(f"Nearby RMS gateways ({len(gateways)} shown):")
+        log = self.query_one("#messages", RichLog)
         for gw in gateways[:15]:
-            call = gw.get("callsign") or gw.get("Callsign") or "?"
+            call = str(gw.get("callsign") or gw.get("Callsign") or "?")
             mode = gw.get("mode") or gw.get("Mode") or ""
             dist = gw.get("distance") or gw.get("Distance") or ""
             extra = " ".join(str(x) for x in (mode, dist) if x)
-            self._log_system(f"  {call}  [dim]{extra}[/dim]")
+            # Make each callsign clickable: clicking picks it as the gateway and
+            # starts a session. Strip quotes so it can't break the action arg.
+            safe = call.replace("'", "").replace("\\", "")
+            log.write(
+                f"  [b][@click=app.pick_gateway('{safe}')]{call}[/][/b]  "
+                f"[dim]{extra}[/dim]"
+            )
         self._log_system(
-            "Use [b]/gateway <CALL>[/b] then [b]Connect[/b] (or /connect <CALL>)."
+            "Click a callsign above, or use [b]/gateway <CALL>[/b] then "
+            "[b]Connect[/b]."
         )
 
     def _js8_transport(self) -> Transport | None:
@@ -2559,10 +4709,19 @@ class RadioTUI(App):
             return
         show = self.view == "active" and self.active_transport == "js8call"
         bar.display = show
+        down = self._health.get("js8call") is ReachabilityStatus.DOWN
+        for btn in bar.query(Button):
+            if btn.id == "js8-start":
+                btn.disabled = not down
+            else:
+                btn.disabled = down
         # The bottom one-click query bar (SNR?/HEARING?/STATUS?/INFO?) tracks the
         # band bar's visibility - both belong to the JS8 chat panel.
         try:
-            self.query_one("#js8-query-bar", Horizontal).display = show
+            qbar = self.query_one("#js8-query-bar", Horizontal)
+            qbar.display = show
+            for btn in qbar.query(Button):
+                btn.disabled = down
         except Exception:  # noqa: BLE001 - not mounted yet
             pass
         if not show:
@@ -2616,6 +4775,117 @@ class RadioTUI(App):
         self._send(f"{name}?")
 
     @work
+    async def _js8_show_inbox(self) -> None:
+        """``/inbox`` — list the messages JS8Call is holding for store-and-forward."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        await t.request_inbox()
+        await asyncio.sleep(1.2)  # let the async INBOX.MESSAGES reply land
+        msgs = t.inbox_messages()
+        if not msgs:
+            self._log_system("JS8Call inbox is empty.")
+            return
+        self._log_system(f"JS8Call inbox ({len(msgs)}):")
+        for m in msgs:
+            who = f"{m['from'] or '?'} \u2192 {m['to'] or '?'}"
+            self._log_system(f"  [{who}] {m['text']}")
+
+    @work
+    async def _js8_relay(self, arg: str) -> None:
+        """``/relay <CALL> <text>`` — leave a store-and-forward message in JS8Call."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            self._log_system("usage: /relay <CALL> <message text>")
+            return
+        call, body = parts[0], parts[1]
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        if await t.store_relay_message(call, body):
+            self._log_system(
+                f"Stored relay for {call.upper()} \u2014 JS8Call will forward it "
+                "when it next hears that station."
+            )
+        else:
+            self._log_system("Could not store the relay message.")
+
+    def _js8_sms_prompt(self) -> None:
+        """SMS push-button: pre-fill the composer with ``/sms `` to type into.
+
+        Switches to JS8Call mode first if needed, since the APRS gateway send
+        only works there. The operator then types ``<phone> <message>``.
+        """
+        if self.active_transport != "js8call":
+            self._select_mode("js8call")
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        composer.value = "/sms "
+        composer.cursor_position = len(composer.value)
+        composer.focus()
+        self._log_system(
+            "SMS via APRS gateway \u2014 type: /sms <phone> <message>  "
+            "[dim](relayed by JS8Call \u2192 SMSGTE)[/dim]"
+        )
+
+    @work
+    async def _js8_send_sms(self, arg: str) -> None:
+        """``/sms <phone> <text>`` — text a phone via JS8Call's APRS gateway."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        parts = arg.split(maxsplit=1)
+        if len(parts) < 2:
+            self._log_system("usage: /sms <phone> <message text>")
+            return
+        phone, body = parts[0], parts[1]
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        if await t.send_sms(phone, body):
+            self._log_system(
+                f"\u2709 SMS to {phone} queued via APRS (SMSGTE) \u2014 "
+                "JS8Call will transmit it on the next cycle."
+            )
+        else:
+            self._log_system(
+                "Could not send the SMS. Check the number and that JS8Call's "
+                "APRS gateway is enabled."
+            )
+
+    @work
+    async def _js8_directed_cmd(self, arg: str) -> None:
+        """``/cmd [<CALL|@GROUP>] <COMMAND>`` — send a JS8 directed command."""
+        if self.active_transport != "js8call":
+            self._log_system("Switch to the JS8Call mode first (press F3).")
+            return
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running.")
+            return
+        parts = arg.split()
+        if len(parts) == 1 and self.current_target:
+            target, command = self.current_target, parts[0]
+        elif len(parts) >= 2:
+            target, command = parts[0], parts[1]
+        else:
+            self._log_system("usage: /cmd [<CALL|@GROUP>] <SNR?|GRID?|INFO?|...>")
+            return
+        if await t.send_directed_command(target, command):
+            self._log_system(f"Sent directed command: {target.upper()} "
+                             f"{command.upper()}")
+        else:
+            self._log_system(f"Unknown/failed JS8 command: {command}")
+
+    @work
     async def _js8_set_freq(self, hz: int) -> None:
         """Move the radio's dial via JS8Call (requires CAT/rig control there)."""
         t = self._js8_transport()
@@ -2662,19 +4932,25 @@ class RadioTUI(App):
         self._js8_switch_band(arg.strip())
 
     def _build_mode_selector(self) -> None:
-        """Create one button per transport (mode) plus Watch/Health controls."""
+        """Create one button per transport (mode) plus Stream/Health controls."""
         if self.core is None:
             return
         bar = self.query_one("#modebar", Horizontal)
-        # One chip per configured transport = one operating mode.
-        for t in self.core.transports:
-            bar.mount(Button(t.name, id=f"mode-{t.name}", classes="modebtn"))
-        # NomadNet is a virtual mode (read-only page browsing over Reticulum).
-        bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+        by_name = {t.name: t for t in self.core.transports}
+        for key in self._mode_keys():
+            if key == "nomadnet":
+                bar.mount(Button("nomadnet", id="mode-nomadnet", classes="modebtn"))
+            else:
+                t = by_name[key]
+                label = t.display_name or t.name
+                bar.mount(Button(label, id=f"mode-{t.name}", classes="modebtn"))
         bar.mount(Static("", id="modebar-spacer"))
-        bar.mount(Button("\u25f7 Watch", id="view-watch", classes="modebtn"))
+        bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
+        bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
         bar.mount(Button("\u2605 Favorites", id="view-favorites", classes="modebtn"))
+        bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
+        bar.mount(Button("\U0001f5d2 Logs", id="view-logs", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))
 
     def _health_dot(self, name: str) -> str:
@@ -2720,6 +4996,14 @@ class RadioTUI(App):
                     await t.request_dial_freq()
                 except Exception:  # noqa: BLE001 - never crash the probe timer
                     pass
+                # Also pull the fuller operating snapshot (speed + selected
+                # callsign) for the Health board; the reply arrives async as a
+                # STATION.STATUS event.
+                if hasattr(t, "radio_status"):
+                    try:
+                        await t.radio_status()
+                    except Exception:  # noqa: BLE001 - never crash the probe timer
+                        pass
             # Winlink: probe each connection path's endpoint (telnet via Pat,
             # varahf/Mercury @8300, ardop @8515) so the Health board can show
             # which modems are up — even when they're expected to be down.
@@ -2734,9 +5018,71 @@ class RadioTUI(App):
             self._health["nomadnet"] = self._health["reticulum"]
         else:
             self._health["nomadnet"] = ReachabilityStatus.NOT_APPLICABLE
+
+        # Time consensus check — GPS → local NTP → internet NTP → system.
+        # At most every 60 s; run in a thread to avoid blocking the event loop.
+        import asyncio as _asyncio
+        loop = _asyncio.get_event_loop()
+        now_mono = loop.time()
+        if now_mono - self._last_time_check >= 60.0:
+            self._last_time_check = now_mono
+            try:
+                from ..core.timesource import TimeConsensus
+                pos_cfg = self.core.config.data.get("position", {}) if self.core else {}
+                tc = TimeConsensus(
+                    gpsd_host=pos_cfg.get("gpsd_host", "127.0.0.1"),
+                    gpsd_port=int(pos_cfg.get("gpsd_port", 2947)),
+                    timeout=1.5,
+                    wsjtx_monitor=self.core.wsjtx_monitor if self.core else None,
+                )
+                self._time_reading = await _asyncio.wait_for(
+                    loop.run_in_executor(None, tc.best_reading),
+                    timeout=5.0,
+                )
+                self._time_queried = True
+            except Exception:  # noqa: BLE001 - never crash the health probe
+                self._time_reading = None
+                self._time_queried = True
+
+        # GPS position refresh — only when gpsd is explicitly enabled in config.
+        if (
+            self.core is not None
+            and self.core.config.data.get("position", {}).get("gpsd_enabled", False)
+        ):
+            try:
+                from ..core.position import GPSReader
+                gpsd_host = self.core.config.position.get("gpsd_host", "127.0.0.1")
+                gpsd_port = int(self.core.config.position.get("gpsd_port", 2947))
+                reader = GPSReader(host=gpsd_host, port=gpsd_port, timeout=3.0)
+                self._position = await _asyncio.wait_for(
+                    loop.run_in_executor(None, reader.read),
+                    timeout=4.0,
+                )
+            except Exception:  # noqa: BLE001 - GPS failure must never crash health probe
+                pass
+
         self._update_modebar()
         if self.view == "health":
             self._render_health()
+
+    @work(exclusive=True)
+    async def _check_scheduled(self) -> None:
+        """Fire any messages whose scheduled send time has arrived."""
+        if self.core is None:
+            return
+        now = datetime.now(UTC)
+        try:
+            pending = self.core.store.schedule_pending(up_to=now)
+        except Exception:  # noqa: BLE001
+            return
+        for entry in pending:
+            ok = await self.core.router.send(
+                entry.message, force_transport=entry.transport
+            )
+            self.core.store.schedule_mark_sent(entry.id, success=ok)
+            status_str = "sent" if ok else "[red]FAILED[/red]"
+            preview = entry.message.content[:40]
+            self._log_system(f"Scheduled message {status_str}: {preview!r}")
 
     # -- input-mode detection -------------------------------------------------
     def _note_input(self, mode: str) -> None:
@@ -2753,8 +5099,70 @@ class RadioTUI(App):
         touch = " touch" if self._touch_layout else ""
         ind.update(f"{glyph}{touch}")
 
+    # -- per-mode command history ---------------------------------------------
+    def _hist_key(self) -> str:
+        """History bucket for the current mode."""
+        if self.view == "active" and self.active_transport:
+            return self.active_transport
+        return self.view or "active"
+
+    def _push_cmd_history(self, text: str) -> None:
+        if not text or not self._cmd_hist_limit:
+            return
+        key = self._hist_key()
+        hist = self._cmd_history.get(key)
+        if hist is None:
+            hist = deque(maxlen=self._cmd_hist_limit)
+            self._cmd_history[key] = hist
+        if not hist or hist[-1] != text:
+            hist.append(text)
+        self._cmd_hist_pos[key] = -1
+        self._cmd_hist_draft.pop(key, None)
+
+    def _navigate_cmd_history(self, back: bool) -> None:
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        key = self._hist_key()
+        hist = self._cmd_history.get(key)
+        if not hist:
+            return
+        pos = self._cmd_hist_pos.get(key, -1)
+        if back:
+            if pos == -1:
+                self._cmd_hist_draft[key] = composer.value
+                pos = len(hist) - 1
+            elif pos > 0:
+                pos -= 1
+            else:
+                return  # already at oldest entry
+        else:
+            if pos == -1:
+                return  # nothing to go forward to
+            if pos < len(hist) - 1:
+                pos += 1
+            else:
+                pos = -1
+                composer.value = self._cmd_hist_draft.pop(key, "")
+                composer.cursor_position = len(composer.value)
+                self._cmd_hist_pos[key] = pos
+                return
+        self._cmd_hist_pos[key] = pos
+        composer.value = hist[pos]
+        composer.cursor_position = len(composer.value)
+
     def on_key(self, event) -> None:  # noqa: ANN001 - Textual event
         self._note_input("key")
+        if event.key in ("up", "down"):
+            try:
+                composer = self.query_one("#composer", Input)
+            except Exception:  # noqa: BLE001
+                return
+            if composer.has_focus:
+                self._navigate_cmd_history(event.key == "up")
+                event.prevent_default()
+                event.stop()
 
     def on_click(self, event) -> None:  # noqa: ANN001 - Textual event
         self._note_input("pointer")
@@ -2795,7 +5203,7 @@ class RadioTUI(App):
         target = target.strip()
         if target.startswith("@"):
             return target
-        if self.active_transport in ("js8call", "mercury"):
+        if self.active_transport == "js8call":
             return target.upper()
         return target
 
@@ -2954,6 +5362,16 @@ class RadioTUI(App):
         elif list_id == "favorites-list":
             if idx < len(self._fav_keys) and self._fav_keys[idx]:
                 self._open_favorite(self._fav_keys[idx])
+        elif list_id == "search-results":
+            if idx < len(self._search_hits):
+                thread_key, transport = self._search_hits[idx]
+                if thread_key:
+                    self._open_thread(thread_key, transport)
+        elif list_id == "archive-list":
+            if idx < len(self._archive_rows):
+                thread_key, transport = self._archive_rows[idx]
+                if thread_key:
+                    self._open_thread(thread_key, transport)
 
     def _load_thread(self, thread_key: str) -> None:
         if self.core is None:
@@ -3013,7 +5431,7 @@ class RadioTUI(App):
         if self._watch_sort_by_mode:
             self._rebuild_monitor()
             return
-        if self._monitor_fav_only and not self._msg_is_favorite(msg):
+        if not self._monitor_passes(msg):
             return
         self._render_monitor_row(msg)
 
@@ -3023,12 +5441,44 @@ class RadioTUI(App):
         "reticulum": "cyan",
         "js8call": "yellow",
         "meshcore": "green",
-        "mercury": "magenta",
         "nomadnet": "blue",
     }
 
     def _mode_color(self, transport: str) -> str:
         return self._MODE_COLORS.get(transport, "white")
+
+    @staticmethod
+    def _subject_md(msg: UnifiedMessage) -> str:
+        """A bold ``Subject \u2014 `` prefix for Winlink mail.
+
+        Winlink is email: the subject carries half the meaning, so prepend it to
+        the body when rendering. Returns ``""`` for transports that have no
+        subject. Brackets/backslashes are escaped so an arbitrary email subject
+        can't break the surrounding Rich markup.
+        """
+        if msg.transport != "winlink":
+            return ""
+        subj = str(msg.metadata.get("subject") or "").strip()
+        if not subj:
+            return ""
+        safe = subj.replace("\\", "\\\\").replace("[", "\\[")
+        return f"[b]{safe}[/b] \u2014 "
+
+    @staticmethod
+    def _attachments_md(msg: UnifiedMessage) -> str:
+        """A dim ``\U0001f4ce name1, name2`` suffix listing message attachments.
+
+        Returns ``""`` when there are none. Names are escaped so they can't
+        break the surrounding Rich markup.
+        """
+        names = msg.metadata.get("attachments") or []
+        names = [str(n).strip() for n in names if str(n).strip()]
+        if not names:
+            return ""
+        safe = ", ".join(
+            n.replace("\\", "\\\\").replace("[", "\\[") for n in names
+        )
+        return f" [dim]\U0001f4ce {safe}[/dim]"
 
     def _render_monitor_row(self, msg: UnifiedMessage) -> None:
         mlist = self.query_one("#monitor", ListView)
@@ -3046,10 +5496,52 @@ class RadioTUI(App):
         name = msg.transport or "?"
         color = self._mode_color(name)
         mode_tag = f"[{color}]{name:<9}[/{color}]"
-        line = f"{ts} {mode_tag} {sec} {star}{who} -> {tgt}: {msg.content}"
+        line = (
+            f"{ts} {mode_tag} {sec} {star}{who} -> {tgt}: "
+            f"{self._subject_md(msg)}{msg.content}{self._attachments_md(msg)}"
+        )
         mlist.append(ListItem(Label(line)))
         self._monitor_entries.append((msg.thread_key, msg.transport))
+        # Bound the rendered list so a long live session can't grow the widget
+        # without limit. The master buffer (a capped deque) already holds at most
+        # `cap` rows; once the rendered list drifts to ~2x that, rebuild from the
+        # deque (resets widget + index map together, ≤ cap, staying aligned).
+        # The 2x hysteresis amortises the rebuild to O(1) per message.
+        cap = self._watch_buffer_limit
+        if cap and len(self._monitor_entries) > 2 * cap:
+            self._rebuild_monitor()
+            return
         mlist.scroll_end(animate=False)
+
+    def _monitor_passes(self, msg: UnifiedMessage) -> bool:
+        """Whether a message survives the Watch stream's active filter.
+
+        The favorites-only and group filters are mutually exclusive; at most one
+        is active at a time (selecting one clears the other), so this is a simple
+        either/or. With no filter active every message passes.
+        """
+        if self._monitor_group_filter is not None:
+            return self._msg_in_group(msg, self._monitor_group_filter)
+        if self._monitor_fav_only:
+            return self._msg_is_favorite(msg)
+        return True
+
+    def _msg_in_group(self, msg: UnifiedMessage, name: str) -> bool:
+        """True if a message belongs to the named group (member or tag).
+
+        Uses the stamp the router already wrote (``msg.groups``) when present,
+        and otherwise resolves live against the registry so your own outbound
+        sends to the group show too (keeping both sides of a watched group).
+        """
+        if self.core is None:
+            return False
+        names = msg.groups
+        if not names:
+            try:
+                names = self.core.groups.groups_for_message(msg)
+            except Exception:  # noqa: BLE001 - filtering must never crash Watch
+                return False
+        return name in names
 
     def _msg_is_favorite(self, msg: UnifiedMessage) -> bool:
         if self.core is None:
@@ -3082,7 +5574,7 @@ class RadioTUI(App):
                 msgs, key=lambda m: (m.transport or "~", m.timestamp)
             )
         for msg in msgs:
-            if self._monitor_fav_only and not self._msg_is_favorite(msg):
+            if not self._monitor_passes(msg):
                 continue
             self._render_monitor_row(msg)
 
@@ -3103,23 +5595,28 @@ class RadioTUI(App):
         )
 
     def _update_monitor_help(self) -> None:
-        """Reflect the Monitor scope and favorites-filter state in the header.
+        """Reflect the Monitor scope and active filter in the header.
 
-        The transport scope ("all transports") and the favorites-only filter are
-        shown as two independent segments, so the filter state never overwrites
-        the scope label.
+        The transport scope ("all transports") and the active filter (favorites
+        or a group) are shown as two independent segments, so the filter state
+        never overwrites the scope label. Favorites and group are mutually
+        exclusive — at most one shows at a time.
         """
         try:
             help_line = self.query_one("#monitor-help", Static)
         except Exception:  # noqa: BLE001 - widget may not be mounted yet
             return
         scope = "Monitor - [b]all transports[/b] (read-only)"
-        if self._monitor_fav_only:
-            fav = "filter: [b yellow]\u2605 favorites only[/b yellow]"
+        if self._monitor_group_filter:
+            grp = self._monitor_group_filter
+            filt = f"filter: [b cyan]\u25c9 group @{grp}[/b cyan]"
+        elif self._monitor_fav_only:
+            filt = "filter: [b yellow]\u2605 favorites only[/b yellow]"
         else:
-            fav = "filter: [dim]off (all senders)[/dim]"
+            filt = "filter: [dim]off (all senders)[/dim]"
         help_line.update(
-            f"{scope}    {fav}    Enter opens an item \u00b7 [F4] toggle favorites"
+            f"{scope}    {filt}    "
+            "[F4] favorites \u00b7 [g] group"
         )
 
     def _refresh_monitor_ticker(self) -> None:
@@ -3279,14 +5776,266 @@ class RadioTUI(App):
             "rm <id> | only | groups"
         )
 
+    def _handle_tmpl_command(self, arg: str) -> None:
+        """List templates or load one into the composer for review before sending."""
+        if self.core is None:
+            return
+        from ..core.templates import Templates
+        tmpls = Templates.from_config(self.core.config)
+        if not arg or arg.strip().lower() == "list":
+            names = tmpls.names()
+            if not names:
+                self._log_system(
+                    "No templates. Add [templates] to config.toml, e.g.:\n"
+                    '  welfare = "Welfare check — all OK"'
+                )
+            else:
+                joined = "  ".join(f"[b]{n}[/b]" for n in names)
+                self._log_system("Templates: " + joined)
+            return
+        text = tmpls.get(arg.strip())
+        if text is None:
+            names = tmpls.names()
+            hint = ", ".join(names) if names else "(none configured)"
+            self._log_system(f"Template '{arg}' not found. Available: {hint}")
+            return
+        try:
+            from textual.widgets import Input
+            composer = self.query_one("#composer", Input)
+            composer.value = text
+            composer.focus()
+        except Exception:  # noqa: BLE001 - not fatal if composer unavailable
+            self._log_system(f"Template text: {text}")
+
+    def _handle_bands_command(self, arg: str) -> None:
+        """Show the band-plan / EmComm frequency reference with live conditions."""
+        from ..core.bandplan import format_mhz, lookup
+        band = arg.strip().lower() or None
+        entries = lookup(band=band, region="US")
+        if not entries:
+            self._log_system(
+                f"No band-plan entries{f' for {band}' if band else ''}."
+            )
+            return
+
+        solar = self._solar_data
+        lines = []
+        if solar:
+            age_s = int(
+                (
+                    __import__("datetime").datetime.now(
+                        __import__("datetime").timezone.utc
+                    )
+                    - solar.fetched_at
+                ).total_seconds()
+            )
+            age = f"{age_s // 60} min ago" if age_s >= 60 else "just now"
+            geo = f"  Geo:[b]{solar.geo_field}[/b]" if solar.geo_field else ""
+            lines.append(
+                f"[dim]Solar  SFI=[b]{solar.sfi}[/b]  SSN=[b]{solar.ssn}[/b]"
+                f"  A=[b]{solar.a_index}[/b]  K=[b]{solar.k_index}[/b]{geo}"
+                f"  ({age})[/dim]"
+            )
+            lines.append("")
+
+        _COND_COLOR = {"Good": "green", "Fair": "yellow", "Poor": "red"}
+
+        lines.append(f"[b]Band plan{f' — {band}' if band else ''}:[/b]")
+        current_band = None
+        for e in entries:
+            if e.band != current_band:
+                current_band = e.band
+                if solar:
+                    cond = solar.condition_for(e.band)
+                    parts = []
+                    for period in ("day", "night"):
+                        val = cond.get(period, "")
+                        if val:
+                            col = _COND_COLOR.get(val, "")
+                            label = f"[{col}]{val}[/{col}]" if col else val
+                            parts.append(f"{period.capitalize()}: {label}")
+                    suffix = f"  [dim]({' / '.join(parts)})[/dim]" if parts else ""
+                else:
+                    suffix = ""
+                lines.append(f"  [b]{e.band}[/b]{suffix}")
+            freq = format_mhz(e.freq_khz)
+            tp = f" [{e.transport}]" if e.transport else ""
+            lines.append(f"    {freq:<14} {e.mode:<6}{tp}  {e.notes}")
+        self._log_system("\n".join(lines))
+
+    def _handle_sched_command(self, arg: str) -> None:
+        """Schedule current composer text (or given text) for a future send.
+
+        Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
+        """
+        from ..core.message import UnifiedMessage
+
+        parts = arg.strip().split(None, 1)
+        if not parts:
+            self._log_system("Usage: /sched +30m | HH:MM [text]")
+            return
+        time_spec = parts[0]
+        text_override = parts[1] if len(parts) > 1 else None
+
+        now = datetime.now(UTC)
+        try:
+            if time_spec.startswith("+"):
+                raw = time_spec[1:].lower()
+                if "h" in raw and "m" in raw:
+                    h_part, rest = raw.split("h")
+                    mins = int(h_part) * 60 + int(rest.rstrip("m"))
+                elif "h" in raw:
+                    mins = int(raw.rstrip("h")) * 60
+                else:
+                    mins = int(raw.rstrip("m"))
+                fire_at = now + timedelta(minutes=mins)
+            else:
+                hh, mm = time_spec.split(":")
+                fire_at = now.replace(
+                    hour=int(hh), minute=int(mm), second=0, microsecond=0
+                )
+                if fire_at <= now:
+                    fire_at += timedelta(days=1)
+        except (ValueError, AttributeError):
+            self._log_system("Invalid time. Use: /sched +30m  or  /sched 19:00")
+            return
+
+        if text_override:
+            content = text_override
+        else:
+            try:
+                from textual.widgets import Input as _Input
+                composer = self.query_one("#composer", _Input)
+                content = composer.value.strip()
+            except Exception:  # noqa: BLE001
+                content = ""
+        if not content:
+            self._log_system(
+                "/sched: no message text. Type a message or use /sched 19:00 text"
+            )
+            return
+
+        if self.core is None:
+            return
+
+        thread = (
+            getattr(self, "_active_thread", None)
+            or getattr(self, "_watch_thread", None)
+        )
+        name = (self.core.station.callsign if self.core.station else None) or "unknown"
+        if thread and thread.startswith("@"):
+            msg = UnifiedMessage.to_group(name, thread[1:], content)
+        elif thread:
+            msg = UnifiedMessage.direct(name, thread, content)
+        else:
+            self._log_system(
+                "/sched: no active thread — navigate to a conversation first"
+            )
+            return
+
+        self.core.store.schedule_add(msg, fire_at)
+        ts = fire_at.strftime("%H:%M UTC")
+        self._log_system(f"Message scheduled for {ts}: {content[:40]!r}")
+
+    def _handle_roster_command(self, arg: str) -> None:
+        """Show the presence roster (recently-heard callsigns)."""
+        from ..core.roster import get_roster
+
+        if self.core is None:
+            return
+
+        raw = arg.strip().lower().rstrip("h") if arg.strip() else "24"
+        try:
+            hours = int(raw)
+        except ValueError:
+            hours = 24
+        since = datetime.now(UTC) - timedelta(hours=hours)
+        entries = get_roster(self.core.store, since=since, limit=30)
+        if not entries:
+            self._log_system(f"Roster: no stations heard in the last {hours}h.")
+            return
+        lines = [f"[b]Roster — last {hours}h:[/b]  {len(entries)} station(s)"]
+        for e in entries:
+            ts = e.last_seen.strftime("%m-%d %H:%M")
+            snr = f" SNR {e.last_snr:+.0f}" if e.last_snr is not None else ""
+            lines.append(
+                f"  [b]{e.callsign}[/b]  {e.transport}  {ts}{snr}  ×{e.message_count}"
+            )
+        self._log_system("\n".join(lines))
+
+    @work
+    async def _handle_start_command(self, arg: str) -> None:
+        """Launch or reconnect the backing process for a transport.
+
+        /start          — start the currently active transport's backing app
+        /start js8call  — start a specific transport by name
+        """
+        if self.core is None:
+            return
+        pm = getattr(self.core, "proc_manager", None)
+        if pm is None:
+            self._log_system("Process manager unavailable.")
+            return
+
+        name = (arg.strip().lower() or self.active_transport or "").strip()
+        if not name:
+            self._log_system("usage: /start [transport_name]  (or pick a mode first)")
+            return
+
+        if pm.definition(name) is None:
+            known = ", ".join(pm.known_transports())
+            self._log_system(
+                f"Unknown transport {name!r}. Manageable transports: {known}"
+            )
+            return
+
+        transport = next(
+            (t for t in self.core.transports if t.name == name), None
+        )
+        if transport is None:
+            self._log_system(
+                f"{name} is not enabled in your config. Add it to [transports.{name}]."
+            )
+            return
+
+        # Build the contextual prompt function so the modal runs in the TUI.
+        async def _prompt(transport_name: str, default_cmd: str) -> str | None:
+            result: list[str | None] = [None]
+            ev = asyncio.Event()
+
+            def _cb(val: str | None) -> None:
+                result[0] = val
+                ev.set()
+
+            self.app.push_screen(
+                LaunchCmdScreen(transport_name, default_cmd), _cb
+            )
+            await ev.wait()
+            return result[0]
+
+        # Show a status line before the potentially-slow launch.
+        if pm.is_running(name):
+            self._log_system(f"Reconnecting {name}…")
+        else:
+            self._log_system(f"Starting {name}…")
+
+        ok = await pm.start(name, transport, prompt_fn=_prompt)
+        if ok:
+            self._log_system(f"{name} ready.")
+            self._refresh_health()
+            self._update_status()
+        else:
+            self._log_system(
+                f"Failed to start {name}. Check logs or set "
+                f"[transports.{name}].launch_cmd in your config."
+            )
+
     def _handle_browse_command(self, arg: str) -> None:
         """Open the NomadNet page viewer: /browse <hash>[:/page/x.mu]."""
         if self.core is None:
             return
-        if not getattr(self.core, "browser", None) or not self.core.browser.available:
-            self._log_system(
-                "Reticulum is not running; the NomadNet browser is unavailable."
-            )
+        if not getattr(self.core, "browser", None):
+            self._log_system("NomadNet browser unavailable.")
             return
         if not arg:
             self._log_system("usage: /browse <hash>[:/page/x.mu]  (see /nodes)")
@@ -3295,7 +6044,19 @@ class RadioTUI(App):
         if not dest:
             self._log_system("usage: /browse <hash>[:/page/x.mu]")
             return
-        self.push_screen(BrowseScreen(self.core.browser, dest, path, fields))
+        # Offline is fine for cached pages; only dynamic (field_data) pages need
+        # a live link.
+        offline = not self.core.browser.available
+        if offline and fields:
+            self._log_system(
+                "Reticulum is down; dynamic pages need a live link."
+            )
+            return
+        if offline:
+            self._log_system("Reticulum is down — showing cached page (if any).")
+        self.push_screen(
+            BrowseScreen(self.core.browser, dest, path, fields, prefer_cache=offline)
+        )
 
     def _handle_nodes_command(self) -> None:
         """List discovered NomadNet nodes in the message log."""
@@ -3339,9 +6100,14 @@ class RadioTUI(App):
         if idx >= len(self._monitor_entries):
             return
         thread_key, transport = self._monitor_entries[idx]
+        self._open_thread(thread_key, transport)
+
+    def _open_thread(self, thread_key: str, transport: str) -> None:
+        """Open a conversation, switching the active mode to its transport."""
         # Entering a conversation switches the active mode to its transport.
         if transport and transport != self.active_transport:
             self.active_transport = transport
+            self._update_radio_claim()
             self._update_modebar()
         self.current_target = thread_key
         self.view = "active"
@@ -3351,6 +6117,202 @@ class RadioTUI(App):
         self._load_thread(thread_key)
         self._update_status()
         self.query_one("#composer", Input).focus()
+
+    # -- search palette -------------------------------------------------------
+
+    def action_search(self) -> None:
+        """Open the full-text history search palette (Ctrl+F)."""
+        self._show_search()
+
+    def action_close_search(self) -> None:
+        """Close the search palette, returning to the prior surface."""
+        if self.view != "search":
+            return
+        prev = self._search_prev_view
+        if prev == "monitor":
+            self._show_watch()
+        elif prev == "health":
+            self._show_health()
+        elif prev == "logs":
+            self._show_logs()
+        elif prev == "favorites":
+            self._show_favorites()
+        elif prev == "nomadnet":
+            self._show_nomadnet()
+        else:
+            self._show_active()
+
+    def _show_search(self) -> None:
+        """Show the search palette and focus its input.
+
+        Remembers the current surface so Esc can restore it. The global composer
+        is disabled here; the dedicated search box drives the query.
+        """
+        if self.view != "search":
+            self._search_prev_view = self.view
+        self.view = "search"
+        self.query_one("#main", ContentSwitcher).current = "search-view"
+        self._enable_composer(False)
+        self._update_modebar()
+        self._update_status()
+        box = self.query_one("#search-input", Input)
+        box.focus()
+        # Re-run the current term so reopening keeps prior results in view.
+        self._run_search(box.value.strip())
+
+    def _run_search(self, term: str) -> None:
+        """Execute a search and render ranked hits (newest/most-relevant first)."""
+        results = self.query_one("#search-results", ListView)
+        results.clear()
+        self._search_hits.clear()
+        term = (term or "").strip()
+        if self.core is None or not term:
+            return
+        try:
+            hits = self.core.store.search_ranked(term, limit=200)
+        except Exception:  # noqa: BLE001 - a bad query must never crash the UI
+            hits = []
+        if not hits:
+            results.append(ListItem(Label("[dim]No matches.[/dim]")))
+            self._search_hits.append(("", ""))
+            return
+        for hit in hits:
+            results.append(ListItem(Label(self._format_search_hit(hit))))
+            self._search_hits.append((hit.thread_key, hit.message.transport or ""))
+
+    def _format_search_hit(self, hit) -> str:
+        """Render one search result row: time · mode · sender · snippet."""
+        msg = hit.message
+        ts = msg.timestamp.strftime("%Y-%m-%d %H:%M")
+        name = msg.transport or "?"
+        color = self._mode_color(name)
+        mode_tag = f"[{color}]{name:<9}[/{color}]"
+        who = (
+            "[cyan]you[/cyan]"
+            if msg.status is not DeliveryStatus.RECEIVED
+            else msg.sender
+        )
+        snippet = self._render_snippet(hit.snippet)
+        return f"[dim]{ts}[/dim] {mode_tag} {who}: {snippet}"
+
+    @staticmethod
+    def _render_snippet(snippet: str) -> str:
+        """Escape Rich markup in a snippet, then apply match highlighting.
+
+        The store wraps matched terms in sentinel control chars (SNIPPET_OPEN/
+        CLOSE) that can't occur in real text, so we can safely escape first and
+        swap the sentinels for reverse-video markup afterward.
+        """
+        from ..core.store import SNIPPET_CLOSE, SNIPPET_OPEN
+
+        safe = snippet.replace("\\", "\\\\").replace("[", "\\[")
+        safe = safe.replace(SNIPPET_OPEN, "[reverse]").replace(
+            SNIPPET_CLOSE, "[/reverse]"
+        )
+        return safe
+
+    # -- "All chats" archive --------------------------------------------------
+
+    def action_archive(self) -> None:
+        """Open the cross-mode "All chats" archive surface."""
+        self._show_archive()
+
+    def _show_archive(self) -> None:
+        """Show every conversation across all modes (read-only), newest first."""
+        self.view = "archive"
+        self.query_one("#main", ContentSwitcher).current = "archive-view"
+        self._enable_composer(False)
+        self._render_archive()
+        self._update_modebar()
+        self._update_status()
+
+    def _render_archive(self) -> None:
+        """Render the conversation rollups, honouring the mode filter."""
+        try:
+            lst = self.query_one("#archive-list", ListView)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        lst.clear()
+        self._archive_rows.clear()
+        if self.core is None:
+            return
+        try:
+            summaries = self.core.store.thread_summaries()
+        except Exception:  # noqa: BLE001 - never let a query crash the UI
+            summaries = []
+        flt = self._archive_mode_filter
+        shown = [s for s in summaries if not flt or s.transport == flt]
+        if not shown:
+            msg = (
+                f"[dim]No conversations for '{flt}'.[/dim]"
+                if flt
+                else "[dim]No conversations yet.[/dim]"
+            )
+            lst.append(ListItem(Label(msg)))
+            self._archive_rows.append(("", ""))
+            self._update_archive_help(len(shown))
+            return
+        for s in shown:
+            lst.append(ListItem(Label(self._format_archive_row(s))))
+            self._archive_rows.append((s.thread_key, s.transport))
+        self._update_archive_help(len(shown))
+
+    def _format_archive_row(self, s) -> str:
+        """Render one archive row: date  mode  thread  count  last preview."""
+        ts = (s.last_ts or "")[:16].replace("T", " ")
+        name = s.transport or "?"
+        color = self._mode_color(name)
+        mode_tag = f"[{color}]{name:<9}[/{color}]"
+        who = (
+            "you"
+            if s.last_status not in ("received", "")
+            else (s.last_sender or "?")
+        )
+        preview = (s.last_content or "").replace("\n", " ")
+        if len(preview) > 48:
+            preview = preview[:47] + "\u2026"
+        preview = preview.replace("\\", "\\\\").replace("[", "\\[")
+        title = self._display_id(s.thread_key)
+        return (
+            f"[dim]{ts}[/dim] {mode_tag} [b]{title}[/b] "
+            f"[dim]({s.count})[/dim]  {who}: {preview}"
+        )
+
+    def _update_archive_help(self, count: int) -> None:
+        try:
+            help_line = self.query_one("#archive-help", Static)
+            btn = self.query_one("#archive-mode", Button)
+        except Exception:  # noqa: BLE001 - surface not mounted yet
+            return
+        flt = self._archive_mode_filter
+        scope = f"mode: {flt}" if flt else "all modes"
+        help_line.update(
+            f"All chats — {count} conversation(s), {scope} (read-only). "
+            "Enter opens one."
+        )
+        btn.label = f"\u25cf {flt}" if flt else "\u25cb Mode"
+
+    def _cycle_archive_filter(self) -> None:
+        """Cycle the archive's mode filter: all -> each transport -> all."""
+        if self.core is None:
+            return
+        names = [t.name for t in self.core.transports]
+        # Only offer filters for modes that actually have conversations, so the
+        # cycle never lands on an always-empty mode.
+        try:
+            present = {
+                s.transport for s in self.core.store.thread_summaries() if s.transport
+            }
+        except Exception:  # noqa: BLE001
+            present = set()
+        options: list[str | None] = [None] + [n for n in names if n in present]
+        try:
+            idx = options.index(self._archive_mode_filter)
+        except ValueError:
+            idx = 0
+        self._archive_mode_filter = options[(idx + 1) % len(options)]
+        self._render_archive()
+        self._update_status()
 
     # -- composer -------------------------------------------------------------
     def _enable_composer(self, enabled: bool) -> None:
@@ -3363,6 +6325,11 @@ class RadioTUI(App):
         )
 
     async def on_input_submitted(self, event: Input.Submitted) -> None:
+        # The dedicated search box drives the history palette; Enter just keeps
+        # the results (selection opens a thread). Route it before view logic.
+        if event.input.id == "search-input":
+            self._run_search(event.value.strip())
+            return
         # In NomadNet the bottom composer is repurposed as an address bar so the
         # input position stays put across modes - route by view, not widget id.
         # Slash-commands (/fav, /help, /quit, ...) must still work there, so we
@@ -3372,6 +6339,7 @@ class RadioTUI(App):
             event.input.value = ""
             if not addr:
                 return
+            self._push_cmd_history(addr)
             dest, path, fields = parse_address(addr)
             if not dest:
                 self._log_system("usage: <node hash>[:/page/x.mu]")
@@ -3384,16 +6352,65 @@ class RadioTUI(App):
             raw = event.value.strip()
             event.input.value = ""
             if raw:
+                self._push_cmd_history(raw)
                 self._add_favorite_from_input(raw)
             return
         text = event.value.strip()
         event.input.value = ""
         if not text:
             return
+        self._push_cmd_history(text)
+        # Hidden easter egg: the classic adventure magic word opens the About
+        # screen instead of sending. (Undocumented; see also the Ctrl+G chord.)
+        if text.lower() == "xyzzy":
+            self.action_about()
+            return
         if text.startswith("/"):
             await self._handle_command(text)
             return
+        # Enforce the active protocol's documented per-message size cap.
+        if not self._check_compose_limit(text):
+            event.input.value = text  # keep their text so they can trim it
+            self._update_status()
+            return
         self._send(text)
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        # Live, type-ahead history search (FTS prefix-matches the last word).
+        if event.input.id == "search-input":
+            if self.view == "search":
+                self._run_search(event.value.strip())
+            return
+        # Keep the live size counter in the status bar current as the operator
+        # types into the active mode's composer.
+        if (
+            event.input.id == "composer"
+            and self.view == "active"
+            and self._compose_limit
+        ):
+            try:
+                self._update_status()
+            except Exception:  # noqa: BLE001 - UI may be mid-teardown
+                pass
+
+    def _show_help(self) -> None:
+        """Print a mode-aware command list for ``/help``.
+
+        Shows the active mode's commands first (only those actually usable in
+        that panel — see ``_MODE_COMMAND_HELP``), then the universal commands
+        that work in every mode. With no mode picked yet, just point the
+        operator at F3 so the list isn't misleadingly empty.
+        """
+        mode = self.active_transport
+        if mode and mode in _MODE_COMMAND_HELP:
+            self._log_system(f"{mode} commands:")
+            for line in _MODE_COMMAND_HELP[mode]:
+                self._log_system(f"  {line}")
+        elif mode:
+            self._log_system(f"{mode}: no mode-specific commands.")
+        else:
+            self._log_system("Pick a mode (F3) to see its commands.")
+        self._log_system(f"Everywhere: {_UNIVERSAL_COMMAND_HELP}")
 
     async def _handle_command(self, text: str) -> None:
         parts = text.split(maxsplit=1)
@@ -3402,17 +6419,7 @@ class RadioTUI(App):
         if cmd in ("/quit", "/q", "/exit"):
             await self.action_quit()
         elif cmd == "/help":
-            self._log_system(
-                "Commands: /to <callsign|@GROUP> [message], /monitor (toggle), "
-                "/favorites (F6), /mode (cycle, like F3), "
-                "/fav add|rm|list|only [<id> [label]], "
-                "/browse <hash>[:/page/x.mu], /nodes, /peers, /refresh, "
-                "/channel list|add <index> <#name> [secret], "
-                "/freq [<MHz|Hz>], /band [<name>], "
-                "/subject <text>, /connect [gateway], /gateway <CALL>, /gateways, "
-                "/name <friendly name>, /close [<id>], "
-                "/whoami, /announce, /path [<id>], /quit"
-            )
+            self._show_help()
         elif cmd == "/to":
             if not self.active_transport:
                 self._log_system("Pick a mode first (press F3).")
@@ -3420,8 +6427,8 @@ class RadioTUI(App):
             if not arg:
                 self._log_system("usage: /to <callsign|@GROUP> [message]")
                 return
-            # Accept an optional trailing message: "/to @TTP SNR?" switches to the
-            # @TTP conversation AND sends "SNR?". Only the first token is the
+            # Accept an optional trailing message: "/to @EMS SNR?" switches to the
+            # @EMS conversation AND sends "SNR?". Only the first token is the
             # target; the remainder (if any) is sent as a message.
             target, _, trailing = arg.partition(" ")
             self.current_target = self._normalize_target(target)
@@ -3435,6 +6442,18 @@ class RadioTUI(App):
             self._show_watch()
         elif cmd in ("/favorites", "/favs"):
             self._show_favorites()
+        elif cmd == "/logs":
+            self._show_logs()
+        elif cmd in ("/loglevel", "/loglvl"):
+            self._set_log_level(arg)
+        elif cmd in ("/search", "/find"):
+            self._show_search()
+            if arg:
+                box = self.query_one("#search-input", Input)
+                box.value = arg
+                self._run_search(arg)
+        elif cmd in ("/chats", "/archive", "/all"):
+            self._show_archive()
         elif cmd == "/mode":
             # Typed convenience: cycle modes just like the F3 key.
             self.action_choose_mode()
@@ -3458,6 +6477,14 @@ class RadioTUI(App):
             self._handle_freq_command(arg)
         elif cmd == "/band":
             self._handle_band_command(arg)
+        elif cmd == "/inbox":
+            self._js8_show_inbox()
+        elif cmd == "/relay":
+            self._js8_relay(arg)
+        elif cmd == "/sms":
+            self._js8_send_sms(arg)
+        elif cmd == "/cmd":
+            self._js8_directed_cmd(arg)
         elif cmd in ("/name", "/rename"):
             self._set_friendly_name(arg)
         elif cmd in ("/close", "/delete"):
@@ -3470,12 +6497,28 @@ class RadioTUI(App):
             self.action_find_path()
         elif cmd == "/subject":
             self._set_winlink_subject(arg)
+        elif cmd == "/attach":
+            self._add_attachment(arg)
+        elif cmd == "/save":
+            self._winlink_save_attachments()
         elif cmd == "/connect":
             self._winlink_connect(arg or None)
         elif cmd in ("/gateway", "/gw"):
             self._set_winlink_gateway(arg)
         elif cmd == "/gateways":
             self._winlink_list_gateways()
+        elif cmd in ("/tmpl", "/template"):
+            self._handle_tmpl_command(arg)
+        elif cmd == "/bands":
+            self._handle_bands_command(arg)
+        elif cmd == "/sched":
+            self._handle_sched_command(arg)
+        elif cmd == "/roster":
+            self._handle_roster_command(arg)
+        elif cmd == "/start":
+            self._handle_start_command(arg)
+        elif cmd == "/net":
+            self._handle_net_command(arg)
         else:
             self._log_system(f"unknown command: {cmd}")
 
@@ -3489,9 +6532,34 @@ class RadioTUI(App):
         if not self.current_target:
             self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
             return
-        me = self.core.config.display_name
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None
+        if t and getattr(t, "carries_operator_identity", False):
+            me = str(t.config.get("callsign") or self.core.config.station.get("callsign", "") or "")
+        elif t:
+            display_getter = getattr(t, "local_display_name", None)
+            me = (display_getter() if callable(display_getter) else None) or ""
+        else:
+            me = str(self.core.config.station.get("callsign", "") or "")
+        # Winlink is email-style: the single-line composer can't hold real
+        # newlines, so let the operator type the literal escape "\n" to break the
+        # body into multiple lines. (Other transports keep the text verbatim.)
+        if self.active_transport == "winlink" and "\\n" in text:
+            text = text.replace("\\n", "\n")
+        # Radio interlock: a send on a continuous radio mode (JS8Call/Mercury)
+        # keys the shared HF radio, so refuse while another transport holds it.
+        # (Winlink sends only *queue* to Pat's outbox — the radio is keyed by the
+        # connect session, which is gated separately in _winlink_connect.)
+        il = self.core.radio_interlock
+        if self.active_transport in self._continuous_radio_modes():
+            dec = il.acquire(self.active_transport)
+            if not dec.granted:
+                self._log_system(
+                    f"\u26d4 radio busy: {dec.blocked_by} is using the radio. "
+                    f"Wait for it to finish (or stop it) before transmitting on "
+                    f"{self.active_transport}."
+                )
+                return
         if self.current_target.startswith("@"):
             if not (caps and caps.supports_groups):
                 self._log_system(
@@ -3507,6 +6575,19 @@ class RadioTUI(App):
             msg.metadata["subject"] = self._winlink_subject
             self._winlink_subject = ""
             self._update_winlink_bar()
+        # Attachments (any transport advertising supports_attachments — Winlink
+        # multipart email, Reticulum LXMF file fields). DIRECT-only: a group/
+        # broadcast send can't carry files, so keep the queue and warn instead.
+        if caps and caps.supports_attachments and self._attach_queue:
+            if self.current_target.startswith("@"):
+                self._log_system(
+                    "Attachments are only supported in direct messages; "
+                    "the queue was kept."
+                )
+            else:
+                msg.metadata["attach"] = list(self._attach_queue)
+                self._attach_queue = []
+                self._update_winlink_bar()
         # Send over the ACTIVE mode only (no auto-selection / fallback).
         ok = await self.core.router.send(msg, force_transport=self.active_transport)
         self._render_message(msg, outgoing=True, ok=ok)
@@ -3578,7 +6659,8 @@ class RadioTUI(App):
             tag = f" [magenta]@{msg.group}[/magenta]"
         log.write(
             f"[dim]{ts}[/dim] [yellow]\\[{via}][/yellow]{tag} {who}: "
-            f"{msg.content}{lock}{status}"
+            f"{self._subject_md(msg)}{msg.content}{lock}{status}"
+            f"{self._attachments_md(msg)}"
         )
 
     def _log_system(self, text: str) -> None:
@@ -3646,6 +6728,27 @@ class RadioTUI(App):
         who = f"{name} {shown}" if name else shown
         return f"{who} ({sec})"
 
+    def _log_badge_markup(self) -> str:
+        """Status-bar WARN/ERR badge from the in-memory log's peak severity.
+
+        Shows nothing while the Logs surface is open (the operator is already
+        looking at them, and opening it clears the peak). Clicking the badge
+        jumps straight to the Logs surface.
+        """
+        if self.view == "logs":
+            return ""
+        ring = self._log_ring()
+        if ring is None:
+            return ""
+        peak = ring.peak_level()
+        if peak >= logging.ERROR:
+            label, colour = "ERR", "red"
+        elif peak >= logging.WARNING:
+            label, colour = "WARN", "yellow"
+        else:
+            return ""
+        return f"    [@click=app.logs()][{colour}]\u26a0 {label}[/{colour}][/]"
+
     def _update_status(self) -> None:
         if self.core is None:
             return
@@ -3672,10 +6775,17 @@ class RadioTUI(App):
             (self.view == "monitor" and self._monitor_fav_only)
             or (self.view in ("active", "nomadnet") and self._active_fav_only)
         )
-        filt = "    [fav-only]" if fav_on else ""
+        if self.view == "monitor" and self._monitor_group_filter:
+            filt = f"    [group:@{self._monitor_group_filter}]"
+        elif fav_on:
+            filt = "    [fav-only]"
+        else:
+            filt = ""
+        counter = self._compose_counter_markup()
+        badge = self._log_badge_markup()
         self.query_one("#statusbar", Static).update(
             f" view: {self.view}    mode: {mode}{ident_part}    target: {target}    "
-            f"up: {up}{filt}"
+            f"up: {up}{filt}{badge}{counter}"
         )
 
 def run(config_path: str | None = None) -> None:

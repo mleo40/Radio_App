@@ -95,7 +95,11 @@ class TransportSelector:
         if mode is SelectionMode.OFFGRID and caps.needs_internet:
             return False
         # Size: the router may chunk, but reject what clearly cannot fit.
-        if msg.size > caps.max_message_size and not caps.supports_addressing:
+        if (
+            msg.size > caps.max_message_size
+            and not caps.supports_addressing
+            and not caps.supports_chunking
+        ):
             # broadcast-only tiny links can't carry oversize bodies
             return False
         # Reachability of the specific recipient/group right now.

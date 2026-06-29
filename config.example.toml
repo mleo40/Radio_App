@@ -3,8 +3,12 @@ favorites = [
 ]
 
 [general]
-display_name = "Anonymous"
 default_mode = "auto"
+# How many days of message history (and cached NomadNet pages) to keep. The
+# database grows over time, so on small devices set a positive number to
+# auto-prune anything older on startup. 0 = keep everything forever. You can
+# also prune on demand with 'radioapp db prune --days N' and reclaim space with
+# 'radioapp db vacuum'; 'radioapp db stats' shows the current size.
 history_retention_days = 0
 
 [station]
@@ -16,15 +20,27 @@ allow_encrypted_on_hf = false
 
 [storage]
 database = "conversations.db"
+# Single folder where ALL downloadable content is saved locally — Winlink
+# attachments, Reticulum/LXMF file attachments, etc. You're asked for this
+# during first-run setup, and every mode saves here. A relative path is taken
+# relative to this config file's folder. Blank = the default app data dir
+# ($XDG_DATA_HOME/radio_app/downloads, i.e. ~/.local/share/radio_app/downloads).
+download_dir = ""
 
 [transports.reticulum]
 enabled = true
 config_path = ""
-shared_instance = true
+# The app ONLY attaches to an external rnsd shared instance; it never starts its
+# own. If rnsd isn't running yet, it keeps retrying every reconnect_interval
+# seconds and attaches automatically once rnsd appears.
+reconnect_interval = 10
 announce_on_start = true
 announce_monitor = true
 display_name = ""
-manage_interface = false
+# Where received file attachments (LXMF file fields) are saved. Blank uses the
+# central [storage].download_dir (shared by all modes); set this only to give
+# Reticulum its own override.
+attachments_dir = ""
 
 [transports.reticulum.rnode]
 port = "/dev/ttyUSB0"
@@ -40,11 +56,12 @@ host = "127.0.0.1"
 port = 2442
 callsign = "N0CALL"
 presence_quiet_seconds = 600
-
-[transports.mercury]
-enabled = false
-host = "127.0.0.1"
-port = 7373
+# Command to launch JS8Call when you type /start or click ⚡ Start in the TUI.
+# Leave blank to use the built-in default ("js8call"). Set a full path if the
+# binary isn't on your PATH, or add arguments (e.g. "--rig IC7300").
+# launch_cmd = "js8call"
+# Seconds to wait for JS8Call's API port to open after spawning (default 15).
+# launch_wait_s = 15
 
 [transports.meshcore]
 enabled = false
@@ -53,6 +70,15 @@ port = "/dev/ttyACM0"
 baud = 115200
 host = "127.0.0.1"
 tcp_port = 5000
+# Display name shown in the Health board and radioapp status when the companion
+# device is offline. When the device is connected, its own reported node name
+# takes precedence. Set this to avoid showing "anon" before the device connects.
+# display_name = "MikeNode"
+# Prepend your node name to outbound channel messages ("Name: message").
+# Off by default — bare message content is sent and other MeshCore nodes
+# will not see a sender name. Enable if you share a channel with stock
+# MeshCore devices that rely on the name prefix for attribution.
+# prepend_name = false
 
 # Winlink (store-and-forward email over radio) via a separately-installed Pat
 # client (https://github.com/la5nta/pat). Pat is NOT bundled — install it
@@ -81,44 +107,96 @@ gateway = ""
 connect_url = ""
 # Seconds between inbox polls for newly received mail.
 poll_interval = 60
+# Where /save downloads received attachments. Blank uses the central
+# [storage].download_dir (shared by all modes); set this only to give Winlink
+# its own override.
+download_dir = ""
 # When true, each send immediately dials the gateway; when false (default),
 # messages queue in Pat's outbox for the next session you start.
 auto_connect = false
+# When true, the connect session log echoes Pat's full raw transcript (verbose,
+# and includes replayed backlog). Default false shows only concise live events
+# (dialing/connected, per-message transfer progress) plus a final summary.
+verbose_session_log = false
+# Command to launch Pat when you type /start or click ⚡ Start.
+# launch_cmd = "pat http"
+# launch_wait_s = 15
+# RF modem to auto-launch before a varahf/varafm connect session (Mercury,
+# VARA HF, etc.). Radio_App spawns this process when you connect and the modem
+# port (vara_port, default 8300) is not yet open. Blank = assume already running.
+# modem_cmd = "mercury"
+# Seconds to wait for the modem port to open after spawning (default 10).
+# modem_wait_s = 10
 
-[groups.TTP]
-display_name = "TTP Net"
+[transports.wsjt_x]
+enabled = false
+# UDP host to bind (0.0.0.0 listens on all interfaces; use 127.0.0.1 for
+# loopback-only if WSJT-X runs on the same machine).
+host = "0.0.0.0"
+# UDP port WSJT-X broadcasts on (default 2237; must match WSJT-X Settings →
+# Reporting → UDP Server port number).
+port = 2237
+# Host where WSJT-X is running (used when sending free-text back to WSJT-X).
+wsjtx_host = "127.0.0.1"
+# Your callsign, if you want Radio_App to identify traffic addressed to you.
+# Leave blank to learn it automatically from WSJT-X Status datagrams.
+callsign = "N0CALL"
+# Command to launch WSJT-X when you type /start or click ⚡ Start.
+# launch_cmd = "wsjtx"
+# launch_wait_s = 15
+
+[groups.EMS]
+display_name = "EMS Net"
 transports = [
     "js8call",
     "reticulum",
 ]
+# Cross-mode membership (INCOMING aggregation only — outbound fan-out is not
+# done yet). Membership is entirely operator-declared; the app never guesses
+# that two identities are "the same person". Manage these with the CLI:
+#   radioapp group EMS add js8call:KE0XYZ
+#   radioapp group EMS add reticulum:ff00112233...
+#   radioapp group EMS tag ems        # a JS8 @group or Winlink subject tag
+#   radioapp group EMS show
+# A member is "transport:identifier" (a bare "identifier" matches any
+# transport); hex hashes are prefix-tolerant, callsigns case-insensitive.
+members = [
+    "js8call:KE0XYZ",
+    "reticulum:ff00112233445566778899aabbccddeeff",
+]
+# Native group names / labels that also map a message into this group
+# regardless of who sent it (e.g. a JS8 @EMS group or a Winlink "ems" tag).
+tags = [
+    "ems",
+]
 
-[groups.TTPNE]
-display_name = "TTP NE Region"
+[groups.EMSNE]
+display_name = "EMS NE Region"
 transports = [
     "js8call",
 ]
 
 [subscriptions]
 groups = [
-    "TTP",
-    "TTPNE",
+    "EMS",
+    "EMSNE",
 ]
 show_unsubscribed = false
 
 [[filters]]
-name = "TTP on HF gets my attention"
+name = "EMS on HF gets my attention"
 action = "notify"
 
 [filters.match]
-group = "TTP"
+group = "EMS"
 transport = "js8call"
 
 [[filters]]
-name = "Keep all TTP* groups quietly"
+name = "Keep all EMS* groups quietly"
 action = "file"
 
 [filters.match]
-group = "TTP*"
+group = "EMS*"
 
 [[filters]]
 name = "Default"
@@ -130,7 +208,24 @@ theme = ""
 # transport (the default). Other options: a transport name (e.g. "meshcore",
 # "js8call", "reticulum"), "nomadnet", "watch", "health", or "favorites".
 home = ""
+# Max rows the Watch live feed keeps in memory (in-app scrollback only; full
+# history lives in the database). Bounded so a long session on a busy band can't
+# grow memory without limit. 0 = unbounded (not recommended on small devices).
+watch_buffer_limit = 1000
+
+# Distributor branding — normally set via config.dist.toml, not here.
+# Override these in your own config.toml only if you want to override what a
+# distribution package pre-configured. Terminal UIs cannot render raster images;
+# app_title and banner accept plain text / ASCII art only.
+# [ui.branding]
+# app_title = ""       # replaces "Radio_App" in the TUI header bar
+# banner = ""          # short ASCII art shown above the active-mode panel (muted color)
 
 [logging]
 file = "radio_app.log"
 level = "INFO"
+# Size-based rotation for the on-disk log file. max_bytes = 0 disables rotation
+# (the file then grows without bound). The in-app Logs surface is in-memory and
+# unaffected by these settings.
+max_bytes = 1048576   # rotate after ~1 MiB
+backup_count = 3      # keep radio_app.log.1 .. .3

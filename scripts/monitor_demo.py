@@ -28,7 +28,7 @@ async def main():
             recipient="me",
             metadata={"encrypted": True},
         )
-        m2 = UnifiedMessage.to_group("KE7XYZ", "TTP", "net in 5")
+        m2 = UnifiedMessage.to_group("KE7XYZ", "EMS", "net in 5")
         m2.transport = "js8call"
         await app.core.router._handle_inbound(m1)
         await app.core.router._handle_inbound(m2)

@@ -69,6 +69,72 @@ def test_local_display_name_reads_config():
     assert t.local_display_name() == "lab-node"
 
 
+def test_reticulum_advertises_attachment_support():
+    assert ReticulumTransport({}).capabilities().supports_attachments is True
+
+
+def test_read_attachments_reads_files_and_skips_missing(tmp_path):
+    good = tmp_path / "report.txt"
+    good.write_text("payload")
+    t = ReticulumTransport({})
+    files = t._read_attachments([str(good), str(tmp_path / "missing.bin")])
+    assert files == [("report.txt", b"payload")]  # missing path skipped
+
+
+def test_attachments_dir_honours_config(tmp_path):
+    target = tmp_path / "rx"
+    t = ReticulumTransport({"attachments_dir": str(target)})
+    assert t.attachments_dir() == str(target)
+
+
+def test_save_inbound_attachments_writes_and_deduplicates(tmp_path):
+    import os
+
+    import LXMF
+
+    t = ReticulumTransport({"attachments_dir": str(tmp_path / "rx")})
+
+    class _LXM:
+        fields = {
+            LXMF.FIELD_FILE_ATTACHMENTS: [
+                ["a.pdf", b"first"],
+                ["a.pdf", b"second"],   # same name -> de-duplicated on disk
+            ]
+        }
+
+    names, saved = t._save_inbound_attachments(_LXM(), "src123")
+    assert names == ["a.pdf", "a.pdf"]
+    assert [os.path.basename(p) for p in saved] == ["a.pdf", "a-1.pdf"]
+    assert all(os.path.exists(p) for p in saved)
+    assert open(saved[0], "rb").read() == b"first"
+    assert open(saved[1], "rb").read() == b"second"
+
+
+def test_save_inbound_attachments_path_traversal_is_neutralised(tmp_path):
+    import os
+
+    import LXMF
+
+    t = ReticulumTransport({"attachments_dir": str(tmp_path / "rx")})
+
+    class _LXM:
+        fields = {LXMF.FIELD_FILE_ATTACHMENTS: [["../../evil.sh", b"x"]]}
+
+    names, saved = t._save_inbound_attachments(_LXM(), "src")
+    # Reduced to a base name inside the attachments dir (no escaping it).
+    assert names == ["evil.sh"]
+    assert os.path.dirname(saved[0]) == str(tmp_path / "rx")
+
+
+def test_save_inbound_attachments_none_when_no_field():
+    t = ReticulumTransport({})
+
+    class _LXM:
+        fields: dict = {}
+
+    assert t._save_inbound_attachments(_LXM(), "src") == ([], [])
+
+
 def test_router_treats_delivery_as_telemetry(tmp_path):
     """A 'delivery' message must bypass storage/dedup but reach UI callbacks."""
     import asyncio

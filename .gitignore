@@ -27,6 +27,13 @@ radio_app.log
 # Local user config (the single source of truth lives outside the repo)
 config.toml
 
+# Distribution config (created by distributors who fork/patch the repo;
+# not shipped by the upstream repo — presence here is a local customization)
+src/radio_app/config.dist.toml
+
+# Local-only planning notes (not tracked)
+NEXT_STEPS.local.md
+
 # Stray literal "~" dir (accidental ~/.reticulum holding private identity keys)
 /~/
 
@@ -34,4 +41,5 @@ config.toml
 # of this repo). No trailing slash so the symlinks themselves are ignored too.
 mercury-src
 pat
+jtdxsync
 

@@ -7,6 +7,7 @@ which keeps the user interface a thin layer over a transport-agnostic core.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 
 from .config import Config
@@ -14,11 +15,16 @@ from .core.compliance import ComplianceGuard
 from .core.favorites import Favorites
 from .core.filters import FilterEngine
 from .core.groups import GroupRegistry
+from .core.net import NetManager
+from .core.nomad_cache import NomadPageCache
 from .core.nomadnet import NomadnetBrowser
+from .core.proc_manager import ProcManager
+from .core.radio_interlock import RadioInterlock
 from .core.router import Router
 from .core.selector import SelectionMode
 from .core.station import Station
 from .core.store import MessageStore
+from .core.timesource import WSJTXDTMonitor
 from .transports import load_transports
 
 log = logging.getLogger(__name__)
@@ -38,13 +44,27 @@ class App:
         )
         self.favorites = Favorites.from_config(config)
         self.transports = load_transports(config.enabled_transports())
+        # Radio interlock: the transports that drive the one physical HF radio
+        # (JS8Call, Pat/Winlink over an RF modem, Mercury) must not key up over
+        # each other. This single-owner token gates our transmit actions; the UI
+        # claims/releases it as the operator switches modes / runs sessions.
+        self.radio_interlock = RadioInterlock(self._radio_contenders())
+        self.proc_manager = ProcManager(config, self.radio_interlock)
+        self.net = NetManager(self.store)
         # HF transports route inbound traffic by our callsign (a message "TO" us
         # is DIRECT). Push the operator identity from [station] into any transport
         # that accepts it, so users don't have to duplicate it per transport block.
         self._apply_station_identity()
-        # Read-only NomadNet page browser over the Reticulum transport (if any).
+        # Tell every transport where downloaded content (attachments/files) goes,
+        # so all modes save into the one central directory the user picked at
+        # setup ([storage].download_dir). Done in-memory (not persisted per
+        # transport) so changing the central path updates every mode at once.
+        self._apply_download_dir()
+        # Read-only NomadNet page browser over the Reticulum transport (if any),
+        # with an offline page cache backed by the same database file.
         ret = next((t for t in self.transports if t.name == "reticulum"), None)
-        self.browser = NomadnetBrowser(ret)
+        self.nomad_cache = NomadPageCache(config.database_path())
+        self.browser = NomadnetBrowser(ret, cache=self.nomad_cache)
         self.router = Router(
             transports=self.transports,
             store=self.store,
@@ -54,11 +74,28 @@ class App:
             station=self.station,
             compliance=self.compliance,
         )
+        self.wsjtx_monitor = WSJTXDTMonitor()
         self._started = False
 
     @classmethod
     def from_config_path(cls, path: str | None = None) -> App:
         return cls(Config.load(path))
+
+    def _radio_contenders(self) -> list[str]:
+        """Names of transports that drive the one physical HF radio.
+
+        These are gated by the radio interlock so they don't transmit over each
+        other. Winlink reports this dynamically: it only contends when an RF
+        modem path is configured (telnet-only never touches the radio).
+        """
+        names: list[str] = []
+        for t in self.transports:
+            try:
+                if t.capabilities().uses_shared_radio:
+                    names.append(t.name)
+            except Exception:  # noqa: BLE001 - a bad capability never blocks startup
+                continue
+        return names
 
     def _default_mode(self) -> SelectionMode:
         try:
@@ -80,14 +117,38 @@ class App:
             if callable(setter):
                 setter(callsign, groups)
 
+    def apply_download_dir(self) -> None:
+        """Push the central download directory into every transport.
+
+        Transports that save downloaded content (e.g. Reticulum attachments)
+        expose ``set_download_dir``; others simply don't define it. Re-callable
+        at runtime so changing ``[storage].download_dir`` (e.g. via setup) takes
+        effect across all modes immediately.
+        """
+        path = str(self.config.download_dir())
+        for transport in self.transports:
+            setter = getattr(transport, "set_download_dir", None)
+            if callable(setter):
+                setter(path)
+
+    # Internal alias used during construction.
+    _apply_download_dir = apply_download_dir
+
     # -- lifecycle ------------------------------------------------------------
 
     async def start(self) -> None:
-        for transport in self.transports:
+        # Start every transport concurrently so a slow/unreachable one (e.g. a
+        # JS8Call host that's off the network, where the TCP connect sits in a
+        # multi-second SYN timeout) doesn't serialise startup behind itself.
+        async def _start_one(transport) -> None:
             try:
                 await transport.start()
             except Exception:  # noqa: BLE001
                 log.exception("failed to start transport %s", transport.name)
+
+        if self.transports:
+            await asyncio.gather(*(_start_one(t) for t in self.transports))
+        await self.wsjtx_monitor.start()
         # Apply retention policy on startup.
         days = int(self.config.general.get("history_retention_days", 0) or 0)
         if days > 0:
@@ -103,12 +164,15 @@ class App:
                 self.favorites.save(self.config)
         except Exception:  # noqa: BLE001 - never let persistence break shutdown
             log.exception("failed to persist favorites")
+        await self.proc_manager.stop_all()
         for transport in self.transports:
             try:
                 await transport.stop()
             except Exception:  # noqa: BLE001
                 log.exception("failed to stop transport %s", transport.name)
+        await self.wsjtx_monitor.stop()
         self.store.close()
+        self.nomad_cache.close()
         self._started = False
 
     @property

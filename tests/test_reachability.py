@@ -18,7 +18,6 @@ from radio_app.transports.base import (
     probe_tcp,
 )
 from radio_app.transports.js8call_transport import JS8CallTransport
-from radio_app.transports.mercury_transport import MercuryTransport
 from radio_app.transports.meshcore_transport import MeshCoreTransport
 
 
@@ -62,7 +61,7 @@ def test_probe_tcp_down_on_closed_port():
     assert status is ReachabilityStatus.DOWN
 
 
-@pytest.mark.parametrize("cls", [JS8CallTransport, MercuryTransport])
+@pytest.mark.parametrize("cls", [JS8CallTransport])
 def test_socket_transport_reachable_against_live_server(cls):
     async def run() -> ReachabilityStatus:
         async def _handle(reader, writer):  # noqa: ANN001
@@ -80,7 +79,7 @@ def test_socket_transport_reachable_against_live_server(cls):
     assert asyncio.run(run()) is ReachabilityStatus.OK
 
 
-@pytest.mark.parametrize("cls", [JS8CallTransport, MercuryTransport])
+@pytest.mark.parametrize("cls", [JS8CallTransport])
 def test_socket_transport_down_when_no_server(cls):
     transport = cls({"host": "127.0.0.1", "port": 1})
     assert asyncio.run(transport.check_reachable()) is ReachabilityStatus.DOWN
