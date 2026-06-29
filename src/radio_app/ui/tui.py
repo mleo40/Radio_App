@@ -1848,6 +1848,7 @@ class RadioTUI(App):
         # Full-text history search palette. Priority so it fires even while the
         # composer (or another Input) has focus.
         Binding("ctrl+f", "search", "Search", priority=True),
+        Binding("escape", "deselect_chat", "All messages", show=False, priority=True),
         Binding("escape", "close_search", "Close search", show=False, priority=True),
         # Hidden easter egg: technical "about" overview. show=False keeps it out
         # of the footer; priority lets it fire even while the composer is focused.
@@ -1887,6 +1888,9 @@ class RadioTUI(App):
         # Cycle the Watch stream group filter: only on the Watch surface.
         if action == "cycle_watch_group":
             return self.view == "monitor"
+        # Escape deselects the open chat (returns to full feed, keeps history).
+        if action == "deselect_chat":
+            return self.view == "active" and self.current_target is not None
         # Escape only closes the search palette while it's open (otherwise let
         # the key pass through to focused widgets).
         if action == "close_search":
@@ -2724,6 +2728,12 @@ class RadioTUI(App):
         self._log_system(
             f"replying to {self._display_id(ident)} — type a message and press Enter"
         )
+
+    def action_deselect_chat(self) -> None:
+        """Return to the full-feed view without deleting the thread (Escape)."""
+        self.current_target = None
+        if self.view == "active" and self.active_transport:
+            self._show_all_messages()
 
     def action_close_chat(self) -> None:
         """Close (delete) the open conversation, removing it from the list."""
