@@ -98,6 +98,31 @@ def lookup(
     return results
 
 
+_BAND_EDGES: tuple[tuple[str, int, int], ...] = (
+    ("160m", 1_800_000,  2_000_000),
+    ("80m",  3_500_000,  4_000_000),
+    ("60m",  5_330_000,  5_410_000),
+    ("40m",  7_000_000,  7_300_000),
+    ("30m", 10_100_000, 10_150_000),
+    ("20m", 14_000_000, 14_350_000),
+    ("17m", 18_068_000, 18_168_000),
+    ("15m", 21_000_000, 21_450_000),
+    ("12m", 24_890_000, 24_990_000),
+    ("10m", 28_000_000, 29_700_000),
+    ("6m",  50_000_000, 54_000_000),
+)
+
+
+def band_for_freq(hz: int | None) -> str | None:
+    """Return the amateur band name (e.g. ``"20m"``) for a frequency in Hz."""
+    if not hz:
+        return None
+    for name, lo, hi in _BAND_EDGES:
+        if lo <= hz <= hi:
+            return name
+    return None
+
+
 def format_mhz(freq_khz: float) -> str:
     """Format a kHz value as a MHz string, e.g. 7078.0 → '7.078 MHz'."""
     mhz = freq_khz / 1000.0

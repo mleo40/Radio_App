@@ -30,6 +30,7 @@ import logging
 import re
 import time
 
+from ..core.bandplan import band_for_freq
 from ..core.message import AddressType, UnifiedMessage
 from .base import ReachabilityStatus, Transport, TransportCapabilities, probe_tcp
 
@@ -294,21 +295,6 @@ JS8_BAND_DIAL_HZ: dict[str, int] = {
     "6m": 50_318_000,
 }
 
-# Amateur HF/6m band edges (Hz) for labelling an arbitrary dial frequency.
-_BAND_EDGES: tuple[tuple[str, int, int], ...] = (
-    ("160m", 1_800_000, 2_000_000),
-    ("80m", 3_500_000, 4_000_000),
-    ("60m", 5_330_000, 5_410_000),
-    ("40m", 7_000_000, 7_300_000),
-    ("30m", 10_100_000, 10_150_000),
-    ("20m", 14_000_000, 14_350_000),
-    ("17m", 18_068_000, 18_168_000),
-    ("15m", 21_000_000, 21_450_000),
-    ("12m", 24_890_000, 24_990_000),
-    ("10m", 28_000_000, 29_700_000),
-    ("6m", 50_000_000, 54_000_000),
-)
-
 # JS8Call submode speeds: STATION.STATUS reports SPEED as a small int.
 _SPEED_NAMES = {
     "0": "normal",
@@ -316,16 +302,6 @@ _SPEED_NAMES = {
     "2": "turbo",
     "4": "slow",
 }
-
-
-def band_for_freq(hz: int | None) -> str | None:
-    """Return the amateur band name (e.g. ``"20m"``) for a dial frequency in Hz."""
-    if not hz:
-        return None
-    for name, lo, hi in _BAND_EDGES:
-        if lo <= hz <= hi:
-            return name
-    return None
 
 
 def dial_for_band(band: str | None) -> int | None:
@@ -742,6 +718,10 @@ class JS8CallTransport(Transport):
                 msg.recipient or (f"@{msg.group}" if msg.group else "?"),
                 msg.content,
             )
+            if self._dial_freq:
+                band = band_for_freq(self._dial_freq)
+                if band:
+                    msg.metadata["band"] = band
             await self._emit(msg)
 
     async def _emit_presence(self, callsign: str, params: dict) -> None:

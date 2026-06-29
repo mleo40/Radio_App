@@ -113,6 +113,9 @@ def _build_parser() -> argparse.ArgumentParser:
         help="shorthand for --since/--until covering one whole day",
     )
     p_history.add_argument(
+        "--band", metavar="BAND", help="only messages on this band (e.g. 40m)"
+    )
+    p_history.add_argument(
         "--format", choices=["text", "json"], default="text"
     )
     p_history.set_defaults(func=_cmd_history)
@@ -463,6 +466,14 @@ def _build_parser() -> argparse.ArgumentParser:
                          help="US (default) or INTL")
     p_bands.add_argument("--transport", metavar="TRANSPORT",
                          help="filter by transport: js8call, winlink")
+    p_bands.add_argument(
+        "--stats", action="store_true",
+        help="show band activity from message history instead of the frequency reference",
+    )
+    p_bands.add_argument(
+        "--since", metavar="YYYY-MM-DD",
+        help="for --stats: only count messages on/after this date",
+    )
     p_bands.set_defaults(func=_cmd_bands)
 
     p_sched = sub.add_parser("schedule", help="manage scheduled / deferred sends")
@@ -681,7 +692,9 @@ def _parse_when(value: str, *, end: bool) -> datetime:
 
 def _format_message_line(m, *, show_thread: bool = False) -> str:
     ts = m.timestamp.strftime("%Y-%m-%d %H:%M")
-    via = f"[{m.transport or '?'}]"
+    band = m.metadata.get("band", "")
+    band_tag = f"/{band}" if band else ""
+    via = f"[{m.transport or '?'}{band_tag}]"
     tgt = f"@{m.group}" if m.group else (m.recipient or "")
     arrow = f" -> {tgt}" if tgt else ""
     where = f" {{{m.thread_key}}}" if show_thread else ""
@@ -746,6 +759,7 @@ def _cmd_history(args: argparse.Namespace) -> int:
             until=until,
             status=getattr(args, "status", None),
             snr_min=getattr(args, "snr_min", None),
+            band=getattr(args, "band", None),
             limit=args.limit,
             newest_first=False,  # read like a conversation (oldest-first)
         )
@@ -1040,8 +1054,48 @@ def _cmd_time(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_band_stats(args: argparse.Namespace) -> int:
+    """Show aggregate band activity from the message store."""
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+    since = None
+    if getattr(args, "since", None):
+        try:
+            since = _parse_when(args.since, end=False)
+        except ValueError:
+            print("error: --since must be YYYY-MM-DD or ISO 8601", file=sys.stderr)
+            store.close()
+            return 2
+    try:
+        transport = getattr(args, "transport", None)
+        stats = store.band_stats(transport=transport, since=since)
+    finally:
+        store.close()
+    if not stats:
+        print("No band activity recorded yet.")
+        print("(Tip: band data is stamped on JS8Call and WSJT-X messages as they arrive.)")
+        return 0
+    total = sum(stats.values())
+    since_str = f" since {args.since}" if getattr(args, "since", None) else ""
+    tp_str = f" [{transport}]" if transport else ""
+    print(f"Band activity{tp_str}{since_str}:")
+    print(f"  {'Band':<8} {'Messages':>8}    {'%':>5}")
+    print("  " + "-" * 28)
+    for band, count in stats.items():
+        pct = 100.0 * count / total
+        print(f"  {band:<8} {count:>8}    {pct:>4.1f}%")
+    print("  " + "-" * 28)
+    print(f"  {'Total':<8} {total:>8}")
+    return 0
+
+
 def _cmd_bands(args: argparse.Namespace) -> int:
     """Print the band-plan / EmComm frequency reference with live conditions."""
+    if getattr(args, "stats", False):
+        return _cmd_band_stats(args)
+
     from .core.bandplan import format_mhz, lookup
     from .core.propagation import fetch_sync
 

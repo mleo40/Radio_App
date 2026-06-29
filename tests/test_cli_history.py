@@ -336,3 +336,121 @@ def test_cli_search_status_filter(seeded_with_meta, capsys):
     out = capsys.readouterr().out
     assert "good signal" in out or "weak signal" in out
 
+
+# -- band filter / band_stats -------------------------------------------------
+
+
+@pytest.fixture()
+def seeded_with_band(tmp_path, monkeypatch):
+    """A seeded DB with band metadata on some messages."""
+    db = tmp_path / "band.db"
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(f'[storage]\ndatabase = "{db}"\n')
+    monkeypatch.setenv("RADIO_APP_CONFIG", str(cfg))
+
+    store = MessageStore(db)
+    base = datetime(2026, 6, 20, 12, 0, tzinfo=UTC)
+    msgs = [
+        UnifiedMessage(
+            sender="W1AW", content="cq on 20m",
+            transport="js8call", status=DeliveryStatus.RECEIVED,
+            timestamp=base, metadata={"band": "20m"},
+        ),
+        UnifiedMessage(
+            sender="KE0XYZ", content="reply on 20m",
+            transport="js8call", status=DeliveryStatus.RECEIVED,
+            timestamp=base + timedelta(hours=1), metadata={"band": "20m"},
+        ),
+        UnifiedMessage(
+            sender="N0CALL", content="cq on 40m",
+            transport="js8call", status=DeliveryStatus.RECEIVED,
+            timestamp=base + timedelta(hours=2), metadata={"band": "40m"},
+        ),
+        UnifiedMessage(
+            sender="AB1CD", content="no band info",
+            transport="reticulum", status=DeliveryStatus.RECEIVED,
+            timestamp=base + timedelta(hours=3), metadata={},
+        ),
+    ]
+    for m in msgs:
+        store.save(m)
+    store.close()
+    return cfg
+
+
+def test_query_band_filter(seeded_with_band):
+    s = _store(seeded_with_band)
+    try:
+        msgs = s.query(band="20m")
+        assert len(msgs) == 2
+        assert all(m.metadata.get("band") == "20m" for m in msgs)
+    finally:
+        s.close()
+
+
+def test_query_band_filter_no_match(seeded_with_band):
+    s = _store(seeded_with_band)
+    try:
+        assert s.query(band="17m") == []
+    finally:
+        s.close()
+
+
+def test_band_stats_counts(seeded_with_band):
+    s = _store(seeded_with_band)
+    try:
+        stats = s.band_stats()
+        assert stats["20m"] == 2
+        assert stats["40m"] == 1
+        assert "reticulum" not in stats  # no-band message excluded
+    finally:
+        s.close()
+
+
+def test_band_stats_transport_filter(seeded_with_band):
+    s = _store(seeded_with_band)
+    try:
+        stats = s.band_stats(transport="js8call")
+        assert set(stats.keys()) == {"20m", "40m"}
+    finally:
+        s.close()
+
+
+def test_band_stats_empty_when_no_band_data(tmp_path):
+    s = MessageStore(tmp_path / "empty.db")
+    try:
+        assert s.band_stats() == {}
+    finally:
+        s.close()
+
+
+def test_cli_history_band_filter(seeded_with_band, capsys):
+    assert main(["history", "--band", "40m"]) == 0
+    out = capsys.readouterr().out
+    assert "cq on 40m" in out
+    assert "cq on 20m" not in out
+
+
+def test_cli_history_band_in_output_line(seeded_with_band, capsys):
+    assert main(["history", "--band", "20m"]) == 0
+    out = capsys.readouterr().out
+    assert "[js8call/20m]" in out
+
+
+def test_cli_bands_stats(seeded_with_band, capsys):
+    assert main(["bands", "--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "20m" in out
+    assert "40m" in out
+    assert "2" in out  # count for 20m
+
+
+def test_cli_bands_stats_empty(monkeypatch, capsys, tmp_path):
+    cfg = tmp_path / "config.toml"
+    db = tmp_path / "empty.db"
+    cfg.write_text(f'[storage]\ndatabase = "{db}"\n')
+    monkeypatch.setenv("RADIO_APP_CONFIG", str(cfg))
+    assert main(["bands", "--stats"]) == 0
+    out = capsys.readouterr().out
+    assert "No band activity" in out
+
