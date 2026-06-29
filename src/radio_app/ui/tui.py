@@ -4123,7 +4123,8 @@ class RadioTUI(App):
         for btn in bar.query(Button):
             bid = btn.id or ""
             if bid == "mode-nomadnet":
-                btn.label = f"{self._health_dot('nomadnet')} nomadnet"
+                short = self._MODE_SHORT_LABELS.get("nomadnet", "Nomad")
+                btn.label = f"{self._health_dot('nomadnet')} {short}"
                 btn.set_class(current == "nomadnet", "-active")
                 btn.set_class(
                     self._health.get("nomadnet") is ReachabilityStatus.DOWN,
@@ -4131,7 +4132,8 @@ class RadioTUI(App):
                 )
             elif bid.startswith("mode-"):
                 name = bid[len("mode-"):]
-                btn.label = f"{self._health_dot(name)} {name}"
+                short = self._MODE_SHORT_LABELS.get(name, name)
+                btn.label = f"{self._health_dot(name)} {short}"
                 btn.set_class(
                     self.view == "active" and current == name,
                     "-active",
