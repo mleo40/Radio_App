@@ -4189,10 +4189,9 @@ class RadioTUI(App):
         from ..core.message import UnifiedMessage as _UM
         import datetime as _dt
         msg = _UM(
-            id=f"wx-inet-{grid}-{int(_dt.datetime.now(_dt.timezone.utc).timestamp())}",
+            msg_id=f"wx-inet-{grid}-{int(_dt.datetime.now(_dt.timezone.utc).timestamp())}",
             transport="internet",
             sender="NWS/Open-Meteo",
-            recipient=None,
             content=text,
             timestamp=_dt.datetime.now(_dt.timezone.utc),
             metadata={
