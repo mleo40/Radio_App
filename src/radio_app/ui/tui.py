@@ -1889,7 +1889,10 @@ class RadioTUI(App):
         if action == "cycle_watch_group":
             return self.view == "monitor"
         # Escape deselects the open chat (returns to full feed, keeps history).
+        # Don't steal Escape from modal screens — let them handle it themselves.
         if action == "deselect_chat":
+            if len(self.screen_stack) > 1:
+                return False
             return self.view == "active" and self.current_target is not None
         # Escape only closes the search palette while it's open (otherwise let
         # the key pass through to focused widgets).
@@ -2076,6 +2079,9 @@ class RadioTUI(App):
                     )
                     yield Button(
                         "\U0001f4e1 Connect", id="winlink-connect", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4e5 Outbox", id="winlink-outbox", classes="modebtn"
                     )
                     yield Button(
                         "\u2630 Gateways", id="winlink-gateways", classes="modebtn"
@@ -3237,6 +3243,8 @@ class RadioTUI(App):
             self._winlink_open_forms()
         elif bid == "winlink-connect":
             self._winlink_connect()
+        elif bid == "winlink-outbox":
+            self._winlink_show_outbox()
         elif bid == "winlink-gateways":
             self._winlink_list_gateways()
         elif bid == "fav-remove":
@@ -5566,8 +5574,8 @@ class RadioTUI(App):
                 btn.disabled = not down
             elif btn.id == "winlink-connect":
                 btn.disabled = down
-            # All other buttons (Compose, Subject, Forms, Gateways) work
-            # offline: compose and queue now, connect later.
+            # All other buttons (Compose, Subject, Forms, Outbox, Gateways)
+            # work regardless of Pat's state.
         if not show:
             return
         t = self._winlink_transport()
@@ -5636,9 +5644,17 @@ class RadioTUI(App):
             self._log_system(f"Winlink template fetch failed: {exc}")
             return
         fields = detect_form_fields(text or "")
-        result = await self.push_screen_wait(
-            WinlinkComposeFormScreen(template, fields)
+        self._log_system(
+            f"Winlink: form [b]{template}[/b] "
+            + (f"({len(fields)} fields)" if fields else "(no prompt fields — fill To/Subject)")
         )
+        try:
+            result = await self.push_screen_wait(
+                WinlinkComposeFormScreen(template, fields)
+            )
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink form compose failed: {exc}")
+            return
         if not result:
             return
         if not getattr(t, "running", False):
@@ -6120,6 +6136,34 @@ class RadioTUI(App):
             "Click a callsign above, or use [b]/gateway <CALL>[/b] then "
             "[b]Connect[/b]."
         )
+
+    @work
+    async def _winlink_show_outbox(self) -> None:
+        """Show Pat's outbox queue in the message log."""
+        t = self._winlink_transport()
+        if t is None or not hasattr(t, "list_outbox"):
+            self._log_system("Winlink is not enabled.")
+            return
+        try:
+            items = await t.list_outbox()
+        except Exception as exc:  # noqa: BLE001
+            self._log_system(f"Winlink outbox fetch failed: {exc}")
+            return
+        if not items:
+            self._log_system("Winlink outbox is empty.")
+            return
+        self._log_system(f"Winlink outbox ({len(items)} queued — Connect to send):")
+        log = self.query_one("#messages", RichLog)
+        for item in items:
+            to = item.get("to") or "(no address)"
+            subj = item.get("subject") or "(no subject)"
+            mid = item.get("mid") or ""
+            size = item.get("size") or 0
+            size_str = f"{size // 1024} KB" if size >= 1024 else f"{size} B"
+            log.write(
+                f"  [b]To:[/b] {to}  [b]Subj:[/b] {subj}  "
+                f"[dim]{size_str} · {mid}[/dim]"
+            )
 
     def _js8_transport(self) -> Transport | None:
         """The live JS8CallTransport instance, or None when not configured."""

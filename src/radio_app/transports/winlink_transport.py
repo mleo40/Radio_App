@@ -834,6 +834,35 @@ class WinlinkTransport(Transport):
         mids = await self._outbox_mids()
         return None if mids is None else len(mids)
 
+    async def list_outbox(self) -> list[dict]:
+        """Full outbox listing: ``[{"mid","to","subject","date","size"}]``.
+
+        Returns an empty list when the outbox is empty or Pat is unreachable.
+        Keys are normalised to lowercase; unknown fields default to empty string.
+        """
+        try:
+            raw = await asyncio.to_thread(
+                self._http_get, "/api/mailbox/out", _HTTP_TIMEOUT_S
+            )
+            data = json.loads(raw) or []
+        except Exception as exc:  # noqa: BLE001
+            log.warning("Winlink outbox list failed: %s", exc)
+            return []
+        if not isinstance(data, list):
+            return []
+        result = []
+        for e in data:
+            if not isinstance(e, dict):
+                continue
+            result.append({
+                "mid": str(e.get("MID") or e.get("mid") or ""),
+                "to": str(e.get("To") or e.get("to") or ""),
+                "subject": str(e.get("Subject") or e.get("subject") or ""),
+                "date": str(e.get("Date") or e.get("date") or ""),
+                "size": int(e.get("Size") or e.get("size") or 0),
+            })
+        return result
+
     async def _reconcile_outbox(self) -> None:
         """Emit a delivery receipt for any tracked message that left the outbox.
 
