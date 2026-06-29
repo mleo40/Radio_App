@@ -95,7 +95,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/chats, "
     "/tmpl [list|<name>|add <n> <text>|del <n>], "
     "/bands [<band>|activity [<band>]], "
-    "/sched [list|cancel <id>|+Nm|HH:MM [text]], "
+    "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
     "/subs [add|rm @GROUP], "
     "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
@@ -6613,13 +6613,20 @@ class RadioTUI(App):
         except Exception:  # noqa: BLE001
             return
         for entry in pending:
-            ok = await self.core.router.send(
-                entry.message, force_transport=entry.transport
-            )
-            self.core.store.schedule_mark_sent(entry.id, success=ok)
-            status_str = "sent" if ok else "[red]FAILED[/red]"
-            preview = entry.message.content[:40]
-            self._log_system(f"Scheduled message {status_str}: {preview!r}")
+            kind = entry.message.metadata.get("kind")
+            if kind == "band_change":
+                ok = await self._fire_scheduled_band_change(entry)
+                self.core.store.schedule_mark_sent(entry.id, success=ok)
+                if ok and entry.message.metadata.get("recur_daily"):
+                    self._reschedule_daily_band_change(entry)
+            else:
+                ok = await self.core.router.send(
+                    entry.message, force_transport=entry.transport
+                )
+                self.core.store.schedule_mark_sent(entry.id, success=ok)
+                status_str = "sent" if ok else "[red]FAILED[/red]"
+                preview = entry.message.content[:40]
+                self._log_system(f"Scheduled message {status_str}: {preview!r}")
 
     # -- input-mode detection -------------------------------------------------
     def _note_input(self, mode: str) -> None:
@@ -7484,18 +7491,20 @@ class RadioTUI(App):
         self._log_system("\n".join(lines))
 
     def _handle_sched_command(self, arg: str) -> None:
-        """Schedule, list, or cancel deferred sends.
+        """Schedule, list, or cancel deferred sends and band changes.
 
         Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
                /sched list  — show pending queue
                /sched cancel <id>  — cancel a pending scheduled message
+               /sched band <band> <time> [daily]  — schedule a JS8Call band change
         """
         from ..core.message import UnifiedMessage
 
         parts = arg.strip().split(None, 1)
         if not parts:
             self._log_system(
-                "Usage: /sched +30m | HH:MM [text] | list | cancel <id>"
+                "Usage: /sched +30m | HH:MM [text] | list | cancel <id> "
+                "| band <band> <time> [daily]"
             )
             return
 
@@ -7509,17 +7518,30 @@ class RadioTUI(App):
             lines = [f"[b]Scheduled messages[/b] ({len(pending)} pending):"]
             for e in pending:
                 ts = e.fire_at.strftime("%H:%M UTC")
-                target = e.message.recipient or (
-                    f"@{e.message.group}" if e.message.group else "?"
-                )
-                preview = e.message.content[:40]
                 short_id = e.id[:8]
-                lines.append(
-                    f"  [b]{ts}[/b]  → {target}  [dim]{preview!r}[/dim]"
-                    f"  [dim](id:{short_id})[/dim]"
-                )
+                kind = e.message.metadata.get("kind")
+                if kind == "band_change":
+                    band = e.message.metadata.get("band", "?")
+                    daily = " [dim](daily)[/dim]" if e.message.metadata.get("recur_daily") else ""
+                    lines.append(
+                        f"  [b]{ts}[/b]  → [b]{band}[/b] [dim](band change){daily}[/dim]"
+                        f"  [dim](id:{short_id})[/dim]"
+                    )
+                else:
+                    target = e.message.recipient or (
+                        f"@{e.message.group}" if e.message.group else "?"
+                    )
+                    preview = e.message.content[:40]
+                    lines.append(
+                        f"  [b]{ts}[/b]  → {target}  [dim]{preview!r}[/dim]"
+                        f"  [dim](id:{short_id})[/dim]"
+                    )
             lines.append("[dim]/sched cancel <id> to cancel[/dim]")
             self._log_system("\n".join(lines))
+            return
+
+        if parts[0].lower() == "band":
+            self._handle_sched_band_command(parts[1].strip() if len(parts) > 1 else "")
             return
 
         if parts[0].lower() == "cancel":
@@ -7610,6 +7632,121 @@ class RadioTUI(App):
         self.core.store.schedule_add(msg, fire_at)
         ts = fire_at.strftime("%H:%M UTC")
         self._log_system(f"Message scheduled for {ts}: {content[:40]!r}")
+
+    def _handle_sched_band_command(self, arg: str) -> None:
+        """Parse and schedule a JS8Call band change.
+
+        Syntax: <band> <time> [daily]
+        Examples:
+          /sched band 40m 20:00
+          /sched band 20m +2h daily
+        """
+        if self.core is None:
+            return
+        from ..core.message import AddressType, UnifiedMessage
+        from ..transports.js8call_transport import dial_for_band
+
+        parts = arg.split()
+        if len(parts) < 2:
+            self._log_system(
+                "usage: /sched band <band> <time> [daily]\n"
+                "  e.g. /sched band 40m 20:00\n"
+                "       /sched band 20m +2h daily"
+            )
+            return
+        band = parts[0].lower()
+        time_spec = parts[1]
+        recur_daily = len(parts) >= 3 and parts[2].lower() == "daily"
+
+        # Validate band name.
+        if dial_for_band(band) is None:
+            from ..core.bandplan import lookup
+            known = sorted({e.band for e in lookup(region="US")})
+            self._log_system(
+                f"Unknown band '{band}'. Valid bands: {', '.join(known)}"
+            )
+            return
+
+        now = datetime.now(UTC)
+        try:
+            if time_spec.startswith("+"):
+                raw = time_spec[1:].lower()
+                if "h" in raw and "m" in raw:
+                    h_part, rest = raw.split("h")
+                    mins = int(h_part) * 60 + int(rest.rstrip("m"))
+                elif "h" in raw:
+                    mins = int(raw.rstrip("h")) * 60
+                else:
+                    mins = int(raw.rstrip("m"))
+                fire_at = now + timedelta(minutes=mins)
+            else:
+                hh, mm = time_spec.split(":")
+                fire_at = now.replace(
+                    hour=int(hh), minute=int(mm), second=0, microsecond=0
+                )
+                if fire_at <= now:
+                    fire_at += timedelta(days=1)
+        except (ValueError, AttributeError):
+            self._log_system("Invalid time. Use: /sched band 40m 20:00  or  +2h")
+            return
+
+        name = self.core.station.callsign or "scheduler"
+        msg = UnifiedMessage(
+            sender=name,
+            content=f"Band change: {band}",
+            address_type=AddressType.BROADCAST,
+            metadata={"kind": "band_change", "band": band, "recur_daily": recur_daily},
+            transport="js8call",
+        )
+        self.core.store.schedule_add(msg, fire_at, transport="js8call")
+        ts = fire_at.strftime("%H:%M UTC")
+        repeat = " (daily)" if recur_daily else ""
+        self._log_system(f"Band change to {band} scheduled for {ts}{repeat}.")
+
+    async def _fire_scheduled_band_change(self, entry) -> bool:
+        """Execute a due band-change scheduled entry.
+
+        Skips (logs + returns False) when JS8Call is not running or when another
+        transport currently holds the radio interlock.
+        """
+        band = entry.message.metadata.get("band", "?")
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system(
+                f"⏰ Band change to {band} skipped — JS8Call not running."
+            )
+            return False
+        blocker = self.core.radio_interlock.blocked_by("js8call")
+        if blocker is not None:
+            self._log_system(
+                f"⏰ Band change to {band} skipped — radio busy ({blocker})."
+            )
+            return False
+        from ..transports.js8call_transport import dial_for_band
+        hz = dial_for_band(band)
+        if hz is None:
+            self._log_system(f"⏰ Band change: unknown band '{band}'.")
+            return False
+        ok = await t.set_dial_freq(hz)
+        if ok:
+            self._log_system(f"⏰ Band changed to [b]{band}[/b] as scheduled.")
+            self._update_js8_bar()
+        else:
+            self._log_system(f"⏰ Band change to {band} failed — JS8Call API error.")
+        return ok
+
+    def _reschedule_daily_band_change(self, entry) -> None:
+        """Re-queue a daily band-change entry for the next day."""
+        from ..core.message import AddressType, UnifiedMessage
+        new_fire = entry.fire_at + timedelta(days=1)
+        msg = UnifiedMessage(
+            sender=entry.message.sender,
+            content=entry.message.content,
+            address_type=AddressType.BROADCAST,
+            metadata=dict(entry.message.metadata),
+            transport="js8call",
+        )
+        self.core.store.schedule_add(msg, new_fire, transport="js8call")
 
     def _handle_roster_command(self, arg: str) -> None:
         """Show the presence roster (recently-heard callsigns)."""

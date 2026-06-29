@@ -499,6 +499,19 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sched_cancel = sched_sub.add_parser("cancel", help="cancel a scheduled message")
     p_sched_cancel.add_argument("id", help="message id (from schedule list)")
 
+    p_sched_band = sched_sub.add_parser(
+        "band", help="schedule a JS8Call band change"
+    )
+    p_sched_band.add_argument("band", help="band name, e.g. 40m, 20m")
+    p_sched_band.add_argument(
+        "time",
+        help="UTC time HH:MM or relative delay (+30m, +2h)",
+    )
+    p_sched_band.add_argument(
+        "--daily", action="store_true",
+        help="repeat every day at this time",
+    )
+
     p_sched.set_defaults(func=_cmd_schedule)
 
     p_roster = sub.add_parser("roster", help="show recently-heard stations")
@@ -1164,6 +1177,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     action = getattr(args, "sched_action", None) or "list"
 
     try:
+        if action == "cancel":
+            ok = store.schedule_cancel(args.id)
+            print("Cancelled." if ok else f"No pending message with id '{args.id}'.")
+            return 0 if ok else 1
+
         if action == "list":
             entries = store.schedule_pending()
             if not entries:
@@ -1171,14 +1189,63 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 return 0
             for e in entries:
                 ts = e.fire_at.strftime("%Y-%m-%d %H:%M UTC")
-                tp = f" [{e.transport}]" if e.transport else ""
-                print(f"  {e.id[:8]}  {ts}{tp}  {e.message.content[:60]!r}")
+                kind = e.message.metadata.get("kind")
+                if kind == "band_change":
+                    band_name = e.message.metadata.get("band", "?")
+                    daily = " [daily]" if e.message.metadata.get("recur_daily") else ""
+                    print(f"  {e.id[:8]}  {ts}  [band change → {band_name}]{daily}")
+                else:
+                    tp = f" [{e.transport}]" if e.transport else ""
+                    print(f"  {e.id[:8]}  {ts}{tp}  {e.message.content[:60]!r}")
             return 0
 
-        if action == "cancel":
-            ok = store.schedule_cancel(args.id)
-            print("Cancelled." if ok else f"No pending message with id '{args.id}'.")
-            return 0 if ok else 1
+        if action == "band":
+            from .core.message import AddressType
+            from .transports.js8call_transport import dial_for_band
+            band_name = args.band.lower()
+            if dial_for_band(band_name) is None:
+                print(f"error: unknown band '{band_name}'", file=sys.stderr)
+                return 2
+            time_spec = args.time.strip()
+            now = datetime.now(UTC)
+            try:
+                if time_spec.startswith("+"):
+                    raw = time_spec[1:].lower()
+                    if "h" in raw and "m" in raw:
+                        h_part, rest = raw.split("h")
+                        minutes = int(h_part) * 60 + int(rest.rstrip("m"))
+                    elif "h" in raw:
+                        minutes = int(raw.rstrip("h")) * 60
+                    else:
+                        minutes = int(raw.rstrip("m"))
+                    fire_at = now + timedelta(minutes=minutes)
+                else:
+                    hh, mm = time_spec.split(":")
+                    fire_at = now.replace(
+                        hour=int(hh), minute=int(mm), second=0, microsecond=0
+                    )
+                    if fire_at <= now:
+                        fire_at += timedelta(days=1)
+            except (ValueError, AttributeError):
+                print("error: time must be HH:MM or +Nm/+Nh", file=sys.stderr)
+                return 2
+            name = cfg.station.get("callsign") or "scheduler"
+            msg = UnifiedMessage(
+                sender=name,
+                content=f"Band change: {band_name}",
+                address_type=AddressType.BROADCAST,
+                metadata={
+                    "kind": "band_change",
+                    "band": band_name,
+                    "recur_daily": bool(getattr(args, "daily", False)),
+                },
+                transport="js8call",
+            )
+            store.schedule_add(msg, fire_at, transport="js8call")
+            ts = fire_at.strftime("%Y-%m-%d %H:%M UTC")
+            daily_str = " (daily)" if getattr(args, "daily", False) else ""
+            print(f"Band change to {band_name} scheduled for {ts}{daily_str}  [{msg.msg_id[:8]}]")
+            return 0
 
         if action == "add":
             now = datetime.now(UTC)
