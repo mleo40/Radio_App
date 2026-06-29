@@ -1191,7 +1191,7 @@ class WXSetupScreen(ModalScreen[dict | None]):
 
 
 class SettingsScreen(ModalScreen["dict | None"]):
-    """Three-tab settings modal: Favorites, Weather, Backup."""
+    """Four-tab settings modal: Favorites, Weather, Backup, Database."""
 
     CSS = """
     SettingsScreen { align: center middle; }
@@ -1234,6 +1234,16 @@ class SettingsScreen(ModalScreen["dict | None"]):
     #stab-bak-path      { width: 1fr; }
     #stab-bak-do        { width: 10; min-width: 10; }
     #stab-bak-log       { height: auto; color: $text-muted; }
+    /* Database pane */
+    #stab-db-pane       { height: auto; }
+    #stab-db-stats      { height: auto; margin-bottom: 1; color: $text-muted; }
+    #stab-db-vac-row    { height: 3; margin-bottom: 1; }
+    #stab-db-vacuum     { width: auto; }
+    #stab-db-prune-l    { height: auto; margin-bottom: 0; }
+    #stab-db-prune-row  { height: 3; margin-bottom: 1; }
+    #stab-db-days       { width: 8; }
+    #stab-db-do         { width: 10; min-width: 10; }
+    #stab-db-log        { height: auto; color: $text-muted; }
     /* Footer */
     #settings-footer    { height: auto; align-horizontal: right; margin-top: 1; }
     """
@@ -1261,6 +1271,7 @@ class SettingsScreen(ModalScreen["dict | None"]):
                 yield Button("Favorites", id="stab-fav", classes="stab")
                 yield Button("Weather", id="stab-wx", classes="stab")
                 yield Button("Backup", id="stab-bak", classes="stab")
+                yield Button("Database", id="stab-db", classes="stab")
             with ContentSwitcher(initial="stab-fav-pane", id="settings-content"):
                 with Vertical(id="stab-fav-pane"):
                     yield Static("Saved contacts (arrow keys to select):")
@@ -1316,6 +1327,16 @@ class SettingsScreen(ModalScreen["dict | None"]):
                         )
                         yield Button("Restore…", id="stab-bak-do", variant="warning")
                     yield Static("", id="stab-bak-log")
+                with Vertical(id="stab-db-pane"):
+                    yield Static("", id="stab-db-stats")
+                    with Horizontal(id="stab-db-vac-row"):
+                        yield Button("Vacuum Now", id="stab-db-vacuum", variant="primary")
+                    yield Static("Prune messages older than:", id="stab-db-prune-l")
+                    with Horizontal(id="stab-db-prune-row"):
+                        yield Input(placeholder="90", id="stab-db-days", max_length=5)
+                        yield Static(" days  ", id="stab-db-days-l")
+                        yield Button("Prune…", id="stab-db-do", variant="warning")
+                    yield Static("", id="stab-db-log")
             with Horizontal(id="settings-footer"):
                 yield Button("Close", id="settings-close", variant="primary")
 
@@ -1327,6 +1348,7 @@ class SettingsScreen(ModalScreen["dict | None"]):
         for grid in self._wx_grids:
             wx_lst.append(ListItem(Label(grid)))
         self._refresh_backup_status()
+        self._refresh_db_stats()
 
     def _refresh_fav_list(self) -> None:
         lst = self.query_one("#stab-fav-list", ListView)
@@ -1358,8 +1380,55 @@ class SettingsScreen(ModalScreen["dict | None"]):
         else:
             status.update("No backup found in config directory.")
 
+    def _refresh_db_stats(self) -> None:
+        try:
+            s = self._core.store.stats()
+            msgs = s.get("messages", 0)
+            threads = s.get("threads", 0)
+            size_kb = (s.get("size_bytes") or 0) // 1024
+            size_str = f"{size_kb / 1024:.1f} MB" if size_kb >= 1024 else f"{size_kb} KB"
+            self.query_one("#stab-db-stats", Static).update(
+                f"{msgs:,} messages · {threads:,} threads · {size_str}"
+            )
+        except Exception:  # noqa: BLE001
+            pass
+
+    @work
+    async def _do_vacuum(self) -> None:
+        try:
+            freed = self._core.store.vacuum()
+            freed_kb = freed // 1024
+            msg = f"✓ Vacuum done — freed {freed_kb} KB." if freed_kb else "✓ Vacuum done — nothing to reclaim."
+            self._set_db_log(msg)
+            self._refresh_db_stats()
+        except Exception as exc:  # noqa: BLE001
+            self._set_db_log(f"✗ Vacuum failed: {exc}")
+
+    @work
+    async def _do_prune(self, days: int) -> None:
+        try:
+            removed = self._core.store.purge_older_than(days)
+            msg = f"✓ Pruned {removed} message(s) older than {days} days."
+            self._set_db_log(msg)
+            self._refresh_db_stats()
+        except Exception as exc:  # noqa: BLE001
+            self._set_db_log(f"✗ Prune failed: {exc}")
+
+    def _trigger_prune(self) -> None:
+        raw = self.query_one("#stab-db-days", Input).value.strip()
+        if not raw.isdigit() or int(raw) <= 0:
+            self._set_db_log("Enter a positive number of days.")
+            return
+        self._do_prune(int(raw))
+
+    def _set_db_log(self, msg: str) -> None:
+        try:
+            self.query_one("#stab-db-log", Static).update(msg)
+        except Exception:  # noqa: BLE001
+            pass
+
     def _set_active_tab(self, tab_id: str) -> None:
-        for tid in ("stab-fav", "stab-wx", "stab-bak"):
+        for tid in ("stab-fav", "stab-wx", "stab-bak", "stab-db"):
             try:
                 self.query_one(f"#{tid}", Button).set_class(tid == tab_id, "-active")
             except Exception:  # noqa: BLE001
@@ -1377,6 +1446,9 @@ class SettingsScreen(ModalScreen["dict | None"]):
             event.stop()
         elif event.input.id == "stab-wx-grid-input":
             self._do_add_wx_grid()
+            event.stop()
+        elif event.input.id == "stab-db-days":
+            self._trigger_prune()
             event.stop()
 
     def _do_add_fav(self) -> None:
@@ -1474,6 +1546,10 @@ class SettingsScreen(ModalScreen["dict | None"]):
             self.query_one("#settings-content", ContentSwitcher).current = "stab-bak-pane"
             self._set_active_tab("stab-bak")
             event.stop()
+        elif bid == "stab-db":
+            self.query_one("#settings-content", ContentSwitcher).current = "stab-db-pane"
+            self._set_active_tab("stab-db")
+            event.stop()
         # Kind selector
         elif bid in ("stab-kind-user", "stab-kind-group", "stab-kind-room"):
             kind_map = {
@@ -1525,6 +1601,13 @@ class SettingsScreen(ModalScreen["dict | None"]):
                 self._do_restore(path_str)
             else:
                 self._set_bak_log("Enter a backup archive path first.")
+            event.stop()
+        # Database actions
+        elif bid == "stab-db-vacuum":
+            self._do_vacuum()
+            event.stop()
+        elif bid == "stab-db-do":
+            self._trigger_prune()
             event.stop()
         # Close
         elif bid == "settings-close":
@@ -1628,6 +1711,8 @@ class LaunchCmdScreen(ModalScreen):
 
 class RadioTUI(App):
     """The Textual application."""
+
+    ENABLE_COMMAND_PALETTE = False
 
     # Transports whose per-message size cap is advisory rather than a hard
     # protocol limit. JS8Call has no documented character cap — it auto-frames
@@ -1755,7 +1840,7 @@ class RadioTUI(App):
         ("g", "cycle_watch_group", "Group filter"),
         ("i", "identity", "My address"),
         ("ctrl+n", "announce", "Announce"),
-        ("ctrl+p", "find_path", "Find path"),
+        Binding("ctrl+p", "settings", "Settings", show=True, priority=True),
         Binding("ctrl+w", "close_chat", "Close chat", priority=True),
         ("delete", "remove_favorite", "Remove fav"),
         Binding("ctrl+d", "remove_favorite", "Remove fav", priority=True),
@@ -1767,7 +1852,6 @@ class RadioTUI(App):
         # Hidden easter egg: technical "about" overview. show=False keeps it out
         # of the footer; priority lets it fire even while the composer is focused.
         Binding("ctrl+g", "about", "About", show=False, priority=True),
-        Binding("ctrl+comma", "settings", "Settings", show=False, priority=True),
     ]
 
     def check_action(
@@ -1785,7 +1869,7 @@ class RadioTUI(App):
         if action == "toggle_fav_only":
             return self.view in ("monitor", "active", "nomadnet")
         # Reticulum-only tools: only meaningful in the Reticulum chat mode.
-        if action in ("identity", "find_path"):
+        if action == "identity":
             return self.view == "active" and self.active_transport == "reticulum"
         # Announce is available in both Reticulum (LXMF announce) and MeshCore
         # (node advert) modes.
@@ -3057,8 +3141,6 @@ class RadioTUI(App):
             self._show_watch()
         elif bid == "view-health":
             self.action_health()
-        elif bid == "view-settings":
-            self.action_settings()
         elif bid == "view-logs":
             self.action_logs()
         elif bid == "view-archive":
@@ -5418,8 +5500,6 @@ class RadioTUI(App):
                 btn.set_class(self.view == "logs", "-active")
             elif bid == "view-archive":
                 btn.set_class(self.view == "archive", "-active")
-            elif bid == "view-settings":
-                btn.set_class(False, "-active")
             elif bid == "view-net":
                 btn.set_class(self.view == "net", "-active")
             elif bid == "view-weather":
@@ -6074,11 +6154,14 @@ class RadioTUI(App):
             label.update("JS8Call [dim]— not running[/dim]")
             return
         hz = getattr(t, "dial_freq", None)
+        band = t.current_band()
         if hz:
-            band = t.current_band() or "?"
-            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band})[/dim]")
+            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or "?"})[/dim]")
         else:
             label.update("JS8Call  [dim]freq unknown — \u21bb to query[/dim]")
+        for btn in bar.query(Button):
+            if btn.id and btn.id.startswith("js8-band-"):
+                btn.set_class(btn.id == f"js8-band-{band}", "-active")
 
     @work
     async def _js8_refresh_freq(self) -> None:
@@ -6287,7 +6370,6 @@ class RadioTUI(App):
         bar.mount(Button("\u25f7 Stream", id="view-watch", classes="modebtn"))
         bar.mount(Button("\u2795 Health", id="view-health", classes="modebtn"))
         bar.mount(Button("\U0001f5c2 History", id="view-archive", classes="modebtn"))
-        bar.mount(Button("\u2699", id="view-settings", classes="modebtn"))
         bar.mount(Button("\u25ce Net", id="view-net", classes="modebtn"))
         bar.mount(Button("\u26c5 WX", id="view-weather", classes="modebtn"))
         bar.mount(Static("\u2328", id="input-ind"))

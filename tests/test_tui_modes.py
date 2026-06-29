@@ -63,7 +63,7 @@ def test_mode_selector_has_nomadnet_and_no_mercury(config_path):
             assert "mode-nomadnet" in ids       # virtual mode present
             assert "mode-mercury" not in ids    # mercury disabled
             assert "view-watch" in ids and "view-health" in ids
-            assert "view-settings" in ids       # settings button (replaces favorites chip)
+            assert "view-settings" not in ids    # settings moved to Ctrl+P, no modebar button
 
     asyncio.run(run())
 
@@ -575,7 +575,7 @@ def test_reticulum_tools_hidden_when_not_reticulum_mode(config_path):
             await pilot.pause()
             assert app.check_action("identity", ()) is False
             assert app.check_action("announce", ()) is False
-            assert app.check_action("find_path", ()) is False
+            # find_path has no keyboard binding now (use /path command); no check_action gate needed
             # Invoking them is a graceful no-op (logs, never raises).
             app.action_identity()
             app.action_announce()
