@@ -1078,7 +1078,7 @@ class WXSetupScreen(ModalScreen[dict | None]):
     }
     #wxsetup-title      { height: auto; margin-bottom: 1; }
     #wxsetup-grids-l    { height: auto; }
-    #wxsetup-grid-list  { height: auto; max-height: 6; margin-bottom: 0; }
+    #wxsetup-grid-list  { height: 6; margin-bottom: 0; }
     .wxsetup-grid-row   { height: 1; }
     .wxsetup-grid-label { width: 1fr; }
     .wxsetup-del-btn    {
@@ -1144,10 +1144,13 @@ class WXSetupScreen(ModalScreen[dict | None]):
 
     def _mount_grid_row(self, grid: str) -> None:
         container = self.query_one("#wxsetup-grid-list", VerticalScroll)
-        row = Horizontal(classes="wxsetup-grid-row")
-        container.mount(row)
-        row.mount(Label(grid, classes="wxsetup-grid-label"))
-        row.mount(Button("×", id=f"wxsetup-del-{grid}", classes="wxsetup-del-btn"))
+        container.mount(
+            Horizontal(
+                Label(grid, classes="wxsetup-grid-label"),
+                Button("×", id=f"wxsetup-del-{grid}", classes="wxsetup-del-btn"),
+                classes="wxsetup-grid-row",
+            )
+        )
 
     def on_input_changed(self, event: Input.Changed) -> None:
         if event.input.id == "wxsetup-grid-input":
