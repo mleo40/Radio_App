@@ -21,7 +21,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
 > awareness, offline band-plan, **band tracking** (every HF message stamped with
 > its band; per-band history filters and aggregate stats), scheduled sends, and a
-> presence roster. 834 tests pass; the whole suite runs without radio hardware.
+> presence roster. 840 tests pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 

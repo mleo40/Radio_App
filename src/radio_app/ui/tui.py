@@ -1779,8 +1779,8 @@ class RadioTUI(App):
     #health-view { height: 1fr; }
     #health-help { height: 1; color: $text-muted; padding: 0 1; }
     #health-body { height: 1fr; }
-    #health-log { height: 1fr; width: 1fr; padding: 0 1; }
-    #health-sys-log { height: 1fr; width: 1fr; padding: 0 1; border-left: tall $panel; }
+    #health-log { height: 1fr; width: 50%; padding: 0 1; }
+    #health-sys-log { height: 1fr; width: 50%; padding: 0 1; border-left: tall $panel; }
     #logs-view { height: 1fr; }
     #logs-bar { height: 1; }
     #logs-help { height: 1; width: auto; color: $text-muted; padding: 0 1; }
@@ -2140,10 +2140,12 @@ class RadioTUI(App):
                 )
                 with Horizontal(id="health-body"):
                     yield RichLog(
-                        id="health-log", wrap=True, markup=True, highlight=False
+                        id="health-log", wrap=True, markup=True, highlight=False,
+                        auto_scroll=False,
                     )
                     yield RichLog(
-                        id="health-sys-log", wrap=True, markup=True, highlight=False
+                        id="health-sys-log", wrap=True, markup=True, highlight=False,
+                        auto_scroll=False,
                     )
             with Vertical(id="logs-view"):
                 with Horizontal(id="logs-bar"):
@@ -3666,6 +3668,7 @@ class RadioTUI(App):
             return
         log = self.query_one("#health-log", RichLog)
         log.clear()
+        log.scroll_home(animate=False)
         log.write("[b]Transport reachability[/b] (passive endpoint probe)")
         if not self.core.transports:
             log.write("[dim]No transports configured. Enable one in your config.[/dim]")
@@ -3749,6 +3752,7 @@ class RadioTUI(App):
         except Exception:  # noqa: BLE001 - widget may not be mounted yet
             return
         log.clear()
+        log.scroll_home(animate=False)
         db_path = self.core.config.database_path()
         health = collect(str(db_path))
         log.write("[b]System[/b] (host resources)")
@@ -3840,20 +3844,28 @@ class RadioTUI(App):
         # Database size + history extent — the "is my history bloating?" signal.
         try:
             s = self.core.store.stats()
-            c = self.core.nomad_cache.stats()
             retention = int(
                 self.core.config.general.get("history_retention_days", 0) or 0
             )
             keep = f"{retention}d retention" if retention > 0 else "kept forever"
             log.write(
-                f"  data  : {format_bytes(s['size_bytes'])} db · "
-                f"{s['messages']} msgs / {s['threads']} threads · "
-                f"{c['pages']} cached pages · {keep}"
+                f"  data  : {format_bytes(s['size_bytes'])} · {keep}"
             )
         except Exception:  # noqa: BLE001 - never let stats break the board
             pass
 
         self._render_propagation(log)
+        self._render_session_activity(log)
+
+    def _render_session_activity(self, log: RichLog) -> None:
+        """Compact per-transport traffic tally for this session."""
+        if self.core is None:
+            return
+        log.write("")
+        log.write("[b]Activity[/b] (this session)")
+        for t in self.core.transports:
+            vol = self._format_traffic_volume(t.name)
+            log.write(f"  {t.name:<12}{vol}")
 
     def _render_power_line(self, log: RichLog, health, format_duration) -> None:
         """Render a battery/power line: charge %, AC/battery, time remaining.
@@ -5456,19 +5468,12 @@ class RadioTUI(App):
     def _default_channel_target(self) -> str | None:
         """Default conversation for the active mode, or None.
 
-        Transports exposing channels (MeshCore) open on the public channel
-        (index 0 when present) so the operator can chat immediately without
-        first picking a channel. Channel tags are '@<index>'.
+        Channel-based transports (MeshCore) start with no channel selected so the
+        right panel shows all channels at once — same as JS8Call's all-messages
+        firehose. The operator clicks a specific channel to filter, then presses
+        Escape to return to the full feed.
         """
-        t = self._active_transport_obj()
-        if t is None or not hasattr(t, "channels"):
-            return None
-        channels = t.channels()
-        if not channels:
-            return None
-        indices = [c["index"] for c in channels]
-        idx = 0 if 0 in indices else indices[0]
-        return f"@{idx}"
+        return None
 
     def _update_modebar(self) -> None:
         """Refresh the persistent mode selector: active highlight + health dots.
@@ -8148,7 +8153,11 @@ class RadioTUI(App):
                 status = " [red]\u2717 (failed)[/red]"
         tag = ""
         if msg.address_type is AddressType.GROUP and msg.group:
-            tag = f" [magenta]@{msg.group}[/magenta]"
+            if msg.group.isdigit() and msg.transport == "meshcore":
+                ch_name = self._meshcore_channel_name(int(msg.group))
+                tag = f" [magenta]#{ch_name or msg.group}[/magenta]"
+            else:
+                tag = f" [magenta]@{msg.group}[/magenta]"
         band = msg.metadata.get("band", "")
         band_tag = f" [dim]{band}[/dim]" if band else ""
         log.write(

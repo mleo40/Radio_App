@@ -1450,20 +1450,23 @@ def _cmd_status(args: argparse.Namespace) -> int:
         from .transports.base import ReachabilityStatus
 
         for t in app.transports:
-            # `running` is just "the adapter loaded"; it does NOT mean the
-            # backing service (Pat, the JS8Call API, rnsd, ...) is actually
-            # reachable. Probe the control endpoint too so this agrees with the
-            # Health panel instead of always reporting UP.
-            state = "UP" if t.running else "down"
+            # Combine adapter state + endpoint probe into one intuitive status:
+            # UP = adapter started AND backing service reachable
+            # configured = adapter started but backing service not responding
+            # down = adapter failed to start
             try:
                 reach = await t.check_reachable()
             except Exception:  # noqa: BLE001 - any failure means "down"
                 reach = ReachabilityStatus.DOWN
-            reach_txt = {
-                ReachabilityStatus.OK: "reachable",
-                ReachabilityStatus.DOWN: "UNREACHABLE",
-                ReachabilityStatus.NOT_APPLICABLE: "n/a",
-            }.get(reach, str(reach.value))
+            if not t.running:
+                state = "down"
+            elif reach is ReachabilityStatus.OK:
+                state = "UP"
+            elif reach is ReachabilityStatus.NOT_APPLICABLE:
+                state = "UP"
+            else:
+                state = "configured"
+            reach_txt = ""
             caps = t.capabilities()
             # Show the *actual* identity this transport uses, not just its kind.
             # Callsign-carrying media (HF: js8call/winlink) identify with a
@@ -1497,7 +1500,7 @@ def _cmd_status(args: argparse.Namespace) -> int:
                 else:
                     ident = f"anon={anon}" if anon else "anon"
             print(
-                f"  - {t.name:<12} {state:<5} {reach_txt:<11} {ident}"
+                f"  - {t.name:<12} {state:<12} {ident}"
             )
         return 0
 

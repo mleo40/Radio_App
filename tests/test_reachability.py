@@ -86,6 +86,11 @@ def test_socket_transport_down_when_no_server(cls):
 
 
 def test_meshcore_tcp_reachable_against_live_server():
+    """Transport not running → DOWN even when the TCP endpoint accepts connections.
+
+    The endpoint probe is now an internal detail (used to trigger _try_start);
+    check_reachable() always returns DOWN when the transport session is not up.
+    """
     async def run() -> ReachabilityStatus:
         async def _handle(reader, writer):  # noqa: ANN001
             writer.close()
@@ -99,7 +104,7 @@ def test_meshcore_tcp_reachable_against_live_server():
             server.close()
             await server.wait_closed()
 
-    assert asyncio.run(run()) is ReachabilityStatus.OK
+    assert asyncio.run(run()) is ReachabilityStatus.DOWN
 
 
 def test_meshcore_tcp_down_when_no_server():
@@ -108,13 +113,17 @@ def test_meshcore_tcp_down_when_no_server():
 
 
 def test_meshcore_serial_reachable_reflects_device_path(tmp_path):
-    """Serial backend: OK when the device path exists, DOWN otherwise (passive)."""
+    """Transport not running → always DOWN regardless of whether the device path exists.
+
+    The path probe is now internal (used to decide whether to fire _try_start);
+    check_reachable() only returns OK once start() has succeeded.
+    """
     import radio_app.transports.meshcore_transport as mc
 
     fake_dev = tmp_path / "ttyFAKE"
-    fake_dev.write_text("")  # path exists -> reachable
+    fake_dev.write_text("")  # path exists, but transport never started
     t_ok = mc.MeshCoreTransport({"connection": "serial", "port": str(fake_dev)})
-    assert asyncio.run(t_ok.check_reachable()) is ReachabilityStatus.OK
+    assert asyncio.run(t_ok.check_reachable()) is ReachabilityStatus.DOWN
 
     t_down = mc.MeshCoreTransport(
         {"connection": "serial", "port": str(tmp_path / "nope")}

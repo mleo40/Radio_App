@@ -271,6 +271,21 @@ def test_check_reachable_ok_when_connected():
     assert asyncio.run(t.check_reachable()) is ReachabilityStatus.OK
 
 
+def test_check_reachable_down_when_not_running():
+    """Transport not started (mc=None, running=False) must report DOWN.
+
+    If probe_tcp/serial-exists were used as a fallback here, the health page
+    would show OK and then call device_telemetry() against a None companion,
+    getting {} back and showing "(no device telemetry)" even though the transport
+    was never connected.
+    """
+    from radio_app.transports.base import ReachabilityStatus
+
+    t = MeshCoreTransport({"connection": "tcp"})
+    # _running=False, _mc=None — the transport was never started.
+    assert asyncio.run(t.check_reachable()) is ReachabilityStatus.DOWN
+
+
 def test_self_prefix_truncates(_unused=None):
     t = _running_transport(self_pub="ff" * 32)
     assert t._self_prefix() == "ff" * 6  # first 12 hex chars

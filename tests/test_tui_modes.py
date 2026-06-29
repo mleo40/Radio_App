@@ -1082,20 +1082,20 @@ def test_channel_command_requires_meshcore_mode(config_path):
 
 
 def test_meshcore_defaults_to_public_channel(config_path):
-    """Selecting MeshCore opens the public channel (@0) by default."""
+    """Selecting MeshCore opens with no channel selected (all-channels firehose)."""
     async def run():
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
-            # A non-channel transport opens with no conversation selected.
+            # Both channel-based (MeshCore) and non-channel (JS8Call) transports
+            # open with no conversation selected so the right pane shows all messages.
             app._select_mode("js8call")
             await pilot.pause()
             assert app.current_target is None
-            # Switching to MeshCore defaults the open conversation to channel 0,
-            # so the panel is ready to chat immediately.
             app._select_mode("meshcore")
             await pilot.pause()
-            assert app.current_target == "@0"
+            assert app.current_target is None
+            # Channels are still listed in the left pane for clicking.
             assert "@0" in app._thread_keys
             assert "#public" in app._display_id("@0")
 
@@ -1458,15 +1458,15 @@ def test_fav_only_always_shows_configured_groups(groups_config_path):
 
 
 def test_reply_to_opens_direct_thread_with_sender_in_meshcore(config_path):
-    """Clicking a sender in a MeshCore channel opens a 1:1 reply to them."""
+    """Clicking a sender in MeshCore opens a 1:1 reply to them."""
     async def run():
         app = RadioTUI(config_path)
         async with app.run_test(size=(120, 30)) as pilot:
             await pilot.pause()
             app._select_mode("meshcore")
             await pilot.pause()
-            # MeshCore opens on the public channel ('@0'), a shared thread.
-            assert app.current_target == "@0"
+            # MeshCore starts with no channel selected (all-channels firehose).
+            assert app.current_target is None
             # Click a participant's username: peel off into a direct reply.
             app.action_reply_to("a1b2c3d4e5f6", "meshcore")
             await pilot.pause()
