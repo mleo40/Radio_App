@@ -98,6 +98,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
     "/subs [add|rm @GROUP], "
     "/groups [@NAME|new|delete|add|rm|tag|untag], "
+    "/bridge [list], "
     "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
@@ -7831,6 +7832,35 @@ class RadioTUI(App):
         )
         self._log_system("\n".join(lines))
 
+    def _handle_bridge_command(self, arg: str) -> None:
+        """Show active bridge rules.
+
+        /bridge        — list configured rules
+        /bridge list   — same
+        """
+        if self.core is None:
+            return
+        rules = self.core.bridge.rules if hasattr(self.core, "bridge") else []
+        if not rules:
+            self._log_system(
+                "No bridge rules configured. Add [[bridge]] entries to config.toml.\n"
+                "Example:\n"
+                "  [[bridge]]\n"
+                "  from = \"js8call\"\n"
+                "  to   = \"reticulum\"\n"
+                "  filter = \"*\"   # *, broadcast, group, direct"
+            )
+            return
+        lines = [f"[b]Bridge rules[/b] ({len(rules)} active):"]
+        for r in rules:
+            addr = f" [{r.address_filter}]" if r.address_filter != "*" else ""
+            lines.append(f"  [b]{r.from_transport}[/b] → [b]{r.to_transport}[/b]{addr}")
+        lines.append(
+            "[dim]Bridged messages carry metadata.bridged=True and "
+            "metadata.bridge_origin=<source transport>[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
     def _handle_groups_command(self, arg: str) -> None:
         """Manage group routing configuration from the TUI.
 
@@ -8637,6 +8667,8 @@ class RadioTUI(App):
             self._handle_subs_command(arg)
         elif cmd in ("/groups", "/group"):
             self._handle_groups_command(arg)
+        elif cmd == "/bridge":
+            self._handle_bridge_command(arg)
         elif cmd in ("/position", "/pos", "/grid"):
             self._handle_position_command(arg)
         elif cmd == "/start":

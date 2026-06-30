@@ -514,6 +514,9 @@ def _build_parser() -> argparse.ArgumentParser:
 
     p_sched.set_defaults(func=_cmd_schedule)
 
+    p_bridge = sub.add_parser("bridge", help="show active bridge / gateway rules")
+    p_bridge.set_defaults(func=_cmd_bridge)
+
     p_roster = sub.add_parser("roster", help="show recently-heard stations")
     p_roster.add_argument("--transport", help="filter to a specific transport")
     p_roster.add_argument(
@@ -1307,6 +1310,32 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
     print(f"Unknown action '{action}'. Use: add | list | cancel", file=sys.stderr)
     return 2
+
+
+def _cmd_bridge(args: argparse.Namespace) -> int:
+    """List configured bridge / gateway rules."""
+    from .config import Config
+    from .core.bridge import BridgeEngine
+
+    cfg = Config.load(args.config)
+    engine = BridgeEngine.from_config(cfg)
+    rules = engine.rules
+    if not rules:
+        print(
+            "No bridge rules configured.\n"
+            "Add [[bridge]] sections to config.toml, e.g.:\n"
+            "\n"
+            "  [[bridge]]\n"
+            "  from   = \"js8call\"\n"
+            "  to     = \"reticulum\"\n"
+            "  filter = \"*\"   # *, broadcast, group, direct"
+        )
+        return 0
+    print(f"Bridge rules ({len(rules)} active):")
+    for r in rules:
+        addr = f"  [{r.address_filter}]" if r.address_filter != "*" else ""
+        print(f"  {r.from_transport} → {r.to_transport}{addr}")
+    return 0
 
 
 def _cmd_roster(args: argparse.Namespace) -> int:

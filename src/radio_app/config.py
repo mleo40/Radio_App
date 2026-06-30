@@ -89,6 +89,7 @@ _DEFAULTS: dict[str, Any] = {
     "groups": {},
     "subscriptions": {"groups": [], "show_unsubscribed": False},
     "filters": [],
+    "bridge": [],
     "templates": {},
     "position": {},
     "power": {
@@ -212,6 +213,10 @@ class Config:
     @property
     def filters(self) -> list[dict[str, Any]]:
         return self._data.get("filters", [])
+
+    @property
+    def bridges(self) -> list[dict[str, Any]]:
+        return self._data.get("bridge", [])
 
     @property
     def ui(self) -> dict[str, Any]:
