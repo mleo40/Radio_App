@@ -21,7 +21,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
 > awareness, offline band-plan, **band tracking** (every HF message stamped with
 > its band; per-band history filters and aggregate stats), scheduled sends, and a
-> presence roster. 880 tests pass; the whole suite runs without radio hardware.
+> presence roster. 904 tests pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 
@@ -622,6 +622,7 @@ In-composer commands:
 | `/sched band <band> <time> [daily]` | (JS8Call) schedule a band change; `daily` repeats every 24h |
 | `/subs [add\|rm @GROUP]` | show group subscriptions / add or remove one |
 | `/groups [@NAME\|new\|delete\|add\|rm\|tag\|untag]` | manage group routing config (members, tags, outbound transports) |
+| `/bridge [list]` | show active cross-mode bridge/gateway rules from config |
 | `/position [<grid>\|clear]` | set your station grid square (e.g. `/position FN31`), show, or clear |
 | `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
 | `/bands [band]` | show offline band-plan / EmComm frequencies (same as `radioapp bands`) |
