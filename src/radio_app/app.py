@@ -12,6 +12,7 @@ import logging
 
 from .config import Config
 from .core.bridge import BridgeEngine
+from .core.contacts import ContactBook
 from .core.compliance import ComplianceGuard
 from .core.favorites import Favorites
 from .core.filters import FilterEngine
@@ -37,6 +38,7 @@ class App:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.store = MessageStore(config.database_path())
+        self.contact_book = ContactBook(self.store._conn)
         self.groups = GroupRegistry.from_config(config)
         self.filters = FilterEngine.from_config(config, self.groups)
         self.station = Station.from_config(config)

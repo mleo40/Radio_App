@@ -29,6 +29,26 @@ CREATE INDEX IF NOT EXISTS idx_sched_fire_at ON scheduled_messages(fire_at)
     WHERE status = 'pending';
 """
 
+_CONTACTS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS contacts (
+    contact_id   TEXT PRIMARY KEY,
+    display_name TEXT NOT NULL,
+    notes        TEXT NOT NULL DEFAULT '',
+    created_at   TEXT NOT NULL
+);
+CREATE TABLE IF NOT EXISTS contact_identities (
+    identity_id  TEXT PRIMARY KEY,
+    contact_id   TEXT NOT NULL REFERENCES contacts(contact_id) ON DELETE CASCADE,
+    transport    TEXT NOT NULL,
+    address      TEXT NOT NULL,
+    label        TEXT NOT NULL DEFAULT '',
+    UNIQUE(transport, address)
+);
+CREATE INDEX IF NOT EXISTS idx_ci_contact ON contact_identities(contact_id);
+CREATE INDEX IF NOT EXISTS idx_ci_addr    ON contact_identities(transport, address);
+PRAGMA foreign_keys = ON;
+"""
+
 _SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     msg_id        TEXT PRIMARY KEY,
@@ -123,6 +143,7 @@ class MessageStore:
         self._conn.row_factory = sqlite3.Row
         self._conn.executescript(_SCHEMA)
         self._conn.executescript(_SCHEDULED_SCHEMA)
+        self._conn.executescript(_CONTACTS_SCHEMA)
         self._conn.commit()
         self._init_fts()
 

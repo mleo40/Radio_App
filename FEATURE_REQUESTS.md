@@ -5,8 +5,8 @@ Tracked, not-yet-implemented feature requests. Newest at the top.
 ## Cross-mode identity linking ("contacts book")
 
 **Requested:** 2026-06-29
-**Status:** Backlog
-**Area:** `core/` (new `contacts.py`), `core/store.py`, `core/favorites.py`, `ui/tui.py`
+**Status:** Implemented (2026-06-29, `phase1-ux-gaps` branch)
+**Area:** `core/contacts.py` (new), `core/store.py`, `app.py`, `ui/tui.py`, `cli.py`
 
 Associate multiple transport-specific addresses to a single named person. Once
 linked, marking any of their identities as a favorite in one mode automatically

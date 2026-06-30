@@ -517,6 +517,30 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bridge = sub.add_parser("bridge", help="show active bridge / gateway rules")
     p_bridge.set_defaults(func=_cmd_bridge)
 
+    for _alias in ("contacts", "contact"):
+        p_contacts = sub.add_parser(
+            _alias,
+            help="manage the cross-mode contacts book",
+        )
+        p_contacts.add_argument(
+            "action",
+            nargs="?",
+            default="list",
+            choices=["list", "show", "add", "link", "unlink", "rename", "delete"],
+            help="action to perform (default: list)",
+        )
+        p_contacts.add_argument("name", nargs="?", default="",
+                                help="contact display name")
+        p_contacts.add_argument("arg2", nargs="?", default="",
+                                help="transport (for link/unlink)")
+        p_contacts.add_argument("arg3", nargs="?", default="",
+                                help="address (for link/unlink) or new name (for rename)")
+        p_contacts.add_argument("--label", default="",
+                                help="optional label for linked identity")
+        p_contacts.add_argument("--notes", default="",
+                                help="notes for new contact")
+        p_contacts.set_defaults(func=_cmd_contacts)
+
     p_roster = sub.add_parser("roster", help="show recently-heard stations")
     p_roster.add_argument("--transport", help="filter to a specific transport")
     p_roster.add_argument(
@@ -1310,6 +1334,134 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
 
     print(f"Unknown action '{action}'. Use: add | list | cancel", file=sys.stderr)
     return 2
+
+
+def _cmd_contacts(args: argparse.Namespace) -> int:
+    """Manage the cross-mode contacts book."""
+    from .config import Config
+    from .core.contacts import ContactBook
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+    book = ContactBook(store._conn)
+    action = args.action or "list"
+
+    try:
+        if action == "list":
+            contacts = book.all()
+            if not contacts:
+                print("(no contacts — add one with 'radioapp contacts add \"Name\"')")
+                return 0
+            for c in contacts:
+                ids = book.identities_for(c.contact_id)
+                suffix = f"  [{len(ids)} identity]" if len(ids) == 1 else f"  [{len(ids)} identities]"
+                print(f"  {c.display_name}{suffix}")
+            return 0
+
+        if action == "add":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts add \"Name\" [--notes \"...\"]",
+                      file=sys.stderr)
+                return 2
+            c = book.add(name, notes=args.notes)
+            print(f"created: {c.display_name}  (id: {c.contact_id[:8]})")
+            return 0
+
+        if action == "show":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts show \"Name\"", file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            for c in matches:
+                print(f"{c.display_name}  (id: {c.contact_id[:8]})")
+                if c.notes:
+                    print(f"  notes: {c.notes}")
+                ids = book.identities_for(c.contact_id)
+                if ids:
+                    for ident in ids:
+                        lbl = f"  ({ident.label})" if ident.label else ""
+                        print(f"  {ident.transport:<12} {ident.address}{lbl}")
+                else:
+                    print("  (no linked identities)")
+            return 0
+
+        if action == "link":
+            name = args.name.strip()
+            transport = args.arg2.strip().lower()
+            address = args.arg3.strip()
+            if not name or not transport or not address:
+                print("usage: radioapp contacts link \"Name\" <transport> <address> [--label \"...\"]",
+                      file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            try:
+                book.link(c.contact_id, transport, address, label=args.label)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(f"linked {transport}:{address} to {c.display_name}")
+            return 0
+
+        if action == "unlink":
+            transport = args.name.strip().lower()
+            address = args.arg2.strip()
+            if not transport or not address:
+                print("usage: radioapp contacts unlink <transport> <address>",
+                      file=sys.stderr)
+                return 2
+            if book.unlink(transport, address):
+                print(f"unlinked {transport}:{address}")
+            else:
+                print(f"{transport}:{address} was not linked to any contact",
+                      file=sys.stderr)
+                return 1
+            return 0
+
+        if action == "rename":
+            name = args.name.strip()
+            new_name = args.arg2.strip()
+            if not name or not new_name:
+                print("usage: radioapp contacts rename \"Old Name\" \"New Name\"",
+                      file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            book.rename(c.contact_id, new_name)
+            print(f"renamed: {c.display_name} → {new_name}")
+            return 0
+
+        if action == "delete":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts delete \"Name\"", file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            ids = book.identities_for(c.contact_id)
+            book.delete(c.contact_id)
+            print(f"deleted: {c.display_name} (removed {len(ids)} linked identities)")
+            return 0
+
+        print(f"unknown action '{action}'", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
 
 
 def _cmd_bridge(args: argparse.Namespace) -> int:

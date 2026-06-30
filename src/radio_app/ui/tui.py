@@ -98,6 +98,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
     "/subs [add|rm @GROUP], "
     "/groups [@NAME|new|delete|add|rm|tag|untag], "
+    "/contacts [<name>|new|delete|link|unlink|rename], "
     "/bridge [list], "
     "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
@@ -5303,6 +5304,7 @@ class RadioTUI(App):
             self._log_system(f"could not save favorites: {exc}")
         tag = f" [{kind}]" if kind else ""
         self._log_system(f"favorite added{tag}: {fav.display}")
+        self._contacts_auto_link_favorite(ident)
         self._refresh_monitor_ticker()
         self._rebuild_monitor()
         self._render_favorites()
@@ -7832,6 +7834,37 @@ class RadioTUI(App):
         )
         self._log_system("\n".join(lines))
 
+    def _contacts_auto_link_favorite(self, address: str) -> None:
+        """When favoriting an address that belongs to a contact, auto-favorite all
+        other identities linked to that contact."""
+        if self.core is None:
+            return
+        book = getattr(self.core, "contact_book", None)
+        if book is None:
+            return
+        contact = book.by_address("", address)
+        if contact is None:
+            return
+        all_ids = book.identities_for(contact.contact_id)
+        newly_added = []
+        for ident in all_ids:
+            if ident.address == address:
+                continue
+            if not self.core.favorites.is_favorite(ident.address):
+                self.core.favorites.add(ident.address, label=contact.display_name)
+                newly_added.append(f"{ident.transport}:{ident.address}")
+        if newly_added:
+            try:
+                self.core.favorites.save(self.core.config)
+            except Exception:  # noqa: BLE001
+                pass
+            self._log_system(
+                f"Also favorited {len(newly_added)} linked "
+                f"{'identity' if len(newly_added)==1 else 'identities'} "
+                f"for [b]{contact.display_name}[/b]: "
+                + ", ".join(newly_added)
+            )
+
     def _handle_bridge_command(self, arg: str) -> None:
         """Show active bridge rules.
 
@@ -7860,6 +7893,162 @@ class RadioTUI(App):
             "metadata.bridge_origin=<source transport>[/dim]"
         )
         self._log_system("\n".join(lines))
+
+    def _handle_contacts_command(self, arg: str) -> None:
+        """Manage the cross-mode contacts book.
+
+        /contacts                                    — list all contacts
+        /contacts <name>                             — show contact details
+        /contacts new <name> [notes...]              — create contact
+        /contacts delete <name>                      — delete contact
+        /contacts link <name> <transport> <addr> [label] — link identity
+        /contacts unlink <transport> <addr>          — unlink identity
+        /contacts rename <name> <new_name>           — rename contact
+        """
+        if self.core is None:
+            return
+        book = getattr(self.core, "contact_book", None)
+        if book is None:
+            self._log_system("Contacts not available.")
+            return
+
+        parts = arg.strip().split(None, 3)
+        action_kw = {"new", "delete", "link", "unlink", "rename"}
+        first = parts[0].lower() if parts else ""
+
+        # /contacts  (no arg) — list all
+        if not parts:
+            contacts = book.all()
+            if not contacts:
+                self._log_system(
+                    "Contacts: (none) — '/contacts new <name>' to create one."
+                )
+                return
+            lines = [f"[b]Contacts[/b] ({len(contacts)}):"]
+            for c in contacts:
+                ids = book.identities_for(c.contact_id)
+                n = len(ids)
+                tag = f"  [dim]({n} identity)[/dim]" if n == 1 else f"  [dim]({n} identities)[/dim]"
+                lines.append(f"  {c.display_name}{tag}")
+            self._log_system("\n".join(lines))
+            return
+
+        # /contacts new <name> [notes...]
+        if first == "new":
+            rest = " ".join(parts[1:]).strip()
+            name_parts = rest.split("//", 1)
+            name = name_parts[0].strip()
+            notes = name_parts[1].strip() if len(name_parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /contacts new <name> [// notes]")
+                return
+            try:
+                c = book.add(name, notes=notes)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(f"Contact created: [b]{c.display_name}[/b]")
+            return
+
+        # /contacts delete <name>
+        if first == "delete":
+            name = " ".join(parts[1:]).strip()
+            if not name:
+                self._log_system("usage: /contacts delete <name>")
+                return
+            matches = book.by_name(name)
+            if not matches:
+                self._log_system(f"No contact matching '{name}'.")
+                return
+            c = matches[0]
+            ids = book.identities_for(c.contact_id)
+            book.delete(c.contact_id)
+            self._log_system(
+                f"Deleted [b]{c.display_name}[/b] "
+                f"and {len(ids)} linked {'identity' if len(ids)==1 else 'identities'}."
+            )
+            return
+
+        # /contacts link <name> <transport> <addr> [label]
+        if first == "link":
+            sub_parts = " ".join(parts[1:]).strip().split(None, 3)
+            if len(sub_parts) < 3:
+                self._log_system(
+                    "usage: /contacts link <name> <transport> <addr> [label]"
+                )
+                return
+            name, transport, address = sub_parts[0], sub_parts[1].lower(), sub_parts[2]
+            label = sub_parts[3] if len(sub_parts) > 3 else ""
+            matches = book.by_name(name)
+            if not matches:
+                self._log_system(f"No contact matching '{name}'.")
+                return
+            c = matches[0]
+            try:
+                book.link(c.contact_id, transport, address, label=label)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(
+                f"Linked [b]{transport}:{address}[/b] to [b]{c.display_name}[/b]."
+            )
+            return
+
+        # /contacts unlink <transport> <addr>
+        if first == "unlink":
+            sub_parts = " ".join(parts[1:]).strip().split(None, 1)
+            if len(sub_parts) < 2:
+                self._log_system("usage: /contacts unlink <transport> <addr>")
+                return
+            transport, address = sub_parts[0].lower(), sub_parts[1]
+            if book.unlink(transport, address):
+                self._log_system(f"Unlinked {transport}:{address}.")
+            else:
+                self._log_system(f"{transport}:{address} was not linked to any contact.")
+            return
+
+        # /contacts rename <name> <new_name>
+        if first == "rename":
+            sub_parts = " ".join(parts[1:]).strip().split("//", 1)
+            if len(sub_parts) < 2:
+                self._log_system("usage: /contacts rename <old name> // <new name>")
+                return
+            old_name = sub_parts[0].strip()
+            new_name = sub_parts[1].strip()
+            if not old_name or not new_name:
+                self._log_system("usage: /contacts rename <old name> // <new name>")
+                return
+            matches = book.by_name(old_name)
+            if not matches:
+                self._log_system(f"No contact matching '{old_name}'.")
+                return
+            c = matches[0]
+            try:
+                book.rename(c.contact_id, new_name)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(f"Renamed [b]{c.display_name}[/b] → [b]{new_name}[/b].")
+            return
+
+        # /contacts <name>  — show contact details
+        name = arg.strip()
+        matches = book.by_name(name)
+        if not matches:
+            self._log_system(f"No contact matching '{name}'.")
+            return
+        for c in matches:
+            ids = book.identities_for(c.contact_id)
+            lines = [f"[b]{c.display_name}[/b]"]
+            if c.notes:
+                lines.append(f"  notes: {c.notes}")
+            if ids:
+                for ident in ids:
+                    lbl = f"  ({ident.label})" if ident.label else ""
+                    lines.append(f"  {ident.transport:<12} {ident.address}{lbl}")
+            else:
+                lines.append("  (no linked identities)")
+            self._log_system("\n".join(lines))
 
     def _handle_groups_command(self, arg: str) -> None:
         """Manage group routing configuration from the TUI.
@@ -8667,6 +8856,8 @@ class RadioTUI(App):
             self._handle_subs_command(arg)
         elif cmd in ("/groups", "/group"):
             self._handle_groups_command(arg)
+        elif cmd in ("/contacts", "/contact"):
+            self._handle_contacts_command(arg)
         elif cmd == "/bridge":
             self._handle_bridge_command(arg)
         elif cmd in ("/position", "/pos", "/grid"):
