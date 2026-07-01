@@ -23,6 +23,7 @@ from .chunking import (
     parse_chunk,
     segment,
 )
+from .bridge import BridgeEngine
 from .compliance import ComplianceGuard
 from .filters import FilterAction, FilterEngine
 from .groups import GroupRegistry
@@ -52,6 +53,8 @@ class Router:
         compliance: ComplianceGuard | None = None,
         ack_timeout: float = 30.0,
         ack_retries: int = 2,
+        bridge: BridgeEngine | None = None,
+        interlock: object | None = None,
     ) -> None:
         self._transports = transports
         self._by_name = {t.name: t for t in transports}
@@ -62,6 +65,8 @@ class Router:
         self._default_mode = default_mode
         self._station = station or Station()
         self._compliance = compliance or ComplianceGuard()
+        self._bridge = bridge
+        self._interlock = interlock
         self._ui_callbacks: list[UiCallback] = []
         self._seen: set[str] = set()  # in-memory dedup cache
         # -- app-level chunking / ACK-retry (small-MTU transports) ------------
@@ -379,3 +384,46 @@ class Router:
                 callback(msg, action)
             except Exception:  # noqa: BLE001
                 log.exception("ui callback failed")
+
+        # Cross-mode bridge: re-inject onto peer transports per config rules.
+        # Skipped for DROPped messages and when no bridge is configured.
+        if self._bridge and action is not FilterAction.DROP:
+            self._dispatch_bridge(msg)
+
+    def _dispatch_bridge(self, msg: UnifiedMessage) -> None:
+        """Forward *msg* to configured peer transports (fire-and-forget tasks)."""
+        import uuid as _uuid
+
+        assert self._bridge is not None
+        targets = self._bridge.targets(msg)
+        if not targets:
+            return
+
+        new_path = msg.metadata.get("bridge_path", []) + [msg.transport]
+
+        for target in targets:
+            # Check the radio interlock without acquiring — the bridge is a
+            # relay, not an operator TX session. Skip if busy, don't retry.
+            if self._interlock is not None:
+                blocker = self._interlock.blocked_by(target)
+                if blocker:
+                    log.warning(
+                        "bridge %s→%s skipped: radio busy (%s)",
+                        msg.transport, target, blocker,
+                    )
+                    continue
+
+            bridged = replace(
+                msg,
+                msg_id=_uuid.uuid4().hex,
+                metadata={
+                    **msg.metadata,
+                    "bridge_path": new_path,
+                    "bridged": True,
+                    "bridge_origin": msg.transport,
+                },
+            )
+            asyncio.create_task(
+                self.send(bridged, force_transport=target),
+                name=f"bridge-{msg.transport}-{target}",
+            )

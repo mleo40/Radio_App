@@ -21,7 +21,7 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
 > awareness, offline band-plan, **band tracking** (every HF message stamped with
 > its band; per-band history filters and aggregate stats), scheduled sends, and a
-> presence roster. 840 tests pass; the whole suite runs without radio hardware.
+> presence roster. 967 tests pass; the whole suite runs without radio hardware.
 
 ## Key ideas
 
@@ -446,6 +446,8 @@ radioapp schedule add --delay 30m --to W1AW "Net check-in"
 radioapp schedule add --at 19:00 --group EMS "Net starting now"
 radioapp schedule list
 radioapp schedule cancel <id>
+radioapp schedule band 40m 20:00 --daily   # JS8Call band change every night at 20:00 UTC
+radioapp schedule band 20m 08:00 --daily   # back to 20m at 08:00 UTC
 
 # Presence roster
 radioapp roster                           # who's been heard in the last 24h
@@ -477,11 +479,15 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
   same announce key re-announces your LXMF identity.
   - **JS8Call band bar:** in **JS8** mode the panel shows the **current dial
     frequency and band** (queried live from JS8Call) so you always know which
-    band you're on, plus quick band-switch buttons (**80m … 10m**) and a **↻**
-    refresh. Switch from the composer too: `/freq` shows the current frequency,
-    `/freq 14.078` (MHz) or `/freq 14078000` (Hz) sets it, and `/band 20m`
-    jumps to a band's standard JS8 dial frequency. Remote band changes require
-    JS8Call to have **CAT/rig control** configured (JS8Call drives the radio).
+    band you're on, plus quick band-switch buttons (**80m … 10m**), a **↻**
+    refresh, and a **📍 Beacon** button that transmits your grid square via
+    `STATION.SET_GRID` so nearby stations can log your position. Switch from the
+    composer too: `/freq` shows the current frequency, `/freq 14.078` (MHz) or
+    `/freq 14078000` (Hz) sets it, and `/band 20m` jumps to a band's standard
+    JS8 dial frequency. Remote band changes require JS8Call to have **CAT/rig
+    control** configured (JS8Call drives the radio). You can pre-program band
+    changes with `/sched band 40m 20:00 daily` — the scheduler fires them
+    automatically and skips quietly if another transport holds the radio.
   - **JS8Call quick-query bar:** a bar at the **bottom** of the JS8 panel sends
     standard JS8 directed queries to the open conversation with one tap —
     **SNR?**, **HEARING?**, **STATUS?**, **INFO?**. Open a callsign to ask one
@@ -498,7 +504,10 @@ operating **mode**, plus two utility surfaces, **Watch** and **Health**. See
     glance. New traffic appends live; pick a conversation (click a name, tap a
     row, or `/to <call|@GROUP>`) to focus it, and closing a conversation drops
     back to the firehose. (This applies to any chat mode that has no default
-    conversation, e.g. Reticulum too.)
+    conversation, e.g. Reticulum too.) In **MeshCore** mode, the composer
+    placeholder reads "click a channel to chat · /to @0 for public channel"
+    while no channel is selected, so new operators aren't left staring at a
+    silent input box.
   - **Adding a channel:** in MeshCore mode, type
     `/channel add <index> <#name> [secret]` in the composer (e.g.
     `/channel add 2 #ops`). A **hashtag channel** (a name starting with `#`)
@@ -607,10 +616,19 @@ In-composer commands:
 | `/fav add [type] <id> [label]` | add a favorite (`type` = `node\|peer\|call\|group\|channel\|contact`) |
 | `/fav here [label]` | favorite the **open conversation** (MeshCore channel by `#name`, contact by pubkey) |
 | `/fav list` / `/fav rm <id>` / `/fav only` | list favorites / remove one / toggle the favorites-only filter |
-| `/tmpl [<name>]` | list canned templates or load one into the composer |
+| `/tmpl [<name>\|add <n> <text>\|del <n>]` | list / load / create / delete canned templates |
 | `/sched +30m\|HH:MM [text]` | schedule composer content (or inline text) for later send |
+| `/sched list` / `/sched cancel <id>` | view pending scheduled sends / cancel one |
+| `/sched band <band> <time> [daily]` | (JS8Call) schedule a band change; `daily` repeats every 24h |
+| `/subs [add\|rm @GROUP]` | show group subscriptions / add or remove one |
+| `/groups [@NAME\|new\|delete\|add\|rm\|tag\|untag]` | manage group routing config (members, tags, outbound transports) |
+| `/contacts [<name>\|new\|delete\|link\|unlink\|rename]` | manage the cross-mode contacts book (link JS8Call/MeshCore/RNS/Winlink addresses to one person) |
+| `/bridge [list]` | show active cross-mode bridge/gateway rules from config |
+| `/filters [add\|edit\|del\|mv]` | manage inbound filter rules (notify/show/file/mute/drop by group/sender/transport/etc.) — takes effect immediately, first match wins |
+| `/position [<grid>\|clear]` | set your station grid square (e.g. `/position FN31`), show, or clear |
 | `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
 | `/bands [band]` | show offline band-plan / EmComm frequencies (same as `radioapp bands`) |
+| `/bands activity [band]` | show recent HF message activity from the store, optionally filtered by band |
 | `/freq` / `/freq <MHz\|Hz>` | (JS8Call) show / set the radio dial frequency |
 | `/band` / `/band <name>` | (JS8Call) list bands / switch band (e.g. `/band 20m`) |
 | `/subject <text>` | (Winlink) set the subject for the next message |

@@ -499,7 +499,72 @@ def _build_parser() -> argparse.ArgumentParser:
     p_sched_cancel = sched_sub.add_parser("cancel", help="cancel a scheduled message")
     p_sched_cancel.add_argument("id", help="message id (from schedule list)")
 
+    p_sched_band = sched_sub.add_parser(
+        "band", help="schedule a JS8Call band change"
+    )
+    p_sched_band.add_argument("band", help="band name, e.g. 40m, 20m")
+    p_sched_band.add_argument(
+        "time",
+        help="UTC time HH:MM or relative delay (+30m, +2h)",
+    )
+    p_sched_band.add_argument(
+        "--daily", action="store_true",
+        help="repeat every day at this time",
+    )
+
     p_sched.set_defaults(func=_cmd_schedule)
+
+    p_bridge = sub.add_parser("bridge", help="show active bridge / gateway rules")
+    p_bridge.set_defaults(func=_cmd_bridge)
+
+    p_filters = sub.add_parser(
+        "filters", help="manage inbound filter rules (list/add/edit/delete/reorder)"
+    )
+    p_filters.add_argument(
+        "subcommand",
+        nargs="?",
+        default="list",
+        choices=["list", "add", "edit", "del", "delete", "mv", "move"],
+        help="action to perform (default: list)",
+    )
+    p_filters.add_argument(
+        "ref", nargs="?", help="rule name (add) or name/index (edit/del/mv)"
+    )
+    p_filters.add_argument(
+        "rule_action",
+        nargs="?",
+        help="filter action for add/edit (notify|show|file|mute|drop); up/down for mv",
+    )
+    p_filters.add_argument(
+        "match",
+        nargs="*",
+        help="match conditions as key=value, e.g. group=EMS transport=js8call",
+    )
+    p_filters.set_defaults(func=_cmd_filters)
+
+    for _alias in ("contacts", "contact"):
+        p_contacts = sub.add_parser(
+            _alias,
+            help="manage the cross-mode contacts book",
+        )
+        p_contacts.add_argument(
+            "action",
+            nargs="?",
+            default="list",
+            choices=["list", "show", "add", "link", "unlink", "rename", "delete"],
+            help="action to perform (default: list)",
+        )
+        p_contacts.add_argument("name", nargs="?", default="",
+                                help="contact display name")
+        p_contacts.add_argument("arg2", nargs="?", default="",
+                                help="transport (for link/unlink)")
+        p_contacts.add_argument("arg3", nargs="?", default="",
+                                help="address (for link/unlink) or new name (for rename)")
+        p_contacts.add_argument("--label", default="",
+                                help="optional label for linked identity")
+        p_contacts.add_argument("--notes", default="",
+                                help="notes for new contact")
+        p_contacts.set_defaults(func=_cmd_contacts)
 
     p_roster = sub.add_parser("roster", help="show recently-heard stations")
     p_roster.add_argument("--transport", help="filter to a specific transport")
@@ -1164,6 +1229,11 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
     action = getattr(args, "sched_action", None) or "list"
 
     try:
+        if action == "cancel":
+            ok = store.schedule_cancel(args.id)
+            print("Cancelled." if ok else f"No pending message with id '{args.id}'.")
+            return 0 if ok else 1
+
         if action == "list":
             entries = store.schedule_pending()
             if not entries:
@@ -1171,14 +1241,63 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
                 return 0
             for e in entries:
                 ts = e.fire_at.strftime("%Y-%m-%d %H:%M UTC")
-                tp = f" [{e.transport}]" if e.transport else ""
-                print(f"  {e.id[:8]}  {ts}{tp}  {e.message.content[:60]!r}")
+                kind = e.message.metadata.get("kind")
+                if kind == "band_change":
+                    band_name = e.message.metadata.get("band", "?")
+                    daily = " [daily]" if e.message.metadata.get("recur_daily") else ""
+                    print(f"  {e.id[:8]}  {ts}  [band change → {band_name}]{daily}")
+                else:
+                    tp = f" [{e.transport}]" if e.transport else ""
+                    print(f"  {e.id[:8]}  {ts}{tp}  {e.message.content[:60]!r}")
             return 0
 
-        if action == "cancel":
-            ok = store.schedule_cancel(args.id)
-            print("Cancelled." if ok else f"No pending message with id '{args.id}'.")
-            return 0 if ok else 1
+        if action == "band":
+            from .core.message import AddressType
+            from .transports.js8call_transport import dial_for_band
+            band_name = args.band.lower()
+            if dial_for_band(band_name) is None:
+                print(f"error: unknown band '{band_name}'", file=sys.stderr)
+                return 2
+            time_spec = args.time.strip()
+            now = datetime.now(UTC)
+            try:
+                if time_spec.startswith("+"):
+                    raw = time_spec[1:].lower()
+                    if "h" in raw and "m" in raw:
+                        h_part, rest = raw.split("h")
+                        minutes = int(h_part) * 60 + int(rest.rstrip("m"))
+                    elif "h" in raw:
+                        minutes = int(raw.rstrip("h")) * 60
+                    else:
+                        minutes = int(raw.rstrip("m"))
+                    fire_at = now + timedelta(minutes=minutes)
+                else:
+                    hh, mm = time_spec.split(":")
+                    fire_at = now.replace(
+                        hour=int(hh), minute=int(mm), second=0, microsecond=0
+                    )
+                    if fire_at <= now:
+                        fire_at += timedelta(days=1)
+            except (ValueError, AttributeError):
+                print("error: time must be HH:MM or +Nm/+Nh", file=sys.stderr)
+                return 2
+            name = cfg.station.get("callsign") or "scheduler"
+            msg = UnifiedMessage(
+                sender=name,
+                content=f"Band change: {band_name}",
+                address_type=AddressType.BROADCAST,
+                metadata={
+                    "kind": "band_change",
+                    "band": band_name,
+                    "recur_daily": bool(getattr(args, "daily", False)),
+                },
+                transport="js8call",
+            )
+            store.schedule_add(msg, fire_at, transport="js8call")
+            ts = fire_at.strftime("%Y-%m-%d %H:%M UTC")
+            daily_str = " (daily)" if getattr(args, "daily", False) else ""
+            print(f"Band change to {band_name} scheduled for {ts}{daily_str}  [{msg.msg_id[:8]}]")
+            return 0
 
         if action == "add":
             now = datetime.now(UTC)
@@ -1239,6 +1358,249 @@ def _cmd_schedule(args: argparse.Namespace) -> int:
         store.close()
 
     print(f"Unknown action '{action}'. Use: add | list | cancel", file=sys.stderr)
+    return 2
+
+
+def _cmd_contacts(args: argparse.Namespace) -> int:
+    """Manage the cross-mode contacts book."""
+    from .config import Config
+    from .core.contacts import ContactBook
+    from .core.store import MessageStore
+
+    cfg = Config.load(args.config)
+    store = MessageStore(cfg.database_path())
+    book = ContactBook(store._conn)
+    action = args.action or "list"
+
+    try:
+        if action == "list":
+            contacts = book.all()
+            if not contacts:
+                print("(no contacts — add one with 'radioapp contacts add \"Name\"')")
+                return 0
+            for c in contacts:
+                ids = book.identities_for(c.contact_id)
+                suffix = f"  [{len(ids)} identity]" if len(ids) == 1 else f"  [{len(ids)} identities]"
+                print(f"  {c.display_name}{suffix}")
+            return 0
+
+        if action == "add":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts add \"Name\" [--notes \"...\"]",
+                      file=sys.stderr)
+                return 2
+            c = book.add(name, notes=args.notes)
+            print(f"created: {c.display_name}  (id: {c.contact_id[:8]})")
+            return 0
+
+        if action == "show":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts show \"Name\"", file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            for c in matches:
+                print(f"{c.display_name}  (id: {c.contact_id[:8]})")
+                if c.notes:
+                    print(f"  notes: {c.notes}")
+                ids = book.identities_for(c.contact_id)
+                if ids:
+                    for ident in ids:
+                        lbl = f"  ({ident.label})" if ident.label else ""
+                        print(f"  {ident.transport:<12} {ident.address}{lbl}")
+                else:
+                    print("  (no linked identities)")
+            return 0
+
+        if action == "link":
+            name = args.name.strip()
+            transport = args.arg2.strip().lower()
+            address = args.arg3.strip()
+            if not name or not transport or not address:
+                print("usage: radioapp contacts link \"Name\" <transport> <address> [--label \"...\"]",
+                      file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            try:
+                book.link(c.contact_id, transport, address, label=args.label)
+            except ValueError as exc:
+                print(f"error: {exc}", file=sys.stderr)
+                return 1
+            print(f"linked {transport}:{address} to {c.display_name}")
+            return 0
+
+        if action == "unlink":
+            transport = args.name.strip().lower()
+            address = args.arg2.strip()
+            if not transport or not address:
+                print("usage: radioapp contacts unlink <transport> <address>",
+                      file=sys.stderr)
+                return 2
+            if book.unlink(transport, address):
+                print(f"unlinked {transport}:{address}")
+            else:
+                print(f"{transport}:{address} was not linked to any contact",
+                      file=sys.stderr)
+                return 1
+            return 0
+
+        if action == "rename":
+            name = args.name.strip()
+            new_name = args.arg2.strip()
+            if not name or not new_name:
+                print("usage: radioapp contacts rename \"Old Name\" \"New Name\"",
+                      file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            book.rename(c.contact_id, new_name)
+            print(f"renamed: {c.display_name} → {new_name}")
+            return 0
+
+        if action == "delete":
+            name = args.name.strip()
+            if not name:
+                print("usage: radioapp contacts delete \"Name\"", file=sys.stderr)
+                return 2
+            matches = book.by_name(name)
+            if not matches:
+                print(f"no contact found matching '{name}'", file=sys.stderr)
+                return 1
+            c = matches[0]
+            ids = book.identities_for(c.contact_id)
+            book.delete(c.contact_id)
+            print(f"deleted: {c.display_name} (removed {len(ids)} linked identities)")
+            return 0
+
+        print(f"unknown action '{action}'", file=sys.stderr)
+        return 2
+    finally:
+        store.close()
+
+
+def _cmd_bridge(args: argparse.Namespace) -> int:
+    """List configured bridge / gateway rules."""
+    from .config import Config
+    from .core.bridge import BridgeEngine
+
+    cfg = Config.load(args.config)
+    engine = BridgeEngine.from_config(cfg)
+    rules = engine.rules
+    if not rules:
+        print(
+            "No bridge rules configured.\n"
+            "Add [[bridge]] sections to config.toml, e.g.:\n"
+            "\n"
+            "  [[bridge]]\n"
+            "  from   = \"js8call\"\n"
+            "  to     = \"reticulum\"\n"
+            "  filter = \"*\"   # *, broadcast, group, direct"
+        )
+        return 0
+    print(f"Bridge rules ({len(rules)} active):")
+    for r in rules:
+        addr = f"  [{r.address_filter}]" if r.address_filter != "*" else ""
+        print(f"  {r.from_transport} → {r.to_transport}{addr}")
+    return 0
+
+
+def _print_filters(engine) -> int:
+    rules = engine.rules
+    if not rules:
+        print(
+            "No filter rules configured. Everything defaults to 'show'.\n"
+            "Add [[filters]] sections to config.toml, or use "
+            "'radioapp filters add <name> <action> [key=value ...]'."
+        )
+        return 0
+    print(f"Filter rules ({len(rules)}, evaluated top to bottom):")
+    for i, r in enumerate(rules, start=1):
+        match = ", ".join(f"{k}={v}" for k, v in r.match.items()) or "(all)"
+        print(f"  {i}. {r.name or '(unnamed)':<24} {r.action.value:<8} {match}")
+    return 0
+
+
+def _cmd_filters(args: argparse.Namespace) -> int:
+    """List, add, edit, delete, or reorder inbound filter rules."""
+    from .config import Config
+    from .core.filters import FilterEngine, build_filter_rule
+    from .core.groups import GroupRegistry
+
+    cfg = Config.load(args.config)
+    groups = GroupRegistry.from_config(cfg)
+    engine = FilterEngine.from_config(cfg, groups)
+    sub = args.subcommand
+
+    if sub == "list":
+        return _print_filters(engine)
+
+    if sub == "add":
+        if not args.ref or not args.rule_action:
+            print("error: add needs a rule name and an action", file=sys.stderr)
+            return 2
+        try:
+            rule = build_filter_rule(args.ref, args.rule_action, args.match)
+            engine.add_rule(rule)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        engine.save(cfg)
+        print(f"added rule '{rule.name}' ({rule.action.value})")
+        return 0
+
+    if sub == "edit":
+        if not args.ref or not args.rule_action:
+            print("error: edit needs a rule reference and an action", file=sys.stderr)
+            return 2
+        try:
+            ok = engine.edit_rule(args.ref, args.rule_action, args.match)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not ok:
+            print(f"no such rule '{args.ref}'", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"updated rule '{args.ref}'")
+        return 0
+
+    if sub in ("del", "delete"):
+        if not args.ref:
+            print("error: delete needs a rule reference", file=sys.stderr)
+            return 2
+        removed = engine.remove_rule(args.ref)
+        if removed is None:
+            print(f"no such rule '{args.ref}'", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"deleted rule '{removed.name}'")
+        return 0
+
+    if sub in ("mv", "move"):
+        if not args.ref or args.rule_action not in ("up", "down"):
+            print(
+                "error: mv needs a rule reference and 'up' or 'down'", file=sys.stderr
+            )
+            return 2
+        if not engine.move_rule(args.ref, args.rule_action):
+            print(f"could not move '{args.ref}' {args.rule_action}", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"moved '{args.ref}' {args.rule_action}")
+        return 0
+
+    print(f"unknown action '{sub}'", file=sys.stderr)
     return 2
 
 
