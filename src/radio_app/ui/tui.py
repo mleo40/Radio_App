@@ -100,6 +100,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/groups [@NAME|new|delete|add|rm|tag|untag], "
     "/contacts [<name>|new|delete|link|unlink|rename], "
     "/bridge [list], "
+    "/filters [add|edit|del|mv] ..., "
     "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
@@ -7894,6 +7895,111 @@ class RadioTUI(App):
         )
         self._log_system("\n".join(lines))
 
+    def _handle_filters_command(self, arg: str) -> None:
+        """List, add, edit, delete, or reorder inbound filter rules.
+
+        /filters                                — list rules (evaluation order)
+        /filters add <name> <action> [k=v ...]  — add a rule
+        /filters edit <ref> <action> [k=v ...]  — replace a rule's action/match
+        /filters del <ref>                      — delete a rule (ref = name or #)
+        /filters mv <ref> up|down                — reorder
+        """
+        if self.core is None:
+            return
+        from ..core.filters import build_filter_rule
+
+        engine = self.core.filters
+        parts = arg.strip().split()
+        sub = parts[0].lower() if parts else ""
+
+        if not arg or sub == "list":
+            self._filters_list(engine)
+            return
+
+        if sub == "add":
+            if len(parts) < 3:
+                self._log_system(
+                    "usage: /filters add <name> <action> [key=value ...]  "
+                    "e.g. /filters add ems-hf notify group=EMS transport=js8call"
+                )
+                return
+            try:
+                rule = build_filter_rule(parts[1], parts[2], parts[3:])
+                engine.add_rule(rule)
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{rule.name}' added ({rule.action.value}).")
+            return
+
+        if sub == "edit":
+            if len(parts) < 3:
+                self._log_system(
+                    "usage: /filters edit <name|#> <action> [key=value ...]"
+                )
+                return
+            try:
+                ok = engine.edit_rule(parts[1], parts[2], parts[3:])
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+                return
+            if not ok:
+                self._log_system(f"No such filter rule '{parts[1]}'.")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{parts[1]}' updated.")
+            return
+
+        if sub in ("del", "delete", "rm", "remove"):
+            if len(parts) < 2:
+                self._log_system("usage: /filters del <name|#>")
+                return
+            removed = engine.remove_rule(parts[1])
+            if removed is None:
+                self._log_system(f"No such filter rule '{parts[1]}'.")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{removed.name}' deleted.")
+            return
+
+        if sub in ("mv", "move"):
+            if len(parts) < 3 or parts[2].lower() not in ("up", "down"):
+                self._log_system("usage: /filters mv <name|#> up|down")
+                return
+            if not engine.move_rule(parts[1], parts[2].lower()):
+                self._log_system(f"Could not move '{parts[1]}' {parts[2].lower()}.")
+                return
+            engine.save(self.core.config)
+            self._filters_list(engine)
+            return
+
+        self._log_system(
+            f"unknown /filters action '{sub}'  ·  try: add | edit | del | mv"
+        )
+
+    def _filters_list(self, engine: object) -> None:
+        from ..core.filters import FilterEngine
+        assert isinstance(engine, FilterEngine)
+        rules = engine.rules
+        if not rules:
+            self._log_system(
+                "No filter rules configured. Everything defaults to 'show'.\n"
+                "Use /filters add <name> <action> [key=value ...] to create one."
+            )
+            return
+        lines = [f"[b]Filter rules[/b] ({len(rules)}, evaluated top to bottom):"]
+        for i, r in enumerate(rules, start=1):
+            match = ", ".join(f"{k}={v}" for k, v in r.match.items()) or "(all)"
+            name = r.name or "(unnamed)"
+            lines.append(
+                f"  {i}. [b]{name}[/b]  {r.action.value}  [dim]{match}[/dim]"
+            )
+        lines.append(
+            "[dim]/filters add|edit|del|mv — manage rules; first match wins[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
     def _handle_contacts_command(self, arg: str) -> None:
         """Manage the cross-mode contacts book.
 
@@ -8860,6 +8966,8 @@ class RadioTUI(App):
             self._handle_contacts_command(arg)
         elif cmd == "/bridge":
             self._handle_bridge_command(arg)
+        elif cmd == "/filters":
+            self._handle_filters_command(arg)
         elif cmd in ("/position", "/pos", "/grid"):
             self._handle_position_command(arg)
         elif cmd == "/start":

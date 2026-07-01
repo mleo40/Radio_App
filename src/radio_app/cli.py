@@ -517,6 +517,31 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bridge = sub.add_parser("bridge", help="show active bridge / gateway rules")
     p_bridge.set_defaults(func=_cmd_bridge)
 
+    p_filters = sub.add_parser(
+        "filters", help="manage inbound filter rules (list/add/edit/delete/reorder)"
+    )
+    p_filters.add_argument(
+        "subcommand",
+        nargs="?",
+        default="list",
+        choices=["list", "add", "edit", "del", "delete", "mv", "move"],
+        help="action to perform (default: list)",
+    )
+    p_filters.add_argument(
+        "ref", nargs="?", help="rule name (add) or name/index (edit/del/mv)"
+    )
+    p_filters.add_argument(
+        "rule_action",
+        nargs="?",
+        help="filter action for add/edit (notify|show|file|mute|drop); up/down for mv",
+    )
+    p_filters.add_argument(
+        "match",
+        nargs="*",
+        help="match conditions as key=value, e.g. group=EMS transport=js8call",
+    )
+    p_filters.set_defaults(func=_cmd_filters)
+
     for _alias in ("contacts", "contact"):
         p_contacts = sub.add_parser(
             _alias,
@@ -1488,6 +1513,95 @@ def _cmd_bridge(args: argparse.Namespace) -> int:
         addr = f"  [{r.address_filter}]" if r.address_filter != "*" else ""
         print(f"  {r.from_transport} → {r.to_transport}{addr}")
     return 0
+
+
+def _print_filters(engine) -> int:
+    rules = engine.rules
+    if not rules:
+        print(
+            "No filter rules configured. Everything defaults to 'show'.\n"
+            "Add [[filters]] sections to config.toml, or use "
+            "'radioapp filters add <name> <action> [key=value ...]'."
+        )
+        return 0
+    print(f"Filter rules ({len(rules)}, evaluated top to bottom):")
+    for i, r in enumerate(rules, start=1):
+        match = ", ".join(f"{k}={v}" for k, v in r.match.items()) or "(all)"
+        print(f"  {i}. {r.name or '(unnamed)':<24} {r.action.value:<8} {match}")
+    return 0
+
+
+def _cmd_filters(args: argparse.Namespace) -> int:
+    """List, add, edit, delete, or reorder inbound filter rules."""
+    from .config import Config
+    from .core.filters import FilterEngine, build_filter_rule
+    from .core.groups import GroupRegistry
+
+    cfg = Config.load(args.config)
+    groups = GroupRegistry.from_config(cfg)
+    engine = FilterEngine.from_config(cfg, groups)
+    sub = args.subcommand
+
+    if sub == "list":
+        return _print_filters(engine)
+
+    if sub == "add":
+        if not args.ref or not args.rule_action:
+            print("error: add needs a rule name and an action", file=sys.stderr)
+            return 2
+        try:
+            rule = build_filter_rule(args.ref, args.rule_action, args.match)
+            engine.add_rule(rule)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        engine.save(cfg)
+        print(f"added rule '{rule.name}' ({rule.action.value})")
+        return 0
+
+    if sub == "edit":
+        if not args.ref or not args.rule_action:
+            print("error: edit needs a rule reference and an action", file=sys.stderr)
+            return 2
+        try:
+            ok = engine.edit_rule(args.ref, args.rule_action, args.match)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        if not ok:
+            print(f"no such rule '{args.ref}'", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"updated rule '{args.ref}'")
+        return 0
+
+    if sub in ("del", "delete"):
+        if not args.ref:
+            print("error: delete needs a rule reference", file=sys.stderr)
+            return 2
+        removed = engine.remove_rule(args.ref)
+        if removed is None:
+            print(f"no such rule '{args.ref}'", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"deleted rule '{removed.name}'")
+        return 0
+
+    if sub in ("mv", "move"):
+        if not args.ref or args.rule_action not in ("up", "down"):
+            print(
+                "error: mv needs a rule reference and 'up' or 'down'", file=sys.stderr
+            )
+            return 2
+        if not engine.move_rule(args.ref, args.rule_action):
+            print(f"could not move '{args.ref}' {args.rule_action}", file=sys.stderr)
+            return 1
+        engine.save(cfg)
+        print(f"moved '{args.ref}' {args.rule_action}")
+        return 0
+
+    print(f"unknown action '{sub}'", file=sys.stderr)
+    return 2
 
 
 def _cmd_roster(args: argparse.Namespace) -> int:

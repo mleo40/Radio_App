@@ -37,6 +37,13 @@ class FilterRule:
     match: dict = field(default_factory=dict)
     name: str = ""
 
+    def to_config(self) -> dict:
+        """Serialize back to the ``[[filters]]`` TOML shape."""
+        out: dict = {"name": self.name, "action": self.action.value}
+        if self.match:
+            out["match"] = dict(self.match)
+        return out
+
     def matches(self, msg: UnifiedMessage) -> bool:
         m = self.match
         if "address_type" in m and msg.address_type.value != m["address_type"]:
@@ -55,12 +62,108 @@ class FilterRule:
         return True
 
 
+_MATCH_KEYS = {"group", "sender", "transport", "address_type", "contains"}
+
+
+def build_filter_rule(name: str, action: str, match_args: list[str]) -> FilterRule:
+    """Build a :class:`FilterRule` from CLI/TUI-style args.
+
+    ``match_args`` is a list of ``key=value`` tokens (e.g. ``["group=EMS",
+    "transport=js8call"]``). Raises :class:`ValueError` with an operator-facing
+    message on an unknown action or match key.
+    """
+    try:
+        act = FilterAction(action.strip().lower())
+    except ValueError:
+        valid = ", ".join(a.value for a in FilterAction)
+        raise ValueError(
+            f"invalid action '{action}' (expected one of: {valid})"
+        ) from None
+    match: dict[str, str] = {}
+    for token in match_args:
+        if "=" not in token:
+            raise ValueError(f"expected key=value, got '{token}'")
+        key, _, value = token.partition("=")
+        key = key.strip().lower()
+        if key not in _MATCH_KEYS:
+            valid = ", ".join(sorted(_MATCH_KEYS))
+            raise ValueError(f"unknown match key '{key}' (expected one of: {valid})")
+        match[key] = value.strip()
+    return FilterRule(name=name.strip(), action=act, match=match)
+
+
 class FilterEngine:
     """Applies subscriptions + ordered rules to inbound messages."""
 
     def __init__(self, rules: list[FilterRule], groups: GroupRegistry) -> None:
         self._rules = rules
         self._groups = groups
+
+    # -- management (TUI / CLI driven; persist via save()) --------------------
+
+    @property
+    def rules(self) -> list[FilterRule]:
+        return list(self._rules)
+
+    def find_index(self, ref: str) -> int | None:
+        """Resolve a rule name or 1-based index string to a list index."""
+        ref = ref.strip()
+        if ref.lstrip("-").isdigit():
+            i = int(ref) - 1
+            return i if 0 <= i < len(self._rules) else None
+        for i, r in enumerate(self._rules):
+            if r.name == ref:
+                return i
+        return None
+
+    def add_rule(self, rule: FilterRule) -> None:
+        if rule.name and any(r.name == rule.name for r in self._rules):
+            raise ValueError(f"a rule named '{rule.name}' already exists")
+        # New rules are necessarily more specific than an existing catch-all
+        # (empty match), so insert ahead of the first one instead of appending
+        # after it - otherwise the catch-all would always win first and the
+        # new rule would never fire.
+        for i, r in enumerate(self._rules):
+            if not r.match:
+                self._rules.insert(i, rule)
+                return
+        self._rules.append(rule)
+
+    def edit_rule(self, ref: str, action: str, match_args: list[str]) -> bool:
+        """Replace an existing rule's action/match in place. Name is kept."""
+        idx = self.find_index(ref)
+        if idx is None:
+            return False
+        name = self._rules[idx].name
+        self._rules[idx] = build_filter_rule(name, action, match_args)
+        return True
+
+    def remove_rule(self, ref: str) -> FilterRule | None:
+        idx = self.find_index(ref)
+        if idx is None:
+            return None
+        return self._rules.pop(idx)
+
+    def move_rule(self, ref: str, direction: str) -> bool:
+        idx = self.find_index(ref)
+        if idx is None:
+            return False
+        rules = self._rules
+        if direction == "up" and idx > 0:
+            rules[idx - 1], rules[idx] = rules[idx], rules[idx - 1]
+            return True
+        if direction == "down" and idx < len(rules) - 1:
+            rules[idx + 1], rules[idx] = rules[idx], rules[idx + 1]
+            return True
+        return False
+
+    def save(self, config: object) -> None:
+        """Persist rules (name, action, match) back to config."""
+        from ..config import Config
+
+        assert isinstance(config, Config)
+        config.data["filters"] = [r.to_config() for r in self._rules]
+        config.save()
 
     @classmethod
     def from_config(cls, config: object, groups: GroupRegistry) -> FilterEngine:
