@@ -6254,7 +6254,7 @@ class RadioTUI(App):
         hz = getattr(t, "dial_freq", None)
         band = t.current_band()
         if hz:
-            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or "?"})[/dim]")
+            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or '?'})[/dim]")
         else:
             label.update("JS8Call  [dim]freq unknown — \u21bb to query[/dim]")
         for btn in bar.query(Button):
