@@ -124,6 +124,10 @@ src/radio_app/
 
 ## Installation
 
+> See [`INSTALL.md`](INSTALL.md) for a fresh-Debian walkthrough (including the PEP 668/venv
+> gotcha) and the full list of external programs (JS8Call, WSJT-X, Pat, gpsd, etc.) Radio_App
+> expects but never bundles.
+
 Requires **Python 3.10+**. On Python 3.10, `tomli` is installed automatically as a backport for `tomllib`; on 3.11+ it uses the stdlib module.
 
 ```bash
