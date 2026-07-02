@@ -79,6 +79,7 @@ from ..transports.js8call_transport import (
     dial_for_band,
 )
 from .about import ABOUT_MD
+from .reference import JS8CALL_MD, OTHER_MODES_MD, QMX_QDX_MD, TRUSDX_MD, WSJTX_MD
 
 # Default cap for the in-memory Watch scrollback (rows). Overridable via
 # [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
@@ -1720,6 +1721,80 @@ class AboutScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ReferenceScreen(ModalScreen[None]):
+    """Field reference: radio + mode setup how-to, no internet required.
+
+    Opened with F1. Content is baked into the package (see ``ui/reference.py``)
+    so it's available on a fresh field deployment with no docs/ checkout.
+    """
+
+    CSS = """
+    ReferenceScreen { align: center middle; }
+    #ref-box {
+        width: 86%; height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #ref-title   { height: auto; margin-bottom: 1; }
+    #ref-tabs    { height: 3; }
+    #ref-tabs Button {
+        height: 1; border: none; padding: 0 2; margin: 0 1 0 0;
+    }
+    #ref-tabs Button.-active { text-style: bold reverse; }
+    #ref-content { height: 1fr; }
+    #ref-hint    { height: 1; color: $text-muted; text-align: center; }
+    """
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+    ]
+
+    _TABS = (
+        ("ref-trusdx", "(tr)uSDX", TRUSDX_MD),
+        ("ref-qmx", "QMX / QDX", QMX_QDX_MD),
+        ("ref-js8", "JS8Call", JS8CALL_MD),
+        ("ref-wsjtx", "WSJT-X", WSJTX_MD),
+        ("ref-other", "Other modes", OTHER_MODES_MD),
+    )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ref-box"):
+            yield Static("[b]📻 Field Reference[/b]", id="ref-title")
+            with Horizontal(id="ref-tabs"):
+                for tab_id, label, _md in self._TABS:
+                    yield Button(label, id=tab_id, classes="rtab")
+            with ContentSwitcher(
+                initial=f"{self._TABS[0][0]}-pane", id="ref-content"
+            ):
+                for tab_id, _label, md in self._TABS:
+                    with VerticalScroll(id=f"{tab_id}-pane"):
+                        yield Markdown(md)
+            yield Static("Esc / q to close", id="ref-hint")
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{self._TABS[0][0]}", Button).add_class("-active")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        for tab_id, _label, _md in self._TABS:
+            if bid == tab_id:
+                self.query_one("#ref-content", ContentSwitcher).current = (
+                    f"{tab_id}-pane"
+                )
+                self._set_active_tab(tab_id)
+                event.stop()
+                return
+
+    def _set_active_tab(self, tab_id: str) -> None:
+        for tid, _label, _md in self._TABS:
+            try:
+                self.query_one(f"#{tid}", Button).set_class(tid == tab_id, "-active")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class LaunchCmdScreen(ModalScreen):
     """One-shot prompt to customise the launch command for a transport's backing app.
 
@@ -1901,6 +1976,7 @@ class RadioTUI(App):
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("q", "quit", "Quit"),
+        Binding("f1", "reference", "Reference", priority=True),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
         ("f5", "cycle_utility", "Stream/Health…"),
@@ -2770,6 +2846,15 @@ class RadioTUI(App):
         if isinstance(self.screen, AboutScreen):
             return
         self.push_screen(AboutScreen())
+
+    def action_reference(self) -> None:
+        """F1: show the field reference (radio + mode setup how-to).
+
+        Guarded so a second press while it's open doesn't stack screens.
+        """
+        if isinstance(self.screen, ReferenceScreen):
+            return
+        self.push_screen(ReferenceScreen())
 
     def action_copy_address(self, value: str = "") -> None:
         """Copy a value (e.g. your Reticulum address) to the clipboard.
@@ -6093,7 +6178,12 @@ class RadioTUI(App):
         try:
             received = await t.connect_now(url)
         except Exception as exc:  # noqa: BLE001
+            # A session can run for a while; if the operator has switched to
+            # another mode (which clears #messages) or a utility view, this
+            # log line alone would never reach them. Toast regardless of
+            # what's currently on screen.
             self._log_system(f"Winlink connect failed: {exc}")
+            self.notify(f"Connect failed: {exc}", title="Winlink", severity="error")
             return
         finally:
             stop.set()
@@ -6120,6 +6210,9 @@ class RadioTUI(App):
         got = max(int(received or 0), len(seen["recv"]))
         self._log_system(
             f"\u2713 Winlink session complete \u2014 sent {sent}, received {got}."
+        )
+        self.notify(
+            f"Session complete \u2014 sent {sent}, received {got}.", title="Winlink"
         )
         if queued_after:
             self._log_system(
@@ -7939,7 +8032,15 @@ class RadioTUI(App):
 
         best = report.best()
         if best is None:
+            # No modal to interrupt with here, and a multi-minute scan often
+            # finishes while the operator has navigated away (F5) to another
+            # view — a toast is the only thing that reaches them regardless
+            # of what's currently on screen.
             self._log_system("Band scan: no replies heard on any band.")
+            self.notify(
+                "No replies heard on any band.",
+                title="Band scan complete", severity="warning",
+            )
             if report.original_band:
                 hz = dial_for_band(report.original_band)
                 if hz:
@@ -7947,6 +8048,11 @@ class RadioTUI(App):
                     self._update_js8_bar()
             return
 
+        self.notify(
+            f"Best band: {best.band} ({best.heard_count} heard) — "
+            "check the JS8Call pane to switch.",
+            title="Band scan complete",
+        )
         result = await self.push_screen_wait(
             BandScanResultScreen(report.results, best.band)
         )
