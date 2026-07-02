@@ -2132,6 +2132,12 @@ class RadioTUI(App):
                         )
                     yield Button("\u21bb", id="js8-freq-refresh", classes="modebtn")
                     yield Button(
+                        "\U0001f4e3 CQ", id="js8-cq", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f493 HB", id="js8-hb", classes="modebtn"
+                    )
+                    yield Button(
                         "\u2709 SMS", id="js8-sms", classes="modebtn"
                     )
                     yield Button(
@@ -3307,6 +3313,10 @@ class RadioTUI(App):
             self._js8_switch_band(bid[len("js8-band-"):])
         elif bid == "js8-freq-refresh":
             self._js8_refresh_freq()
+        elif bid == "js8-cq":
+            self._js8_send_cq()
+        elif bid == "js8-hb":
+            self._js8_send_hb()
         elif bid == "js8-sms":
             self._js8_sms_prompt()
         elif bid == "js8-beacon":
@@ -6345,6 +6355,42 @@ class RadioTUI(App):
             )
             return
         self._send(f"{name}?")
+
+    @work
+    async def _js8_send_cq(self) -> None:
+        """Transmit a CQ call (📣 CQ button)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        callsign = ""
+        if self.core is not None:
+            callsign = str(
+                t.config.get("callsign")
+                or self.core.config.station.get("callsign", "")
+                or ""
+            )
+        ok = await t.send_cq(callsign)
+        if ok:
+            self._log_system("\U0001f4e3 CQ sent.")
+        else:
+            self._log_system("CQ failed — check JS8Call connection.")
+
+    @work
+    async def _js8_send_hb(self) -> None:
+        """Transmit a JS8Call heartbeat (💓 HB button)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        grid = ""
+        if self.core is not None:
+            grid = str(self.core.config.station.get("grid_square", "") or "")
+        ok = await t.send_heartbeat(grid)
+        if ok:
+            self._log_system("\U0001f493 Heartbeat sent (@HB).")
+        else:
+            self._log_system("Heartbeat failed — check JS8Call connection.")
 
     @work
     async def _js8_send_beacon(self) -> None:

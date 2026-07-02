@@ -734,6 +734,12 @@ In-composer commands:
 > Callsigns (JS8Call/Winlink) are upper-cased for you; MeshCore names/hashes and
 > Reticulum addresses are kept **case-sensitive**.
 
+> **JS8Call action bar** (below the mode chips) has one-click buttons with no
+> slash-command equivalent: **⚡ Start**, per-band buttons, **↻** (refresh dial
+> frequency), **📣 CQ** (broadcast a CQ call), **💓 HB** (JS8Call heartbeat —
+> other JS8Call stations with heartbeat ack enabled auto-reply with your SNR;
+> the same mechanism `/bandscan` uses per band), **✉ SMS**, and **📍 Beacon**.
+
 Typing plain text sends to the selected conversation **over the active mode only**.
 Each line shows the transport that carried it (`[js8call]`, `[reticulum]`, ...).
 HF messages (JS8Call and WSJT-X) additionally show a **dim band tag** between
