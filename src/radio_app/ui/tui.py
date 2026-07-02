@@ -6093,7 +6093,12 @@ class RadioTUI(App):
         try:
             received = await t.connect_now(url)
         except Exception as exc:  # noqa: BLE001
+            # A session can run for a while; if the operator has switched to
+            # another mode (which clears #messages) or a utility view, this
+            # log line alone would never reach them. Toast regardless of
+            # what's currently on screen.
             self._log_system(f"Winlink connect failed: {exc}")
+            self.notify(f"Connect failed: {exc}", title="Winlink", severity="error")
             return
         finally:
             stop.set()
@@ -6120,6 +6125,9 @@ class RadioTUI(App):
         got = max(int(received or 0), len(seen["recv"]))
         self._log_system(
             f"\u2713 Winlink session complete \u2014 sent {sent}, received {got}."
+        )
+        self.notify(
+            f"Session complete \u2014 sent {sent}, received {got}.", title="Winlink"
         )
         if queued_after:
             self._log_system(
