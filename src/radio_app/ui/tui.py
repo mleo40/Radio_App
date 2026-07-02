@@ -104,6 +104,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/bridge [list], "
     "/filters [add|edit|del|mv] ..., "
     "/position [<grid>|clear], "
+    "/map [<grid>|<favorite>] — ASCII compass map of favorites' grid squares, "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
     "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
@@ -8708,6 +8709,78 @@ class RadioTUI(App):
             f"Position set: {lat:+.4f}°  {lon:+.4f}°  grid [b]{grid}[/b]"
         )
 
+    def _handle_map_command(self, arg: str) -> None:
+        """ASCII compass map of favorites with a known grid square.
+
+        /map              — radar plot + distance/bearing to every favorite
+                             that has a grid square set
+        /map <grid>       — distance/bearing to one arbitrary grid square
+        /map <id|label>   — distance/bearing to one favorite, by lookup
+        """
+        if self.core is None:
+            return
+        from ..core.maidenhead import _GRID_RE as _GRE
+        from ..core.maidenhead import (
+            bearing_distance,
+            compass_point,
+            render_compass_map,
+        )
+        from ..core.position import position_from_config
+
+        pos = self._position or position_from_config(self.core.config)
+        if pos is None or not pos.grid:
+            self._log_system(
+                "No position set. Use /position <grid> to configure one."
+            )
+            return
+        my_grid = pos.grid
+
+        target = arg.strip()
+        if target:
+            if _GRE.match(target.upper()):
+                label, target_grid = target.upper(), target.upper()
+            else:
+                fav = self.core.favorites.match(target)
+                target_grid = (fav.meta.get("gridsquare") or "").strip() if fav else ""
+                label = fav.display if fav else target
+                if not target_grid:
+                    self._log_system(
+                        f"No known grid square for '{target}'. Set one with "
+                        f"'radioapp favorites set {target} --grid <grid>'."
+                    )
+                    return
+            try:
+                dist, brg = bearing_distance(my_grid, target_grid)
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+                return
+            self._log_system(
+                f"{label} ({target_grid}): {dist:.0f} km, {brg:.0f}° "
+                f"{compass_point(brg)} from {my_grid}"
+            )
+            return
+
+        entries: list[tuple[str, str, float, float]] = []
+        for fav in self.core.favorites.all():
+            grid = (fav.meta.get("gridsquare") or "").strip()
+            if not grid:
+                continue
+            try:
+                dist, brg = bearing_distance(my_grid, grid)
+            except ValueError:
+                continue
+            entries.append((fav.display, grid, dist, brg))
+        entries.sort(key=lambda e: e[2])
+
+        if not entries:
+            self._log_system(
+                "No favorites have a grid square set. Use "
+                "'radioapp favorites set <id> --grid <grid>' to add one, "
+                "then /map to see them plotted."
+            )
+            return
+        self._log_system(render_compass_map(my_grid, entries))
+
     @work
     async def _handle_start_command(self, arg: str) -> None:
         """Launch or reconnect the backing process for a transport.
@@ -9289,6 +9362,8 @@ class RadioTUI(App):
             self._handle_filters_command(arg)
         elif cmd in ("/position", "/pos", "/grid"):
             self._handle_position_command(arg)
+        elif cmd == "/map":
+            self._handle_map_command(arg)
         elif cmd == "/start":
             self._handle_start_command(arg)
         elif cmd == "/net":
