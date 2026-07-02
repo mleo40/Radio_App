@@ -519,6 +519,14 @@ class MeshCoreTransport(Transport):
         else:
             sender = f"chan{chan}"
             meta["mc_anon"] = True  # not an addressable identity
+        # Stamp traffic on a named "#weather" channel so it surfaces on the WX
+        # page, same convention as the Reticulum and JS8Call/Winlink weather
+        # sources (WXSetupScreen creates this channel as plain "weather").
+        chan_name = next(
+            (c["name"] for c in self.channels() if c["index"] == chan), ""
+        ).lower()
+        if chan_name == "weather":
+            meta["kind"] = "weather_bulletin"
         await self._emit(
             UnifiedMessage(
                 sender=sender,

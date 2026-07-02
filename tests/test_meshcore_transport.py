@@ -226,6 +226,33 @@ def test_inbound_channel_message_parses_embedded_sender_name():
     assert "mc_anon" not in m.metadata
 
 
+def test_inbound_channel_message_on_weather_channel_is_tagged():
+    """A named '#weather' channel's traffic must reach the WX page's query."""
+    t = MeshCoreTransport(
+        {"connection": "tcp", "channels": [{"index": 3, "name": "weather"}]}
+    )
+    t._mc = _FakeMC()
+    t._running = True
+    received = _capture(t)
+    ev = _Event(
+        EventType.CHANNEL_MSG_RECV,
+        {"channel_idx": 3, "text": "72F sunny, wind 5mph NW"},
+    )
+    asyncio.run(t._on_channel_msg(ev))
+    assert received[0].metadata.get("kind") == "weather_bulletin"
+
+
+def test_inbound_channel_message_non_weather_channel_not_tagged():
+    t = _running_transport()
+    received = _capture(t)
+    ev = _Event(
+        EventType.CHANNEL_MSG_RECV,
+        {"channel_idx": 3, "text": "channel chatter"},
+    )
+    asyncio.run(t._on_channel_msg(ev))
+    assert "kind" not in received[0].metadata
+
+
 def test_split_channel_sender_is_conservative():
     """Only a 'name: ' (colon+space) prefix is treated as a sender."""
     split = MeshCoreTransport._split_channel_sender
