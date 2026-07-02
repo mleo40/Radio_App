@@ -127,12 +127,15 @@ def test_reference_tabs_switch_content(config_path):
             initial = switcher.current
 
             await pilot.click("#ref-qmx")
-            # Under heavy parallel test load a single pause isn't always
-            # enough for the button-pressed handler to fully settle; poll
-            # briefly instead of asserting on the very next tick.
+            # Under heavy parallel test load, pilot.pause() alone doesn't
+            # reliably give the button-pressed handler enough real wall-clock
+            # time to settle -- mix in a genuine sleep so the event loop
+            # actually yields to other scheduled work, not just Textual's own
+            # message queue, before asserting.
             active_ids: list[str | None] = []
-            for _ in range(20):
+            for _ in range(50):
                 await pilot.pause()
+                await asyncio.sleep(0.01)
                 active_ids = [
                     b.id for b in screen.query(".rtab") if "-active" in b.classes
                 ]
