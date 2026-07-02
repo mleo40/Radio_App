@@ -521,6 +521,7 @@ always current even when this file lags):
 | Command | Purpose |
 |---|---|
 | `radioapp bandscan <bands> <dwell_min>` | JS8Call propagation probe (see the in-composer command table below) |
+| `radioapp map [<grid>\|<favorite>]` | ASCII compass map / distance+bearing to favorites with a `gridsquare` set (`radioapp favorites set <id> --grid <grid>` to add one) |
 | `radioapp filters [list\|add\|edit\|del\|mv]` | manage inbound filter rules from a script/cron, not just the TUI |
 | `radioapp bridge` | show active cross-mode bridge/gateway rules |
 | `radioapp contacts [list\|add\|link\|unlink\|rename\|delete]` | manage the cross-mode contacts book |
@@ -675,7 +676,8 @@ radioapp tui              # launch it
 ```
 
 Keys: **F3** choose mode · **F4** favorites-only (Watch + every mode) ·
-**F5** cycle Watch/Health/Logs/Chats/Favorites/Net/Weather · **Ctrl+P** settings ·
+**F5** cycle Watch/Health/Logs/Chats/Favorites/Net/Weather · **F9** field
+reference (radio/mode setup how-to, offline) · **Ctrl+P** settings ·
 **Ctrl+F** search · **Ctrl+R** refresh · **Ctrl+C** quit. The
 mode chips are tappable on a touchscreen; tap the **⌨/☞** glyph to toggle a
 larger touch layout.
@@ -711,6 +713,7 @@ In-composer commands:
 | `/bridge [list]` | show active cross-mode bridge/gateway rules from config |
 | `/filters [add\|edit\|del\|mv]` | manage inbound filter rules (notify/show/file/mute/drop by group/sender/transport/etc.) — takes effect immediately, first match wins |
 | `/position [<grid>\|clear]` | set your station grid square (e.g. `/position FN31`), show, or clear |
+| `/map [<grid>\|<favorite>]` | ASCII compass map (distance/bearing) to every favorite with a `gridsquare` set — one target with an argument, everyone at once without |
 | `/roster [Nh]` | show recently-heard callsigns (default 24h lookback) |
 | `/bands [band]` | show offline band-plan / EmComm frequencies (same as `radioapp bands`) |
 | `/bands activity [band]` | show recent HF message activity from the store, optionally filtered by band |

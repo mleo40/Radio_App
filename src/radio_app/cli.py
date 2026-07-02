@@ -456,6 +456,16 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     p_pos.set_defaults(func=_cmd_position)
 
+    p_map = sub.add_parser(
+        "map", help="ASCII compass map of favorites with a known grid square"
+    )
+    p_map.add_argument(
+        "target", nargs="?",
+        help="a grid square or favorite id/label to show distance/bearing to; "
+        "omit to plot every favorite with a known grid square",
+    )
+    p_map.set_defaults(func=_cmd_map)
+
     p_time = sub.add_parser("time", help="show current UTC and NTP clock offset")
     p_time.set_defaults(func=_cmd_time)
 
@@ -1051,6 +1061,79 @@ def _cmd_templates(args: argparse.Namespace) -> int:
         return 0 if ok else 1
 
     return _run(_with_app(args.config, run))
+
+
+def _cmd_map(args: argparse.Namespace) -> int:
+    """ASCII compass map of favorites with a known grid square."""
+    from .core.favorites import Favorites
+    from .core.maidenhead import (
+        _GRID_RE as _GRE,
+    )
+    from .core.maidenhead import (
+        bearing_distance,
+        compass_point,
+        render_compass_map,
+    )
+    from .core.position import position_from_config
+
+    cfg = Config.load(args.config)
+    pos = position_from_config(cfg)
+    if pos is None or not pos.grid:
+        print(
+            "No position configured. Set one with 'radioapp position' "
+            "or [position] in config.toml.",
+            file=sys.stderr,
+        )
+        return 1
+    my_grid = pos.grid
+    favs = Favorites.from_config(cfg)
+
+    target = (args.target or "").strip()
+    if target:
+        if _GRE.match(target.upper()):
+            label, target_grid = target.upper(), target.upper()
+        else:
+            fav = favs.match(target)
+            target_grid = (fav.meta.get("gridsquare") or "").strip() if fav else ""
+            label = fav.display if fav else target
+            if not target_grid:
+                print(
+                    f"No known grid square for '{target}'. Set one with "
+                    f"'radioapp favorites set {target} --grid <grid>'.",
+                    file=sys.stderr,
+                )
+                return 1
+        try:
+            dist, brg = bearing_distance(my_grid, target_grid)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
+        print(
+            f"{label} ({target_grid}): {dist:.0f} km, {brg:.0f}° "
+            f"{compass_point(brg)} from {my_grid}"
+        )
+        return 0
+
+    entries: list[tuple[str, str, float, float]] = []
+    for fav in favs.all():
+        grid = (fav.meta.get("gridsquare") or "").strip()
+        if not grid:
+            continue
+        try:
+            dist, brg = bearing_distance(my_grid, grid)
+        except ValueError:
+            continue
+        entries.append((fav.display, grid, dist, brg))
+    entries.sort(key=lambda e: e[2])
+
+    if not entries:
+        print(
+            "No favorites have a grid square set. Use "
+            "'radioapp favorites set <id> --grid <grid>' to add one."
+        )
+        return 0
+    print(render_compass_map(my_grid, entries))
+    return 0
 
 
 def _cmd_position(args: argparse.Namespace) -> int:
