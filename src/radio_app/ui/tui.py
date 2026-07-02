@@ -3385,8 +3385,12 @@ class RadioTUI(App):
             self.action_sync_nomad()
         elif bid in ("mesh-start", "js8-start", "winlink-start"):
             transport_name = bid.split("-")[0]
-            if transport_name == "mesh":
-                transport_name = "meshcore"
+            # Button id prefixes ("mesh", "js8") are shorthand, not the
+            # transport's registered name -- map them explicitly rather than
+            # assuming the prefix matches (it doesn't for either of these).
+            transport_name = {"mesh": "meshcore", "js8": "js8call"}.get(
+                transport_name, transport_name
+            )
             self._handle_start_command(transport_name)
         elif bid == "mesh-fav":
             self._favorite_current_conversation()
