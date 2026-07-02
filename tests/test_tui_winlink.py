@@ -10,6 +10,7 @@ gateway plumbing, and subject injection into outbound messages.
 from __future__ import annotations
 
 import asyncio
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -636,6 +637,113 @@ def test_winlink_open_forms_reports_when_none_installed(config_path):
             assert any(
                 "No Winlink forms" in m or "catalog" in m.lower() for m in logged
             )
+
+    asyncio.run(run())
+
+
+def test_winlink_open_forms_auto_fetches_when_catalog_empty(config_path, monkeypatch):
+    """An empty catalog triggers update_forms() automatically, not just a hint."""
+
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+            t = app._winlink_transport()
+
+            calls: list[str] = []
+
+            async def fake_list_forms():
+                calls.append("list")
+                # Empty on the first call (nothing installed yet), populated
+                # after update_forms() has "downloaded" the catalog.
+                if any(c == "update" for c in calls):
+                    return [
+                        {"name": "ICS213", "path": "ICS/ICS213.txt", "folder": "ICS"}
+                    ]
+                return []
+
+            async def fake_update_forms():
+                calls.append("update")
+                return {"version": "1.0", "action": "update"}
+
+            monkeypatch.setattr(t, "list_forms", fake_list_forms)
+            monkeypatch.setattr(t, "update_forms", fake_update_forms)
+
+            logged: list[str] = []
+            app._log_system = lambda m: logged.append(m)  # type: ignore
+            app._winlink_open_forms()
+            for _ in range(50):
+                await pilot.pause()
+                if "update" in calls and calls.count("list") >= 2:
+                    break
+
+            assert calls == ["list", "update", "list"]
+            assert any("fetching" in m.lower() for m in logged)
+
+    asyncio.run(run())
+
+
+def test_winlink_connect_failure_shows_toast(config_path, monkeypatch):
+    """A failed session (dead Pat) toasts, not just logs to #messages.
+
+    A multi-message session can run for a while; if the operator has switched
+    to another mode (clears #messages) or a utility view (F5) while waiting,
+    the log line alone never reaches them.
+    """
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+
+            notifications: list[tuple[str, dict]] = []
+            monkeypatch.setattr(
+                app, "notify", lambda msg, **kw: notifications.append((msg, kw))
+            )
+
+            app._winlink_connect()
+            for _ in range(50):
+                await pilot.pause()
+                if notifications:
+                    break
+
+            assert len(notifications) == 1
+            msg, kw = notifications[0]
+            assert "failed" in msg.lower()
+            assert kw.get("severity") == "error"
+
+    asyncio.run(run())
+
+
+def test_winlink_connect_success_shows_toast(config_path, monkeypatch):
+    async def run():
+        app = RadioTUI(config_path)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("winlink")
+            await pilot.pause()
+            t = app._winlink_transport()
+            monkeypatch.setattr(t, "connect_now", AsyncMock(return_value=2))
+
+            notifications: list[tuple[str, dict]] = []
+            monkeypatch.setattr(
+                app, "notify", lambda msg, **kw: notifications.append((msg, kw))
+            )
+
+            app._winlink_connect()
+            for _ in range(50):
+                await pilot.pause()
+                if notifications:
+                    break
+
+            assert len(notifications) == 1
+            msg, kw = notifications[0]
+            assert "session complete" in msg.lower()
+            assert "received 2" in msg.lower()
+            assert kw.get("severity") is None
 
     asyncio.run(run())
 

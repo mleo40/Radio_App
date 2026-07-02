@@ -79,6 +79,7 @@ from ..transports.js8call_transport import (
     dial_for_band,
 )
 from .about import ABOUT_MD
+from .reference import JS8CALL_MD, OTHER_MODES_MD, QMX_QDX_MD, TRUSDX_MD, WSJTX_MD
 
 # Default cap for the in-memory Watch scrollback (rows). Overridable via
 # [ui].watch_buffer_limit; see RadioTUI.__init__ / on_mount.
@@ -92,7 +93,17 @@ _UNIVERSAL_COMMAND_HELP = (
     "/favorites (F6), /fav add|rm|list|only [<id> [label]], "
     "/mode (cycle, F3), /refresh, /logs, "
     "/loglevel <debug|info|warning|error>, /search <text> (Ctrl+F), "
-    "/chats, /tmpl [<name>], /bands [band], /sched +Nm|HH:MM [text], "
+    "/chats, "
+    "/tmpl [list|<name>|add <n> <text>|del <n>], "
+    "/bands [<band>|activity [<band>]], "
+    "/bandscan <bands> <dwell_min> — JS8Call propagation probe, "
+    "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
+    "/subs [add|rm @GROUP], "
+    "/groups [@NAME|new|delete|add|rm|tag|untag], "
+    "/contacts [<name>|new|delete|link|unlink|rename], "
+    "/bridge [list], "
+    "/filters [add|edit|del|mv] ..., "
+    "/position [<grid>|clear], "
     "/roster [Nh], /name <friendly name>, /close [<id>], "
     "/start [transport], "
     "/net open <name> | ci [<call>] [note] | list | close | status | sessions, "
@@ -1074,6 +1085,52 @@ class WinlinkWXSubscribeScreen(ModalScreen[bool]):
         self.dismiss(False)
 
 
+class BandScanResultScreen(ModalScreen[bool]):
+    """Show band-scan results and offer to switch to the best-performing band.
+
+    Dismisses with True to switch, False to stay (caller restores the
+    pre-scan band on decline).
+    """
+
+    CSS = """
+    BandScanResultScreen { align: center middle; }
+    #bscan-box {
+        width: 60; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #bscan-title { height: auto; margin-bottom: 1; }
+    #bscan-body  { height: auto; color: $text-muted; margin-bottom: 1; }
+    #bscan-btns  { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, results: list, best_band: str) -> None:
+        super().__init__()
+        self._results = results
+        self._best = best_band
+
+    def compose(self) -> ComposeResult:
+        lines = []
+        for r in self._results:
+            snr = f", avg SNR {r.avg_snr:+.0f} dB" if r.avg_snr is not None else ""
+            marker = " ← best" if r.band == self._best else ""
+            lines.append(f"{r.band}: {r.heard_count} heard{snr}{marker}")
+        with Vertical(id="bscan-box"):
+            yield Static("[b]📡 Band Scan Results[/b]", id="bscan-title")
+            yield Static("\n".join(lines), id="bscan-body")
+            with Horizontal(id="bscan-btns"):
+                yield Button("Stay", id="bscan-no")
+                yield Button(
+                    f"Switch to {self._best} →", id="bscan-yes", variant="primary"
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "bscan-yes")
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
 class WXSetupScreen(ModalScreen[dict | None]):
     """Weather setup: manage grid squares and passive radio source subscriptions.
 
@@ -1664,6 +1721,80 @@ class AboutScreen(ModalScreen[None]):
         self.dismiss(None)
 
 
+class ReferenceScreen(ModalScreen[None]):
+    """Field reference: radio + mode setup how-to, no internet required.
+
+    Opened with F1. Content is baked into the package (see ``ui/reference.py``)
+    so it's available on a fresh field deployment with no docs/ checkout.
+    """
+
+    CSS = """
+    ReferenceScreen { align: center middle; }
+    #ref-box {
+        width: 86%; height: 90%; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #ref-title   { height: auto; margin-bottom: 1; }
+    #ref-tabs    { height: 3; }
+    #ref-tabs Button {
+        height: 1; border: none; padding: 0 2; margin: 0 1 0 0;
+    }
+    #ref-tabs Button.-active { text-style: bold reverse; }
+    #ref-content { height: 1fr; }
+    #ref-hint    { height: 1; color: $text-muted; text-align: center; }
+    """
+    BINDINGS = [
+        ("escape", "close", "Close"),
+        ("q", "close", "Close"),
+    ]
+
+    _TABS = (
+        ("ref-trusdx", "(tr)uSDX", TRUSDX_MD),
+        ("ref-qmx", "QMX / QDX", QMX_QDX_MD),
+        ("ref-js8", "JS8Call", JS8CALL_MD),
+        ("ref-wsjtx", "WSJT-X", WSJTX_MD),
+        ("ref-other", "Other modes", OTHER_MODES_MD),
+    )
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="ref-box"):
+            yield Static("[b]📻 Field Reference[/b]", id="ref-title")
+            with Horizontal(id="ref-tabs"):
+                for tab_id, label, _md in self._TABS:
+                    yield Button(label, id=tab_id, classes="rtab")
+            with ContentSwitcher(
+                initial=f"{self._TABS[0][0]}-pane", id="ref-content"
+            ):
+                for tab_id, _label, md in self._TABS:
+                    with VerticalScroll(id=f"{tab_id}-pane"):
+                        yield Markdown(md)
+            yield Static("Esc / q to close", id="ref-hint")
+
+    def on_mount(self) -> None:
+        self.query_one(f"#{self._TABS[0][0]}", Button).add_class("-active")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        for tab_id, _label, _md in self._TABS:
+            if bid == tab_id:
+                self.query_one("#ref-content", ContentSwitcher).current = (
+                    f"{tab_id}-pane"
+                )
+                self._set_active_tab(tab_id)
+                event.stop()
+                return
+
+    def _set_active_tab(self, tab_id: str) -> None:
+        for tid, _label, _md in self._TABS:
+            try:
+                self.query_one(f"#{tid}", Button).set_class(tid == tab_id, "-active")
+            except Exception:  # noqa: BLE001
+                pass
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class LaunchCmdScreen(ModalScreen):
     """One-shot prompt to customise the launch command for a transport's backing app.
 
@@ -1845,6 +1976,7 @@ class RadioTUI(App):
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("q", "quit", "Quit"),
+        Binding("f1", "reference", "Reference", priority=True),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
         ("f5", "cycle_utility", "Stream/Health…"),
@@ -2076,7 +2208,16 @@ class RadioTUI(App):
                         )
                     yield Button("\u21bb", id="js8-freq-refresh", classes="modebtn")
                     yield Button(
+                        "\U0001f4e3 CQ", id="js8-cq", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f493 HB", id="js8-hb", classes="modebtn"
+                    )
+                    yield Button(
                         "\u2709 SMS", id="js8-sms", classes="modebtn"
+                    )
+                    yield Button(
+                        "\U0001f4cd Beacon", id="js8-beacon", classes="modebtn"
                     )
                 with Horizontal(id="winlink-bar"):
                     yield Static("Winlink", id="winlink-bar-label")
@@ -2706,6 +2847,15 @@ class RadioTUI(App):
             return
         self.push_screen(AboutScreen())
 
+    def action_reference(self) -> None:
+        """F1: show the field reference (radio + mode setup how-to).
+
+        Guarded so a second press while it's open doesn't stack screens.
+        """
+        if isinstance(self.screen, ReferenceScreen):
+            return
+        self.push_screen(ReferenceScreen())
+
     def action_copy_address(self, value: str = "") -> None:
         """Copy a value (e.g. your Reticulum address) to the clipboard.
 
@@ -2756,6 +2906,7 @@ class RadioTUI(App):
         self.current_target = None
         if self.view == "active" and self.active_transport:
             self._show_all_messages()
+        self._update_composer_placeholder()
 
     def action_close_chat(self) -> None:
         """Close (delete) the open conversation, removing it from the list."""
@@ -3247,8 +3398,14 @@ class RadioTUI(App):
             self._js8_switch_band(bid[len("js8-band-"):])
         elif bid == "js8-freq-refresh":
             self._js8_refresh_freq()
+        elif bid == "js8-cq":
+            self._js8_send_cq()
+        elif bid == "js8-hb":
+            self._js8_send_hb()
         elif bid == "js8-sms":
             self._js8_sms_prompt()
+        elif bid == "js8-beacon":
+            self._js8_send_beacon()
         elif bid.startswith("js8-query-"):
             self._js8_send_query(bid[len("js8-query-"):])
         elif bid == "winlink-subject":
@@ -4222,8 +4379,9 @@ class RadioTUI(App):
 
         Saved (favorited) nodes that haven't re-announced yet are listed first
         and marked offline, so a bookmark is always recallable even before the
-        node beacons again. Currently-heard nodes follow, with a leading star
-        when they are favorites. Selecting any row opens the page browser.
+        node beacons again. Currently-heard nodes follow, favorites first
+        (starred), then everyone else. Selecting any row opens the page
+        browser.
         """
         if self.core is None:
             return
@@ -4258,10 +4416,15 @@ class RadioTUI(App):
                 f"\u2605 \U0001f5ce {name}  <{f.id[:16]}>  [dim](offline)[/dim]"
             )))
             self._nomad_nodes.append({"dest": f.id, "name": name})
-        # Then live nodes, marking the ones we've saved. With the favorites-only
-        # filter on (F4), non-favorite live nodes are hidden so only saved nodes
-        # remain.
-        for n in list(live.values())[:50]:
+        # Then live nodes, favorites first (stable within each group), marking
+        # the ones we've saved. Sorting before the [:50] cap means a favorite
+        # heard less recently than 50 others still isn't dropped. With the
+        # favorites-only filter on (F4), non-favorite live nodes are hidden so
+        # only saved nodes remain.
+        live_nodes = sorted(
+            live.values(), key=lambda n: not favs.is_favorite(n["dest"])
+        )
+        for n in live_nodes[:50]:
             is_fav = favs.is_favorite(n["dest"])
             if self._active_fav_only and not is_fav:
                 continue
@@ -5290,6 +5453,7 @@ class RadioTUI(App):
             self._log_system(f"could not save favorites: {exc}")
         tag = f" [{kind}]" if kind else ""
         self._log_system(f"favorite added{tag}: {fav.display}")
+        self._contacts_auto_link_favorite(ident)
         self._refresh_monitor_ticker()
         self._rebuild_monitor()
         self._render_favorites()
@@ -5478,6 +5642,7 @@ class RadioTUI(App):
             # No conversation selected: show every message for this mode so the
             # window isn't empty (e.g. the JS8Call firehose).
             self._show_all_messages()
+        self._update_composer_placeholder()
 
     def _default_channel_target(self) -> str | None:
         """Default conversation for the active mode, or None.
@@ -5648,10 +5813,25 @@ class RadioTUI(App):
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"Winlink form catalog failed: {exc}")
             return
+        if not forms and hasattr(t, "update_forms"):
+            # First use: nothing installed yet. Fetch Pat's standard forms
+            # package automatically instead of just pointing the operator at
+            # a CLI command \u2014 this needs internet (Pat does the download), so
+            # do it before you're off-grid, not as a rescue in the field.
+            self._log_system(
+                "No Winlink forms installed. Fetching from Pat "
+                "(needs internet) \u2026"
+            )
+            try:
+                await t.update_forms()
+                forms = await t.list_forms()
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"Winlink forms update failed: {exc}")
         if not forms:
             self._log_system(
-                "No Winlink forms installed. Run 'radioapp winlink forms-update' "
-                "to download them."
+                "No Winlink forms available \u2014 Pat couldn't reach the forms "
+                "server (no internet?). Try again with connectivity, or run "
+                "'radioapp winlink forms-update' once you have it."
             )
             return
         template = await self.push_screen_wait(WinlinkFormsScreen(forms))
@@ -5998,7 +6178,12 @@ class RadioTUI(App):
         try:
             received = await t.connect_now(url)
         except Exception as exc:  # noqa: BLE001
+            # A session can run for a while; if the operator has switched to
+            # another mode (which clears #messages) or a utility view, this
+            # log line alone would never reach them. Toast regardless of
+            # what's currently on screen.
             self._log_system(f"Winlink connect failed: {exc}")
+            self.notify(f"Connect failed: {exc}", title="Winlink", severity="error")
             return
         finally:
             stop.set()
@@ -6025,6 +6210,9 @@ class RadioTUI(App):
         got = max(int(received or 0), len(seen["recv"]))
         self._log_system(
             f"\u2713 Winlink session complete \u2014 sent {sent}, received {got}."
+        )
+        self.notify(
+            f"Session complete \u2014 sent {sent}, received {got}.", title="Winlink"
         )
         if queued_after:
             self._log_system(
@@ -6238,7 +6426,7 @@ class RadioTUI(App):
         hz = getattr(t, "dial_freq", None)
         band = t.current_band()
         if hz:
-            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or "?"})[/dim]")
+            label.update(f"JS8Call  [b]{hz / 1e6:.3f} MHz[/b] [dim]({band or '?'})[/dim]")
         else:
             label.update("JS8Call  [dim]freq unknown — \u21bb to query[/dim]")
         for btn in bar.query(Button):
@@ -6281,6 +6469,66 @@ class RadioTUI(App):
             )
             return
         self._send(f"{name}?")
+
+    @work
+    async def _js8_send_cq(self) -> None:
+        """Transmit a CQ call (📣 CQ button)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        callsign = ""
+        if self.core is not None:
+            callsign = str(
+                t.config.get("callsign")
+                or self.core.config.station.get("callsign", "")
+                or ""
+            )
+        ok = await t.send_cq(callsign)
+        if ok:
+            self._log_system("\U0001f4e3 CQ sent.")
+        else:
+            self._log_system("CQ failed — check JS8Call connection.")
+
+    @work
+    async def _js8_send_hb(self) -> None:
+        """Transmit a JS8Call heartbeat (💓 HB button)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        grid = ""
+        if self.core is not None:
+            grid = str(self.core.config.station.get("grid_square", "") or "")
+        ok = await t.send_heartbeat(grid)
+        if ok:
+            self._log_system("\U0001f493 Heartbeat sent (@HB).")
+        else:
+            self._log_system("Heartbeat failed — check JS8Call connection.")
+
+    @work
+    async def _js8_send_beacon(self) -> None:
+        """Send a JS8Call position beacon (sets STATION.SET_GRID in JS8Call)."""
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("JS8Call is not running — start it first.")
+            return
+        from ..core.position import position_from_config
+        pos = self._position
+        if pos is None:
+            pos = position_from_config(self.core.config) if self.core else None
+        if pos is None:
+            self._log_system(
+                "No position set. Use /position <grid> to configure one."
+            )
+            return
+        ok = await t.send_position_beacon(pos)
+        if ok:
+            self._log_system(
+                f"\U0001f4cd Beacon sent: grid [b]{pos.grid}[/b] set in JS8Call."
+            )
+        else:
+            self._log_system("Beacon failed — check JS8Call connection.")
 
     @work
     async def _js8_show_inbox(self) -> None:
@@ -6579,13 +6827,20 @@ class RadioTUI(App):
         except Exception:  # noqa: BLE001
             return
         for entry in pending:
-            ok = await self.core.router.send(
-                entry.message, force_transport=entry.transport
-            )
-            self.core.store.schedule_mark_sent(entry.id, success=ok)
-            status_str = "sent" if ok else "[red]FAILED[/red]"
-            preview = entry.message.content[:40]
-            self._log_system(f"Scheduled message {status_str}: {preview!r}")
+            kind = entry.message.metadata.get("kind")
+            if kind == "band_change":
+                ok = await self._fire_scheduled_band_change(entry)
+                self.core.store.schedule_mark_sent(entry.id, success=ok)
+                if ok and entry.message.metadata.get("recur_daily"):
+                    self._reschedule_daily_band_change(entry)
+            else:
+                ok = await self.core.router.send(
+                    entry.message, force_transport=entry.transport
+                )
+                self.core.store.schedule_mark_sent(entry.id, success=ok)
+                status_str = "sent" if ok else "[red]FAILED[/red]"
+                preview = entry.message.content[:40]
+                self._log_system(f"Scheduled message {status_str}: {preview!r}")
 
     # -- input-mode detection -------------------------------------------------
     def _note_input(self, mode: str) -> None:
@@ -7280,21 +7535,63 @@ class RadioTUI(App):
         )
 
     def _handle_tmpl_command(self, arg: str) -> None:
-        """List templates or load one into the composer for review before sending."""
+        """List, load, add, or delete message templates.
+
+        /tmpl list           — list all template names
+        /tmpl <name>         — load template into composer
+        /tmpl add <n> <text> — create a new template
+        /tmpl del <name>     — delete a template
+        """
         if self.core is None:
             return
         from ..core.templates import Templates
+        parts = arg.strip().split(None, 1)
+        sub = parts[0].lower() if parts else ""
+
+        if sub in ("add", "new"):
+            rest = parts[1].strip() if len(parts) > 1 else ""
+            subparts = rest.split(None, 1)
+            if len(subparts) < 2:
+                self._log_system(
+                    'usage: /tmpl add <name> <text>  e.g. /tmpl add ack "Message received"'
+                )
+                return
+            name, text = subparts[0], subparts[1]
+            self.core.config.set("templates", name, text)
+            self.core.config.save()
+            self._log_system(f"Template '{name}' saved.")
+            return
+
+        if sub in ("del", "delete", "rm", "remove"):
+            name = parts[1].strip() if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /tmpl del <name>")
+                return
+            tmpls_data = self.core.config.data.get("templates", {})
+            if name not in tmpls_data:
+                self._log_system(
+                    f"Template '{name}' not found. "
+                    f"Available: {', '.join(sorted(tmpls_data)) or '(none)'}"
+                )
+                return
+            del tmpls_data[name]
+            self.core.config.save()
+            self._log_system(f"Template '{name}' deleted.")
+            return
+
         tmpls = Templates.from_config(self.core.config)
-        if not arg or arg.strip().lower() == "list":
+        if not arg or sub == "list":
             names = tmpls.names()
             if not names:
                 self._log_system(
-                    "No templates. Add [templates] to config.toml, e.g.:\n"
-                    '  welfare = "Welfare check — all OK"'
+                    "No templates. Use /tmpl add <name> <text> to create one."
                 )
             else:
                 joined = "  ".join(f"[b]{n}[/b]" for n in names)
-                self._log_system("Templates: " + joined)
+                self._log_system(
+                    "Templates: " + joined
+                    + "  [dim](/tmpl add <n> <text> to add, /tmpl del <n> to remove)[/dim]"
+                )
             return
         text = tmpls.get(arg.strip())
         if text is None:
@@ -7311,8 +7608,49 @@ class RadioTUI(App):
             self._log_system(f"Template text: {text}")
 
     def _handle_bands_command(self, arg: str) -> None:
-        """Show the band-plan / EmComm frequency reference with live conditions."""
+        """Show band-plan reference or recent HF band activity log.
+
+        /bands             — band-plan + solar conditions
+        /bands <band>      — filter plan to one band (e.g. /bands 40m)
+        /bands activity    — show recent messages with band metadata
+        /bands activity 40m — filter activity log to one band
+        """
         from ..core.bandplan import format_mhz, lookup
+        parts = arg.strip().lower().split(None, 1) if arg.strip() else []
+        first = parts[0] if parts else ""
+
+        if first in ("activity", "log", "rx"):
+            if self.core is None:
+                return
+            band_filter = parts[1].strip() if len(parts) > 1 else None
+            since = datetime.now(UTC) - timedelta(hours=24)
+            msgs = self.core.store.query(
+                band=band_filter, since=since, limit=100, newest_first=False
+            )
+            # Keep only messages that have a band in metadata (HF traffic).
+            msgs = [m for m in msgs if m.metadata.get("band")]
+            if not msgs:
+                qualifier = f" on {band_filter}" if band_filter else ""
+                self._log_system(
+                    f"No HF band activity{qualifier} in the last 24h."
+                )
+                return
+            title = f"[b]Band activity{f' — {band_filter}' if band_filter else ''} (last 24h):[/b]"
+            lines = [title]
+            for m in msgs:
+                ts = m.timestamp.strftime("%H:%M")
+                band_tag = m.metadata.get("band", "?")
+                snr = m.metadata.get("snr")
+                snr_str = f" SNR{snr:+.0f}" if snr is not None else ""
+                direction = "→" if m.status.value != "received" else "←"
+                preview = m.content[:50]
+                lines.append(
+                    f"  {ts}  [b]{band_tag:<5}[/b]  {m.sender:<10}"
+                    f"  {direction}  {preview!r}{snr_str}"
+                )
+            self._log_system("\n".join(lines))
+            return
+
         band = arg.strip().lower() or None
         entries = lookup(band=band, region="US")
         if not entries:
@@ -7367,16 +7705,85 @@ class RadioTUI(App):
         self._log_system("\n".join(lines))
 
     def _handle_sched_command(self, arg: str) -> None:
-        """Schedule current composer text (or given text) for a future send.
+        """Schedule, list, or cancel deferred sends and band changes.
 
         Usage: /sched +30m  |  /sched 19:00  |  /sched +1h optional message text
+               /sched list  — show pending queue
+               /sched cancel <id>  — cancel a pending scheduled message
+               /sched band <band> <time> [daily]  — schedule a JS8Call band change
         """
         from ..core.message import UnifiedMessage
 
         parts = arg.strip().split(None, 1)
         if not parts:
-            self._log_system("Usage: /sched +30m | HH:MM [text]")
+            self._log_system(
+                "Usage: /sched +30m | HH:MM [text] | list | cancel <id> "
+                "| band <band> <time> [daily]"
+            )
             return
+
+        if parts[0].lower() == "list":
+            if self.core is None:
+                return
+            pending = self.core.store.schedule_pending()
+            if not pending:
+                self._log_system("No scheduled messages pending.")
+                return
+            lines = [f"[b]Scheduled messages[/b] ({len(pending)} pending):"]
+            for e in pending:
+                ts = e.fire_at.strftime("%H:%M UTC")
+                short_id = e.id[:8]
+                kind = e.message.metadata.get("kind")
+                if kind == "band_change":
+                    band = e.message.metadata.get("band", "?")
+                    daily = " [dim](daily)[/dim]" if e.message.metadata.get("recur_daily") else ""
+                    lines.append(
+                        f"  [b]{ts}[/b]  → [b]{band}[/b] [dim](band change){daily}[/dim]"
+                        f"  [dim](id:{short_id})[/dim]"
+                    )
+                else:
+                    target = e.message.recipient or (
+                        f"@{e.message.group}" if e.message.group else "?"
+                    )
+                    preview = e.message.content[:40]
+                    lines.append(
+                        f"  [b]{ts}[/b]  → {target}  [dim]{preview!r}[/dim]"
+                        f"  [dim](id:{short_id})[/dim]"
+                    )
+            lines.append("[dim]/sched cancel <id> to cancel[/dim]")
+            self._log_system("\n".join(lines))
+            return
+
+        if parts[0].lower() == "band":
+            self._handle_sched_band_command(parts[1].strip() if len(parts) > 1 else "")
+            return
+
+        if parts[0].lower() == "cancel":
+            if self.core is None:
+                return
+            target_id = parts[1].strip() if len(parts) > 1 else ""
+            if not target_id:
+                self._log_system("usage: /sched cancel <id>  (from /sched list)")
+                return
+            # Allow partial ID match (first 8 chars)
+            pending = self.core.store.schedule_pending()
+            matches = [e for e in pending if e.id.startswith(target_id)]
+            if not matches:
+                self._log_system(f"No pending message with id starting '{target_id}'.")
+                return
+            if len(matches) > 1:
+                self._log_system(
+                    f"Ambiguous id '{target_id}' matches {len(matches)} messages; "
+                    "use more characters."
+                )
+                return
+            ok = self.core.store.schedule_cancel(matches[0].id)
+            if ok:
+                self._log_system(f"Cancelled: {matches[0].id[:8]}")
+            else:
+                self._log_system(f"Could not cancel {matches[0].id[:8]} (already sent?).")
+            return
+
         time_spec = parts[0]
         text_override = parts[1] if len(parts) > 1 else None
 
@@ -7440,6 +7847,227 @@ class RadioTUI(App):
         ts = fire_at.strftime("%H:%M UTC")
         self._log_system(f"Message scheduled for {ts}: {content[:40]!r}")
 
+    def _handle_sched_band_command(self, arg: str) -> None:
+        """Parse and schedule a JS8Call band change.
+
+        Syntax: <band> <time> [daily]
+        Examples:
+          /sched band 40m 20:00
+          /sched band 20m +2h daily
+        """
+        if self.core is None:
+            return
+        from ..core.message import AddressType, UnifiedMessage
+        from ..transports.js8call_transport import dial_for_band
+
+        parts = arg.split()
+        if len(parts) < 2:
+            self._log_system(
+                "usage: /sched band <band> <time> [daily]\n"
+                "  e.g. /sched band 40m 20:00\n"
+                "       /sched band 20m +2h daily"
+            )
+            return
+        band = parts[0].lower()
+        time_spec = parts[1]
+        recur_daily = len(parts) >= 3 and parts[2].lower() == "daily"
+
+        # Validate band name.
+        if dial_for_band(band) is None:
+            from ..core.bandplan import lookup
+            known = sorted({e.band for e in lookup(region="US")})
+            self._log_system(
+                f"Unknown band '{band}'. Valid bands: {', '.join(known)}"
+            )
+            return
+
+        now = datetime.now(UTC)
+        try:
+            if time_spec.startswith("+"):
+                raw = time_spec[1:].lower()
+                if "h" in raw and "m" in raw:
+                    h_part, rest = raw.split("h")
+                    mins = int(h_part) * 60 + int(rest.rstrip("m"))
+                elif "h" in raw:
+                    mins = int(raw.rstrip("h")) * 60
+                else:
+                    mins = int(raw.rstrip("m"))
+                fire_at = now + timedelta(minutes=mins)
+            else:
+                hh, mm = time_spec.split(":")
+                fire_at = now.replace(
+                    hour=int(hh), minute=int(mm), second=0, microsecond=0
+                )
+                if fire_at <= now:
+                    fire_at += timedelta(days=1)
+        except (ValueError, AttributeError):
+            self._log_system("Invalid time. Use: /sched band 40m 20:00  or  +2h")
+            return
+
+        name = self.core.station.callsign or "scheduler"
+        msg = UnifiedMessage(
+            sender=name,
+            content=f"Band change: {band}",
+            address_type=AddressType.BROADCAST,
+            metadata={"kind": "band_change", "band": band, "recur_daily": recur_daily},
+            transport="js8call",
+        )
+        self.core.store.schedule_add(msg, fire_at, transport="js8call")
+        ts = fire_at.strftime("%H:%M UTC")
+        repeat = " (daily)" if recur_daily else ""
+        self._log_system(f"Band change to {band} scheduled for {ts}{repeat}.")
+
+    async def _fire_scheduled_band_change(self, entry) -> bool:
+        """Execute a due band-change scheduled entry.
+
+        Skips (logs + returns False) when JS8Call is not running or when another
+        transport currently holds the radio interlock.
+        """
+        band = entry.message.metadata.get("band", "?")
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system(
+                f"⏰ Band change to {band} skipped — JS8Call not running."
+            )
+            return False
+        blocker = self.core.radio_interlock.blocked_by("js8call")
+        if blocker is not None:
+            self._log_system(
+                f"⏰ Band change to {band} skipped — radio busy ({blocker})."
+            )
+            return False
+        from ..transports.js8call_transport import dial_for_band
+        hz = dial_for_band(band)
+        if hz is None:
+            self._log_system(f"⏰ Band change: unknown band '{band}'.")
+            return False
+        ok = await t.set_dial_freq(hz)
+        if ok:
+            self._log_system(f"⏰ Band changed to [b]{band}[/b] as scheduled.")
+            self._update_js8_bar()
+        else:
+            self._log_system(f"⏰ Band change to {band} failed — JS8Call API error.")
+        return ok
+
+    def _reschedule_daily_band_change(self, entry) -> None:
+        """Re-queue a daily band-change entry for the next day."""
+        from ..core.message import AddressType, UnifiedMessage
+        new_fire = entry.fire_at + timedelta(days=1)
+        msg = UnifiedMessage(
+            sender=entry.message.sender,
+            content=entry.message.content,
+            address_type=AddressType.BROADCAST,
+            metadata=dict(entry.message.metadata),
+            transport="js8call",
+        )
+        self.core.store.schedule_add(msg, new_fire, transport="js8call")
+
+    def _handle_bandscan_command(self, arg: str) -> None:
+        """Run an on-demand band scan: heartbeat + listen per band, then report.
+
+        /bandscan <band1,band2,...> <dwell_minutes>
+        """
+        parts = arg.strip().split()
+        if len(parts) != 2:
+            self._log_system(
+                "usage: /bandscan <band1,band2,...> <dwell_minutes>  "
+                "e.g. /bandscan 80m,40m,20m 5"
+            )
+            return
+        bands = [b.strip() for b in parts[0].split(",") if b.strip()]
+        if not bands:
+            self._log_system("usage: /bandscan <band1,band2,...> <dwell_minutes>")
+            return
+        try:
+            dwell_min = float(parts[1])
+            if dwell_min <= 0:
+                raise ValueError
+        except ValueError:
+            self._log_system(f"invalid dwell minutes: '{parts[1]}'")
+            return
+        self._run_bandscan(bands, dwell_min * 60)
+
+    @work(exclusive=True)
+    async def _run_bandscan(self, bands: list[str], dwell_s: float) -> None:
+        """Cycle ``bands``, heartbeat + listen on each, then offer to switch.
+
+        Running /bandscan again cancels an in-progress scan (Textual's
+        exclusive-worker semantics) — there's no separate stop command.
+        """
+        if self.core is None:
+            return
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("Band scan: JS8Call is not running.")
+            return
+        blocker = self.core.radio_interlock.blocked_by("js8call")
+        if blocker is not None:
+            self._log_system(f"⛔ Band scan blocked — radio busy ({blocker}).")
+            return
+        from ..transports.js8call_transport import dial_for_band
+        unknown = [b for b in bands if dial_for_band(b) is None]
+        if unknown:
+            self._log_system(f"Band scan: unknown band(s): {', '.join(unknown)}")
+            return
+
+        grid = self.core.config.station.get("grid_square", "")
+        self._log_system(
+            f"📡 Band scan starting: {', '.join(bands)} "
+            f"({int(dwell_s)}s each) — sending JS8 heartbeats…"
+        )
+        from ..core.band_scan import run_band_scan
+        report = await run_band_scan(
+            t, self.core.router, self.core.radio_interlock,
+            bands, dwell_s, grid=grid, on_progress=self._log_system,
+        )
+        if report is None:
+            return  # already logged (radio busy)
+        self._update_js8_bar()
+
+        lines = ["[b]Band scan results:[/b]"]
+        for r in report.results:
+            snr = f", avg SNR {r.avg_snr:+.0f} dB" if r.avg_snr is not None else ""
+            lines.append(f"  {r.band}: {r.heard_count} heard{snr}")
+        self._log_system("\n".join(lines))
+
+        best = report.best()
+        if best is None:
+            # No modal to interrupt with here, and a multi-minute scan often
+            # finishes while the operator has navigated away (F5) to another
+            # view — a toast is the only thing that reaches them regardless
+            # of what's currently on screen.
+            self._log_system("Band scan: no replies heard on any band.")
+            self.notify(
+                "No replies heard on any band.",
+                title="Band scan complete", severity="warning",
+            )
+            if report.original_band:
+                hz = dial_for_band(report.original_band)
+                if hz:
+                    await t.set_dial_freq(hz)
+                    self._update_js8_bar()
+            return
+
+        self.notify(
+            f"Best band: {best.band} ({best.heard_count} heard) — "
+            "check the JS8Call pane to switch.",
+            title="Band scan complete",
+        )
+        result = await self.push_screen_wait(
+            BandScanResultScreen(report.results, best.band)
+        )
+        if result:
+            hz = dial_for_band(best.band)
+            if hz:
+                await t.set_dial_freq(hz)
+                self._update_js8_bar()
+                self._log_system(f"✓ Switched to {best.band}.")
+        elif report.original_band:
+            hz = dial_for_band(report.original_band)
+            if hz:
+                await t.set_dial_freq(hz)
+                self._update_js8_bar()
+
     def _handle_roster_command(self, arg: str) -> None:
         """Show the presence roster (recently-heard callsigns)."""
         from ..core.roster import get_roster
@@ -7465,6 +8093,616 @@ class RadioTUI(App):
                 f"  [b]{e.callsign}[/b]  {e.transport}  {ts}{snr}  ×{e.message_count}"
             )
         self._log_system("\n".join(lines))
+
+    def _handle_subs_command(self, arg: str) -> None:
+        """Manage group subscriptions from the TUI.
+
+        /subs           — list current subscriptions and all configured groups
+        /subs add @EMS  — subscribe to a group
+        /subs rm @EMS   — unsubscribe from a group
+        """
+        if self.core is None:
+            return
+        subs = list(self.core.config.subscriptions.get("groups", []))
+        all_groups = list(self.core.config.groups.keys())
+
+        parts = arg.strip().split(None, 1)
+        sub = parts[0].lower() if parts else ""
+
+        if sub in ("add", "sub"):
+            name = parts[1].strip().lstrip("@") if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /subs add <@GROUP>")
+                return
+            if name not in subs:
+                subs.append(name)
+                self.core.config.set("subscriptions", "groups", subs)
+                self.core.config.save()
+            self._log_system(f"Subscribed to @{name}.")
+            return
+
+        if sub in ("rm", "remove", "del", "unsub"):
+            name = parts[1].strip().lstrip("@") if len(parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /subs rm <@GROUP>")
+                return
+            if name in subs:
+                subs.remove(name)
+                self.core.config.set("subscriptions", "groups", subs)
+                self.core.config.save()
+                self._log_system(f"Unsubscribed from @{name}.")
+            else:
+                self._log_system(f"@{name} is not in your subscriptions.")
+            return
+
+        # Default: show list
+        lines = ["[b]Group subscriptions[/b]"]
+        if all_groups:
+            for g in sorted(all_groups):
+                marker = "[green]✓[/green]" if g in subs else "[dim]○[/dim]"
+                lines.append(f"  {marker}  @{g}")
+        else:
+            lines.append("  [dim]No groups configured.[/dim]")
+        lines.append(
+            "[dim]/subs add @GROUP or /subs rm @GROUP to change subscriptions[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _contacts_auto_link_favorite(self, address: str) -> None:
+        """When favoriting an address that belongs to a contact, auto-favorite all
+        other identities linked to that contact."""
+        if self.core is None:
+            return
+        book = getattr(self.core, "contact_book", None)
+        if book is None:
+            return
+        contact = book.by_address("", address)
+        if contact is None:
+            return
+        all_ids = book.identities_for(contact.contact_id)
+        newly_added = []
+        for ident in all_ids:
+            if ident.address == address:
+                continue
+            if not self.core.favorites.is_favorite(ident.address):
+                self.core.favorites.add(ident.address, label=contact.display_name)
+                newly_added.append(f"{ident.transport}:{ident.address}")
+        if newly_added:
+            try:
+                self.core.favorites.save(self.core.config)
+            except Exception:  # noqa: BLE001
+                pass
+            self._log_system(
+                f"Also favorited {len(newly_added)} linked "
+                f"{'identity' if len(newly_added)==1 else 'identities'} "
+                f"for [b]{contact.display_name}[/b]: "
+                + ", ".join(newly_added)
+            )
+
+    def _handle_bridge_command(self, arg: str) -> None:
+        """Show active bridge rules.
+
+        /bridge        — list configured rules
+        /bridge list   — same
+        """
+        if self.core is None:
+            return
+        rules = self.core.bridge.rules if hasattr(self.core, "bridge") else []
+        if not rules:
+            self._log_system(
+                "No bridge rules configured. Add [[bridge]] entries to config.toml.\n"
+                "Example:\n"
+                "  [[bridge]]\n"
+                "  from = \"js8call\"\n"
+                "  to   = \"reticulum\"\n"
+                "  filter = \"*\"   # *, broadcast, group, direct"
+            )
+            return
+        lines = [f"[b]Bridge rules[/b] ({len(rules)} active):"]
+        for r in rules:
+            addr = f" [{r.address_filter}]" if r.address_filter != "*" else ""
+            lines.append(f"  [b]{r.from_transport}[/b] → [b]{r.to_transport}[/b]{addr}")
+        lines.append(
+            "[dim]Bridged messages carry metadata.bridged=True and "
+            "metadata.bridge_origin=<source transport>[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _handle_filters_command(self, arg: str) -> None:
+        """List, add, edit, delete, or reorder inbound filter rules.
+
+        /filters                                — list rules (evaluation order)
+        /filters add <name> <action> [k=v ...]  — add a rule
+        /filters edit <ref> <action> [k=v ...]  — replace a rule's action/match
+        /filters del <ref>                      — delete a rule (ref = name or #)
+        /filters mv <ref> up|down                — reorder
+        """
+        if self.core is None:
+            return
+        from ..core.filters import build_filter_rule
+
+        engine = self.core.filters
+        parts = arg.strip().split()
+        sub = parts[0].lower() if parts else ""
+
+        if not arg or sub == "list":
+            self._filters_list(engine)
+            return
+
+        if sub == "add":
+            if len(parts) < 3:
+                self._log_system(
+                    "usage: /filters add <name> <action> [key=value ...]  "
+                    "e.g. /filters add ems-hf notify group=EMS transport=js8call"
+                )
+                return
+            try:
+                rule = build_filter_rule(parts[1], parts[2], parts[3:])
+                engine.add_rule(rule)
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{rule.name}' added ({rule.action.value}).")
+            return
+
+        if sub == "edit":
+            if len(parts) < 3:
+                self._log_system(
+                    "usage: /filters edit <name|#> <action> [key=value ...]"
+                )
+                return
+            try:
+                ok = engine.edit_rule(parts[1], parts[2], parts[3:])
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+                return
+            if not ok:
+                self._log_system(f"No such filter rule '{parts[1]}'.")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{parts[1]}' updated.")
+            return
+
+        if sub in ("del", "delete", "rm", "remove"):
+            if len(parts) < 2:
+                self._log_system("usage: /filters del <name|#>")
+                return
+            removed = engine.remove_rule(parts[1])
+            if removed is None:
+                self._log_system(f"No such filter rule '{parts[1]}'.")
+                return
+            engine.save(self.core.config)
+            self._log_system(f"Filter '{removed.name}' deleted.")
+            return
+
+        if sub in ("mv", "move"):
+            if len(parts) < 3 or parts[2].lower() not in ("up", "down"):
+                self._log_system("usage: /filters mv <name|#> up|down")
+                return
+            if not engine.move_rule(parts[1], parts[2].lower()):
+                self._log_system(f"Could not move '{parts[1]}' {parts[2].lower()}.")
+                return
+            engine.save(self.core.config)
+            self._filters_list(engine)
+            return
+
+        self._log_system(
+            f"unknown /filters action '{sub}'  ·  try: add | edit | del | mv"
+        )
+
+    def _filters_list(self, engine: object) -> None:
+        from ..core.filters import FilterEngine
+        assert isinstance(engine, FilterEngine)
+        rules = engine.rules
+        if not rules:
+            self._log_system(
+                "No filter rules configured. Everything defaults to 'show'.\n"
+                "Use /filters add <name> <action> [key=value ...] to create one."
+            )
+            return
+        lines = [f"[b]Filter rules[/b] ({len(rules)}, evaluated top to bottom):"]
+        for i, r in enumerate(rules, start=1):
+            match = ", ".join(f"{k}={v}" for k, v in r.match.items()) or "(all)"
+            name = r.name or "(unnamed)"
+            lines.append(
+                f"  {i}. [b]{name}[/b]  {r.action.value}  [dim]{match}[/dim]"
+            )
+        lines.append(
+            "[dim]/filters add|edit|del|mv — manage rules; first match wins[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _handle_contacts_command(self, arg: str) -> None:
+        """Manage the cross-mode contacts book.
+
+        /contacts                                    — list all contacts
+        /contacts <name>                             — show contact details
+        /contacts new <name> [notes...]              — create contact
+        /contacts delete <name>                      — delete contact
+        /contacts link <name> <transport> <addr> [label] — link identity
+        /contacts unlink <transport> <addr>          — unlink identity
+        /contacts rename <name> <new_name>           — rename contact
+        """
+        if self.core is None:
+            return
+        book = getattr(self.core, "contact_book", None)
+        if book is None:
+            self._log_system("Contacts not available.")
+            return
+
+        parts = arg.strip().split(None, 3)
+        action_kw = {"new", "delete", "link", "unlink", "rename"}
+        first = parts[0].lower() if parts else ""
+
+        # /contacts  (no arg) — list all
+        if not parts:
+            contacts = book.all()
+            if not contacts:
+                self._log_system(
+                    "Contacts: (none) — '/contacts new <name>' to create one."
+                )
+                return
+            lines = [f"[b]Contacts[/b] ({len(contacts)}):"]
+            for c in contacts:
+                ids = book.identities_for(c.contact_id)
+                n = len(ids)
+                tag = f"  [dim]({n} identity)[/dim]" if n == 1 else f"  [dim]({n} identities)[/dim]"
+                lines.append(f"  {c.display_name}{tag}")
+            self._log_system("\n".join(lines))
+            return
+
+        # /contacts new <name> [notes...]
+        if first == "new":
+            rest = " ".join(parts[1:]).strip()
+            name_parts = rest.split("//", 1)
+            name = name_parts[0].strip()
+            notes = name_parts[1].strip() if len(name_parts) > 1 else ""
+            if not name:
+                self._log_system("usage: /contacts new <name> [// notes]")
+                return
+            try:
+                c = book.add(name, notes=notes)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(f"Contact created: [b]{c.display_name}[/b]")
+            return
+
+        # /contacts delete <name>
+        if first == "delete":
+            name = " ".join(parts[1:]).strip()
+            if not name:
+                self._log_system("usage: /contacts delete <name>")
+                return
+            matches = book.by_name(name)
+            if not matches:
+                self._log_system(f"No contact matching '{name}'.")
+                return
+            c = matches[0]
+            ids = book.identities_for(c.contact_id)
+            book.delete(c.contact_id)
+            self._log_system(
+                f"Deleted [b]{c.display_name}[/b] "
+                f"and {len(ids)} linked {'identity' if len(ids)==1 else 'identities'}."
+            )
+            return
+
+        # /contacts link <name> <transport> <addr> [label]
+        if first == "link":
+            sub_parts = " ".join(parts[1:]).strip().split(None, 3)
+            if len(sub_parts) < 3:
+                self._log_system(
+                    "usage: /contacts link <name> <transport> <addr> [label]"
+                )
+                return
+            name, transport, address = sub_parts[0], sub_parts[1].lower(), sub_parts[2]
+            label = sub_parts[3] if len(sub_parts) > 3 else ""
+            matches = book.by_name(name)
+            if not matches:
+                self._log_system(f"No contact matching '{name}'.")
+                return
+            c = matches[0]
+            try:
+                book.link(c.contact_id, transport, address, label=label)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(
+                f"Linked [b]{transport}:{address}[/b] to [b]{c.display_name}[/b]."
+            )
+            return
+
+        # /contacts unlink <transport> <addr>
+        if first == "unlink":
+            sub_parts = " ".join(parts[1:]).strip().split(None, 1)
+            if len(sub_parts) < 2:
+                self._log_system("usage: /contacts unlink <transport> <addr>")
+                return
+            transport, address = sub_parts[0].lower(), sub_parts[1]
+            if book.unlink(transport, address):
+                self._log_system(f"Unlinked {transport}:{address}.")
+            else:
+                self._log_system(f"{transport}:{address} was not linked to any contact.")
+            return
+
+        # /contacts rename <name> <new_name>
+        if first == "rename":
+            sub_parts = " ".join(parts[1:]).strip().split("//", 1)
+            if len(sub_parts) < 2:
+                self._log_system("usage: /contacts rename <old name> // <new name>")
+                return
+            old_name = sub_parts[0].strip()
+            new_name = sub_parts[1].strip()
+            if not old_name or not new_name:
+                self._log_system("usage: /contacts rename <old name> // <new name>")
+                return
+            matches = book.by_name(old_name)
+            if not matches:
+                self._log_system(f"No contact matching '{old_name}'.")
+                return
+            c = matches[0]
+            try:
+                book.rename(c.contact_id, new_name)
+            except ValueError as exc:
+                self._log_system(f"error: {exc}")
+                return
+            self._log_system(f"Renamed [b]{c.display_name}[/b] → [b]{new_name}[/b].")
+            return
+
+        # /contacts <name>  — show contact details
+        name = arg.strip()
+        matches = book.by_name(name)
+        if not matches:
+            self._log_system(f"No contact matching '{name}'.")
+            return
+        for c in matches:
+            ids = book.identities_for(c.contact_id)
+            lines = [f"[b]{c.display_name}[/b]"]
+            if c.notes:
+                lines.append(f"  notes: {c.notes}")
+            if ids:
+                for ident in ids:
+                    lbl = f"  ({ident.label})" if ident.label else ""
+                    lines.append(f"  {ident.transport:<12} {ident.address}{lbl}")
+            else:
+                lines.append("  (no linked identities)")
+            self._log_system("\n".join(lines))
+
+    def _handle_groups_command(self, arg: str) -> None:
+        """Manage group routing configuration from the TUI.
+
+        /groups                              — list all groups
+        /groups @EMS                         — show group details
+        /groups new @EMS [transport ...]     — create group
+        /groups delete @EMS                  — delete group
+        /groups add @EMS transport:id        — add incoming member
+        /groups rm @EMS transport:id         — remove incoming member
+        /groups tag @EMS @tag                — add incoming tag
+        /groups untag @EMS @tag              — remove incoming tag
+        """
+        from ..core.groups import GroupRegistry
+
+        if self.core is None:
+            return
+
+        reg = GroupRegistry.from_config(self.core.config)
+        parts = arg.strip().split(None, 2)
+
+        if not parts:
+            self._groups_list(reg)
+            return
+
+        first = parts[0].lower()
+        _ACTIONS = {"new", "delete", "add", "rm", "remove", "tag", "untag"}
+
+        if first.startswith("@") or first not in _ACTIONS:
+            self._groups_show(reg, parts[0])
+            return
+
+        action = first
+
+        if action == "new":
+            if len(parts) < 2:
+                self._log_system("usage: /groups new @NAME [transport ...]")
+                return
+            name = parts[1].lstrip("@")
+            transports = parts[2].split() if len(parts) > 2 else []
+            g = reg.ensure_group(name)
+            if transports:
+                g.transports = transports
+                reg._dirty = True  # noqa: SLF001
+            reg.save(self.core.config)
+            note = f" on {', '.join(transports)}" if transports else ""
+            self._log_system(f"Created group @{name}{note}.")
+            return
+
+        if action == "delete":
+            if len(parts) < 2:
+                self._log_system("usage: /groups delete @EMS")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_group(name):
+                reg.save(self.core.config)
+                self._log_system(f"Deleted group @{name}.")
+            else:
+                self._log_system(f"No such group @{name}.")
+            return
+
+        if action == "add":
+            if len(parts) < 3:
+                self._log_system("usage: /groups add @EMS transport:identifier")
+                return
+            name = parts[1].lstrip("@")
+            try:
+                m = reg.add_member(name, parts[2])
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: added member {m.spec}.")
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+            return
+
+        if action in ("rm", "remove"):
+            if len(parts) < 3:
+                self._log_system("usage: /groups rm @EMS transport:identifier")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_member(name, parts[2]):
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: removed member {parts[2]}.")
+            else:
+                self._log_system(f"@{name}: '{parts[2]}' is not a member.")
+            return
+
+        if action == "tag":
+            if len(parts) < 3:
+                self._log_system("usage: /groups tag @EMS @tag")
+                return
+            name = parts[1].lstrip("@")
+            try:
+                t = reg.add_tag(name, parts[2])
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: now claims tag @{t}.")
+            except ValueError as exc:
+                self._log_system(f"Error: {exc}")
+            return
+
+        if action == "untag":
+            if len(parts) < 3:
+                self._log_system("usage: /groups untag @EMS @tag")
+                return
+            name = parts[1].lstrip("@")
+            if reg.remove_tag(name, parts[2]):
+                reg.save(self.core.config)
+                self._log_system(f"@{name}: removed tag @{parts[2].lstrip('@')}.")
+            else:
+                self._log_system(f"@{name}: no such tag '{parts[2]}'.")
+            return
+
+        self._log_system(
+            f"unknown /groups action '{action}'  ·  "
+            "try: new | delete | add | rm | tag | untag"
+        )
+
+    def _groups_list(self, reg: object) -> None:
+        from ..core.groups import GroupRegistry
+        assert isinstance(reg, GroupRegistry)
+        groups = reg.all()
+        if not groups:
+            self._log_system(
+                "No groups configured. Use /groups new @NAME to create one."
+            )
+            return
+        lines = ["[b]Groups:[/b]"]
+        for g in sorted(groups, key=lambda g: g.name):
+            marker = "[green]✓[/green]" if reg.is_subscribed(g.name) else "[dim]○[/dim]"
+            where = ", ".join(g.transports) or "-"
+            extras = []
+            if g.members:
+                extras.append(f"{len(g.members)} member(s)")
+            if g.tags:
+                extras.append(f"tags: {', '.join('@' + t for t in g.tags)}")
+            suffix = f"  [dim]{'; '.join(extras)}[/dim]" if extras else ""
+            lines.append(f"  {marker}  [b]@{g.name}[/b]  via {where}{suffix}")
+        lines.append(
+            "[dim]/groups @NAME for details  ·  /groups new @NAME to create[/dim]"
+        )
+        self._log_system("\n".join(lines))
+
+    def _groups_show(self, reg: object, name_arg: str) -> None:
+        from ..core.groups import GroupRegistry
+        assert isinstance(reg, GroupRegistry)
+        name = name_arg.lstrip("@")
+        g = reg.get(name)
+        if g is None:
+            self._log_system(
+                f"No such group @{name}.  Use /groups new @{name} to create it."
+            )
+            return
+        lines = [f"[b]@{g.name}[/b]  ({g.display_name})"]
+        lines.append(
+            f"  outbound transports: {', '.join(g.transports) or '(none)'}"
+        )
+        lines.append(
+            f"  subscribed: {'[green]yes[/green]' if reg.is_subscribed(g.name) else '[dim]no[/dim]'}"
+        )
+        if g.members:
+            lines.append("  incoming members:")
+            for m in g.members:
+                who = m.transport or "any"
+                lines.append(f"    [dim]{m.identifier}  [{who}][/dim]")
+        else:
+            lines.append("  incoming members: (none)")
+        lines.append(
+            "  incoming tags: "
+            + (", ".join("@" + t for t in g.tags) if g.tags else "(none)")
+        )
+        self._log_system("\n".join(lines))
+
+    def _handle_position_command(self, arg: str) -> None:
+        """Show or set the station position.
+
+        /position           — show current position
+        /position <grid>    — set position by Maidenhead grid square (e.g. FN31pr)
+        /position clear     — remove manually configured position
+        """
+        if self.core is None:
+            return
+        from ..core.maidenhead import grid_to_latlon, _GRID_RE as _GRE
+
+        sub = arg.strip()
+        if not sub:
+            from ..core.position import position_from_config
+            pos = self._position
+            if pos is None:
+                pos = position_from_config(self.core.config)
+            if pos is None:
+                self._log_system(
+                    "No position set. Use /position <grid> to set manually."
+                )
+            else:
+                self._log_system(
+                    f"Position: {pos.lat:+.4f}°  {pos.lon:+.4f}°  "
+                    f"grid [b]{pos.grid}[/b]  [dim]({pos.source})[/dim]"
+                )
+            return
+
+        if sub.lower() == "clear":
+            pos_data = self.core.config.data.get("position", {})
+            changed = False
+            for key in ("lat", "lon", "fixed_grid"):
+                if key in pos_data:
+                    del pos_data[key]
+                    changed = True
+            if changed:
+                self.core.config.save()
+                self._position = None
+                self._log_system("Position cleared.")
+            else:
+                self._log_system("No manually configured position to clear.")
+            return
+
+        # Treat argument as a Maidenhead grid square.
+        grid = sub.upper()
+        if not _GRE.match(grid):
+            self._log_system(
+                f"'{sub}' is not a valid Maidenhead grid (e.g. FN31, FN31pr)."
+            )
+            return
+        try:
+            lat, lon = grid_to_latlon(grid)
+        except ValueError as exc:
+            self._log_system(f"Grid error: {exc}")
+            return
+        self.core.config.set("position", "lat", round(lat, 6))
+        self.core.config.set("position", "lon", round(lon, 6))
+        self.core.config.save()
+        # Update cached position so Health panel reflects it immediately.
+        from ..core.position import Position
+        self._position = Position(lat=lat, lon=lon, source="manual")
+        self._log_system(
+            f"Position set: {lat:+.4f}°  {lon:+.4f}°  grid [b]{grid}[/b]"
+        )
 
     @work
     async def _handle_start_command(self, arg: str) -> None:
@@ -7827,6 +9065,21 @@ class RadioTUI(App):
             else "Read-only view - tap the Watch tab, or pick a mode"
         )
 
+    def _update_composer_placeholder(self) -> None:
+        """Update the composer hint text to match the current mode and target."""
+        try:
+            composer = self.query_one("#composer", Input)
+        except Exception:  # noqa: BLE001
+            return
+        if composer.disabled:
+            return
+        if self.active_transport == "meshcore" and not self.current_target:
+            composer.placeholder = (
+                "click a channel to chat  ·  /to @0 for public channel"
+            )
+        else:
+            composer.placeholder = "Type a message or /help ..."
+
     async def on_input_submitted(self, event: Input.Submitted) -> None:
         # The dedicated search box drives the history palette; Enter just keeps
         # the results (selection opens a thread). Route it before view logic.
@@ -8018,6 +9271,20 @@ class RadioTUI(App):
             self._handle_sched_command(arg)
         elif cmd == "/roster":
             self._handle_roster_command(arg)
+        elif cmd == "/bandscan":
+            self._handle_bandscan_command(arg)
+        elif cmd in ("/subs", "/subscriptions"):
+            self._handle_subs_command(arg)
+        elif cmd in ("/groups", "/group"):
+            self._handle_groups_command(arg)
+        elif cmd in ("/contacts", "/contact"):
+            self._handle_contacts_command(arg)
+        elif cmd == "/bridge":
+            self._handle_bridge_command(arg)
+        elif cmd == "/filters":
+            self._handle_filters_command(arg)
+        elif cmd in ("/position", "/pos", "/grid"):
+            self._handle_position_command(arg)
         elif cmd == "/start":
             self._handle_start_command(arg)
         elif cmd == "/net":
@@ -8041,7 +9308,13 @@ class RadioTUI(App):
             self._log_system("Pick a mode first (press F3).")
             return
         if not self.current_target:
-            self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
+            if self.active_transport == "meshcore":
+                self._log_system(
+                    "No channel selected. Use /to @0 for the public channel, "
+                    "or /channel list to see available channels."
+                )
+            else:
+                self._log_system("No conversation selected. Use /to <callsign|@GROUP>.")
             return
         t = self._active_transport_obj()
         caps = t.capabilities() if t else None

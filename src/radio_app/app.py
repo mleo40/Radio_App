@@ -11,6 +11,8 @@ import asyncio
 import logging
 
 from .config import Config
+from .core.bridge import BridgeEngine
+from .core.contacts import ContactBook
 from .core.compliance import ComplianceGuard
 from .core.favorites import Favorites
 from .core.filters import FilterEngine
@@ -36,6 +38,7 @@ class App:
     def __init__(self, config: Config) -> None:
         self.config = config
         self.store = MessageStore(config.database_path())
+        self.contact_book = ContactBook(self.store._conn)
         self.groups = GroupRegistry.from_config(config)
         self.filters = FilterEngine.from_config(config, self.groups)
         self.station = Station.from_config(config)
@@ -65,6 +68,7 @@ class App:
         ret = next((t for t in self.transports if t.name == "reticulum"), None)
         self.nomad_cache = NomadPageCache(config.database_path())
         self.browser = NomadnetBrowser(ret, cache=self.nomad_cache)
+        self.bridge = BridgeEngine.from_config(config)
         self.router = Router(
             transports=self.transports,
             store=self.store,
@@ -73,6 +77,8 @@ class App:
             default_mode=self._default_mode(),
             station=self.station,
             compliance=self.compliance,
+            bridge=self.bridge if self.bridge.rules else None,
+            interlock=self.radio_interlock,
         )
         self.wsjtx_monitor = WSJTXDTMonitor()
         self._started = False

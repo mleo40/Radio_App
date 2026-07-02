@@ -47,6 +47,7 @@ health = [
 # Developer tooling.
 dev = [
     "pytest>=8.0",
+    "pytest-xdist>=3.5",
     "ruff>=0.4",
     "mypy>=1.10",
 ]

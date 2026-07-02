@@ -5,8 +5,8 @@ Tracked, not-yet-implemented feature requests. Newest at the top.
 ## Cross-mode identity linking ("contacts book")
 
 **Requested:** 2026-06-29
-**Status:** Backlog
-**Area:** `core/` (new `contacts.py`), `core/store.py`, `core/favorites.py`, `ui/tui.py`
+**Status:** Implemented (2026-06-29, `phase1-ux-gaps` branch)
+**Area:** `core/contacts.py` (new), `core/store.py`, `app.py`, `ui/tui.py`, `cli.py`
 
 Associate multiple transport-specific addresses to a single named person. Once
 linked, marking any of their identities as a favorite in one mode automatically
@@ -62,8 +62,8 @@ people with similar callsigns) is worse than two separate entries.
 ## Scheduled band changes (JS8Call / HF)
 
 **Requested:** 2026-06-29
-**Status:** Backlog
-**Area:** `core/scheduler.py`, `transports/js8call_transport.py`, `ui/tui.py`
+**Status:** Implemented (2026-06-29, `phase1-ux-gaps` branch)
+**Area:** `transports/js8call_transport.py`, `ui/tui.py`, `cli.py`
 
 Change the active HF band on a schedule — for example, move to 40m at 20:00 local
 for the evening EmComm net, then back to 20m at 08:00 the next morning.

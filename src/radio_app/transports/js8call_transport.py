@@ -617,6 +617,19 @@ class JS8CallTransport(Transport):
             return False
         return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
 
+    async def send_cq(self, callsign: str = "") -> bool:
+        """Transmit a plain CQ call (``CQ CQ CQ DE <CALLSIGN>``) as a broadcast.
+
+        Ordinary broadcast text (the ``@ALLCALL`` target ``send()`` already
+        uses for broadcast messages), not a special API verb — any JS8Call
+        station decoding traffic on the frequency can answer.
+        """
+        call = callsign.strip().upper()
+        body = f"CQ CQ CQ DE {call}" if call else "CQ CQ CQ"
+        return await self._send_api(
+            {"type": "TX.SEND_MESSAGE", "value": f"@ALLCALL {body}"}
+        )
+
     async def send_position_beacon(self, position) -> bool:
         """Update the station grid square in JS8Call via the STATION.SET_GRID API.
 
@@ -640,6 +653,17 @@ class JS8CallTransport(Transport):
         return await self._send_api(
             {"type": "TX.SEND_MESSAGE", "value": f"{JS8_APRS_GATEWAY} NWS {grid4}"}
         )
+
+    async def send_heartbeat(self, grid: str = "") -> bool:
+        """Transmit a JS8Call heartbeat (``@HB HEARTBEAT <GRID>``) to the ``@HB``
+        group, JS8Call's own propagation-probe convention.
+
+        Any JS8Call station with heartbeat acknowledgement enabled auto-replies
+        with our SNR at their end (``HEARTBEAT SNR <value>``) — no cooperating
+        operator needed. Used by :mod:`core.band_scan` to probe each band.
+        """
+        value = f"@HB HEARTBEAT {grid.strip().upper()[:4]}".strip()
+        return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
 
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
