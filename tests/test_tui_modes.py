@@ -2163,3 +2163,56 @@ def test_start_command_does_not_crash(config_path):
 
     asyncio.run(run())
 
+
+def test_js8_start_button_resolves_js8call_transport(tmp_path):
+    """Regression: the #js8-start button must resolve to "js8call", not "js8".
+
+    The button id's prefix ("js8") isn't the registered transport name
+    ("js8call") -- clicking it used to look up a nonexistent "js8" transport
+    and report it as unknown/unavailable.
+
+    Uses its own config (with a callsign set) rather than the shared
+    ``config_path`` fixture: that fixture has no [station] callsign, so the
+    app's background _initial_flow() can pop a SetupScreen on startup and
+    race with pilot.click() (which needs #js8-start to be on the current
+    topmost screen). The pre-existing /start-command test sidesteps this by
+    calling the handler directly instead of clicking; a real button click
+    needs the callsign pre-set instead.
+    """
+    from textual.widgets import RichLog
+
+    cfg = tmp_path / "config.toml"
+    cfg.write_text(
+        "[general]\ndisplay_name = \"Tester\"\n[logging]\nfile = \"\"\n"
+        "[station]\ncallsign = \"W1TEST\"\n"
+        "[transports.js8call]\nenabled = true\nport = 2442\n"
+    )
+
+    async def run():
+        app = RadioTUI(str(cfg))
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+
+            await pilot.click("#js8-start")
+
+            for _ in range(20):
+                await pilot.pause()
+                await asyncio.sleep(0)
+                text = "\n".join(
+                    s.text for s in app.query_one("#messages", RichLog).lines
+                )
+                if "js8call" in text.lower() or "unknown transport" in text.lower():
+                    break
+
+            text = "\n".join(
+                s.text for s in app.query_one("#messages", RichLog).lines
+            )
+            assert "unknown transport" not in text.lower(), (
+                f"js8-start button resolved to the wrong transport name: {text!r}"
+            )
+            assert "js8call" in text.lower()
+
+    asyncio.run(run())
+

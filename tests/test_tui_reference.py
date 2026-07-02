@@ -127,12 +127,18 @@ def test_reference_tabs_switch_content(config_path):
             initial = switcher.current
 
             await pilot.click("#ref-qmx")
-            await pilot.pause()
+            # Under heavy parallel test load a single pause isn't always
+            # enough for the button-pressed handler to fully settle; poll
+            # briefly instead of asserting on the very next tick.
+            active_ids: list[str | None] = []
+            for _ in range(20):
+                await pilot.pause()
+                active_ids = [
+                    b.id for b in screen.query(".rtab") if "-active" in b.classes
+                ]
+                if active_ids == ["ref-qmx"]:
+                    break
             after_click = switcher.current
-
-            active_ids = [
-                b.id for b in screen.query(".rtab") if "-active" in b.classes
-            ]
             return initial, after_click, active_ids
 
     initial, after_click, active_ids = asyncio.run(run())
