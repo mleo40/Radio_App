@@ -676,7 +676,8 @@ radioapp tui              # launch it
 ```
 
 Keys: **F3** choose mode · **F4** favorites-only (Watch + every mode) ·
-**F5** cycle Watch/Health/Logs/Chats/Favorites/Net/Weather · **Ctrl+P** settings ·
+**F5** cycle Watch/Health/Logs/Chats/Favorites/Net/Weather · **F9** field
+reference (radio/mode setup how-to, offline) · **Ctrl+P** settings ·
 **Ctrl+F** search · **Ctrl+R** refresh · **Ctrl+C** quit. The
 mode chips are tappable on a touchscreen; tap the **⌨/☞** glyph to toggle a
 larger touch layout.

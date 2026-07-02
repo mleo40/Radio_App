@@ -1,6 +1,6 @@
 """Reference screen content: radio + mode setup how-to for field use.
 
-Packaged source of truth for the TUI's F1 Reference screen (works even when
+Packaged source of truth for the TUI's F9 Reference screen (works even when
 pip-installed — no external docs/ files needed). This is necessarily general
 guidance: always cross-check the manufacturer's manual and your installed
 Hamlib version's actual rig list, since exact menu wording and available rig

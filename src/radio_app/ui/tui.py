@@ -1725,8 +1725,9 @@ class AboutScreen(ModalScreen[None]):
 class ReferenceScreen(ModalScreen[None]):
     """Field reference: radio + mode setup how-to, no internet required.
 
-    Opened with F1. Content is baked into the package (see ``ui/reference.py``)
-    so it's available on a fresh field deployment with no docs/ checkout.
+    Opened with F9 (not F1 -- many terminals intercept F1 for their own
+    help). Content is baked into the package (see ``ui/reference.py``) so
+    it's available on a fresh field deployment with no docs/ checkout.
     """
 
     CSS = """
@@ -1977,7 +1978,7 @@ class RadioTUI(App):
         Binding("ctrl+c", "quit", "Quit", priority=True),
         Binding("ctrl+q", "quit", "Quit", priority=True),
         Binding("q", "quit", "Quit"),
-        Binding("f1", "reference", "Reference", priority=True),
+        Binding("f9", "reference", "Reference", priority=True),
         ("f3", "choose_mode", "Next mode"),
         ("f4", "toggle_fav_only", "Fav-only"),
         ("f5", "cycle_utility", "Stream/Health…"),
@@ -2849,7 +2850,7 @@ class RadioTUI(App):
         self.push_screen(AboutScreen())
 
     def action_reference(self) -> None:
-        """F1: show the field reference (radio + mode setup how-to).
+        """F9: show the field reference (radio + mode setup how-to).
 
         Guarded so a second press while it's open doesn't stack screens.
         """

@@ -1,6 +1,6 @@
-"""Headless TUI tests for the F1 field-reference screen.
+"""Headless TUI tests for the F9 field-reference screen.
 
-Verify the screen opens with F1, closes on Escape/q, doesn't stack on a
+Verify the screen opens with F9, closes on Escape/q, doesn't stack on a
 second press, and its tabs actually switch content. Needs the ``tui`` extra
 (skips otherwise); no network required.
 """
@@ -56,7 +56,7 @@ def test_f1_opens_reference_screen(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             return isinstance(app.screen, ReferenceScreen)
 
@@ -75,10 +75,10 @@ def test_reference_screen_does_not_stack_on_second_press(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             first = app.screen
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             return first is app.screen
 
@@ -90,7 +90,7 @@ def test_reference_screen_closes_on_escape(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             opened = isinstance(app.screen, ReferenceScreen)
             await pilot.press("escape")
@@ -106,7 +106,7 @@ def test_reference_screen_closes_on_q(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             await pilot.press("q")
             await pilot.pause()
@@ -120,7 +120,7 @@ def test_reference_tabs_switch_content(config_path):
         app = RadioTUI(config_path)
         async with app.run_test(size=(100, 30)) as pilot:
             await pilot.pause()
-            await pilot.press("f1")
+            await pilot.press("f9")
             await pilot.pause()
             screen = app.screen
             switcher = screen.query_one("#ref-content", ContentSwitcher)
