@@ -662,12 +662,15 @@ async def _with_app(config_path, func, *, quiet: bool = False):
     from .logging_setup import configure_logging
 
     configure_logging(app.config, stderr=not quiet)
+    # Silence the *entire* start/run/stop lifetime, not just start and stop
+    # separately — background RNS activity (announce processing) can emit
+    # [Notice]/[Error] lines at any point while ``func`` runs, not only during
+    # startup/teardown, and quiet mode should suppress all of it.
     with _silence_stderr() if quiet else _contextlib.nullcontext():
         await app.start()
-    try:
-        return await func(app)
-    finally:
-        with _silence_stderr() if quiet else _contextlib.nullcontext():
+        try:
+            return await func(app)
+        finally:
             await app.stop()
 
 
