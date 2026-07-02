@@ -89,6 +89,13 @@ class Router:
         """Register a callback invoked with (UnifiedMessage, FilterAction)."""
         self._ui_callbacks.append(callback)
 
+    def remove_ui_callback(self, callback: UiCallback) -> None:
+        """Unregister a previously added UI callback (no-op if not registered)."""
+        try:
+            self._ui_callbacks.remove(callback)
+        except ValueError:
+            pass
+
     # -- outbound -------------------------------------------------------------
 
     async def send(
