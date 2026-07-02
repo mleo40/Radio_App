@@ -5722,10 +5722,25 @@ class RadioTUI(App):
         except Exception as exc:  # noqa: BLE001
             self._log_system(f"Winlink form catalog failed: {exc}")
             return
+        if not forms and hasattr(t, "update_forms"):
+            # First use: nothing installed yet. Fetch Pat's standard forms
+            # package automatically instead of just pointing the operator at
+            # a CLI command \u2014 this needs internet (Pat does the download), so
+            # do it before you're off-grid, not as a rescue in the field.
+            self._log_system(
+                "No Winlink forms installed. Fetching from Pat "
+                "(needs internet) \u2026"
+            )
+            try:
+                await t.update_forms()
+                forms = await t.list_forms()
+            except Exception as exc:  # noqa: BLE001
+                self._log_system(f"Winlink forms update failed: {exc}")
         if not forms:
             self._log_system(
-                "No Winlink forms installed. Run 'radioapp winlink forms-update' "
-                "to download them."
+                "No Winlink forms available \u2014 Pat couldn't reach the forms "
+                "server (no internet?). Try again with connectivity, or run "
+                "'radioapp winlink forms-update' once you have it."
             )
             return
         template = await self.push_screen_wait(WinlinkFormsScreen(forms))
