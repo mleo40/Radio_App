@@ -4294,8 +4294,9 @@ class RadioTUI(App):
 
         Saved (favorited) nodes that haven't re-announced yet are listed first
         and marked offline, so a bookmark is always recallable even before the
-        node beacons again. Currently-heard nodes follow, with a leading star
-        when they are favorites. Selecting any row opens the page browser.
+        node beacons again. Currently-heard nodes follow, favorites first
+        (starred), then everyone else. Selecting any row opens the page
+        browser.
         """
         if self.core is None:
             return
@@ -4330,10 +4331,15 @@ class RadioTUI(App):
                 f"\u2605 \U0001f5ce {name}  <{f.id[:16]}>  [dim](offline)[/dim]"
             )))
             self._nomad_nodes.append({"dest": f.id, "name": name})
-        # Then live nodes, marking the ones we've saved. With the favorites-only
-        # filter on (F4), non-favorite live nodes are hidden so only saved nodes
-        # remain.
-        for n in list(live.values())[:50]:
+        # Then live nodes, favorites first (stable within each group), marking
+        # the ones we've saved. Sorting before the [:50] cap means a favorite
+        # heard less recently than 50 others still isn't dropped. With the
+        # favorites-only filter on (F4), non-favorite live nodes are hidden so
+        # only saved nodes remain.
+        live_nodes = sorted(
+            live.values(), key=lambda n: not favs.is_favorite(n["dest"])
+        )
+        for n in live_nodes[:50]:
             is_fav = favs.is_favorite(n["dest"])
             if self._active_fav_only and not is_fav:
                 continue
