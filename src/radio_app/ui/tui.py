@@ -95,6 +95,7 @@ _UNIVERSAL_COMMAND_HELP = (
     "/chats, "
     "/tmpl [list|<name>|add <n> <text>|del <n>], "
     "/bands [<band>|activity [<band>]], "
+    "/bandscan <bands> <dwell_min> — JS8Call propagation probe, "
     "/sched [list|cancel <id>|band <band> <time> [daily]|+Nm|HH:MM [text]], "
     "/subs [add|rm @GROUP], "
     "/groups [@NAME|new|delete|add|rm|tag|untag], "
@@ -1078,6 +1079,52 @@ class WinlinkWXSubscribeScreen(ModalScreen[bool]):
             self.dismiss(True)
         else:
             self.dismiss(False)
+
+    def action_cancel(self) -> None:
+        self.dismiss(False)
+
+
+class BandScanResultScreen(ModalScreen[bool]):
+    """Show band-scan results and offer to switch to the best-performing band.
+
+    Dismisses with True to switch, False to stay (caller restores the
+    pre-scan band on decline).
+    """
+
+    CSS = """
+    BandScanResultScreen { align: center middle; }
+    #bscan-box {
+        width: 60; height: auto; padding: 1 2;
+        border: thick $accent; background: $surface;
+    }
+    #bscan-title { height: auto; margin-bottom: 1; }
+    #bscan-body  { height: auto; color: $text-muted; margin-bottom: 1; }
+    #bscan-btns  { height: auto; align-horizontal: right; }
+    """
+    BINDINGS = [("escape", "cancel", "Cancel")]
+
+    def __init__(self, results: list, best_band: str) -> None:
+        super().__init__()
+        self._results = results
+        self._best = best_band
+
+    def compose(self) -> ComposeResult:
+        lines = []
+        for r in self._results:
+            snr = f", avg SNR {r.avg_snr:+.0f} dB" if r.avg_snr is not None else ""
+            marker = " ← best" if r.band == self._best else ""
+            lines.append(f"{r.band}: {r.heard_count} heard{snr}{marker}")
+        with Vertical(id="bscan-box"):
+            yield Static("[b]📡 Band Scan Results[/b]", id="bscan-title")
+            yield Static("\n".join(lines), id="bscan-body")
+            with Horizontal(id="bscan-btns"):
+                yield Button("Stay", id="bscan-no")
+                yield Button(
+                    f"Switch to {self._best} →", id="bscan-yes", variant="primary"
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        self.dismiss(event.button.id == "bscan-yes")
 
     def action_cancel(self) -> None:
         self.dismiss(False)
@@ -7755,6 +7802,99 @@ class RadioTUI(App):
         )
         self.core.store.schedule_add(msg, new_fire, transport="js8call")
 
+    def _handle_bandscan_command(self, arg: str) -> None:
+        """Run an on-demand band scan: heartbeat + listen per band, then report.
+
+        /bandscan <band1,band2,...> <dwell_minutes>
+        """
+        parts = arg.strip().split()
+        if len(parts) != 2:
+            self._log_system(
+                "usage: /bandscan <band1,band2,...> <dwell_minutes>  "
+                "e.g. /bandscan 80m,40m,20m 5"
+            )
+            return
+        bands = [b.strip() for b in parts[0].split(",") if b.strip()]
+        if not bands:
+            self._log_system("usage: /bandscan <band1,band2,...> <dwell_minutes>")
+            return
+        try:
+            dwell_min = float(parts[1])
+            if dwell_min <= 0:
+                raise ValueError
+        except ValueError:
+            self._log_system(f"invalid dwell minutes: '{parts[1]}'")
+            return
+        self._run_bandscan(bands, dwell_min * 60)
+
+    @work(exclusive=True)
+    async def _run_bandscan(self, bands: list[str], dwell_s: float) -> None:
+        """Cycle ``bands``, heartbeat + listen on each, then offer to switch.
+
+        Running /bandscan again cancels an in-progress scan (Textual's
+        exclusive-worker semantics) — there's no separate stop command.
+        """
+        if self.core is None:
+            return
+        t = self._js8_transport()
+        if t is None or not getattr(t, "running", False):
+            self._log_system("Band scan: JS8Call is not running.")
+            return
+        blocker = self.core.radio_interlock.blocked_by("js8call")
+        if blocker is not None:
+            self._log_system(f"⛔ Band scan blocked — radio busy ({blocker}).")
+            return
+        from ..transports.js8call_transport import dial_for_band
+        unknown = [b for b in bands if dial_for_band(b) is None]
+        if unknown:
+            self._log_system(f"Band scan: unknown band(s): {', '.join(unknown)}")
+            return
+
+        grid = self.core.config.station.get("grid_square", "")
+        self._log_system(
+            f"📡 Band scan starting: {', '.join(bands)} "
+            f"({int(dwell_s)}s each) — sending JS8 heartbeats…"
+        )
+        from ..core.band_scan import run_band_scan
+        report = await run_band_scan(
+            t, self.core.router, self.core.radio_interlock,
+            bands, dwell_s, grid=grid, on_progress=self._log_system,
+        )
+        if report is None:
+            return  # already logged (radio busy)
+        self._update_js8_bar()
+
+        lines = ["[b]Band scan results:[/b]"]
+        for r in report.results:
+            snr = f", avg SNR {r.avg_snr:+.0f} dB" if r.avg_snr is not None else ""
+            lines.append(f"  {r.band}: {r.heard_count} heard{snr}")
+        self._log_system("\n".join(lines))
+
+        best = report.best()
+        if best is None:
+            self._log_system("Band scan: no replies heard on any band.")
+            if report.original_band:
+                hz = dial_for_band(report.original_band)
+                if hz:
+                    await t.set_dial_freq(hz)
+                    self._update_js8_bar()
+            return
+
+        result = await self.push_screen_wait(
+            BandScanResultScreen(report.results, best.band)
+        )
+        if result:
+            hz = dial_for_band(best.band)
+            if hz:
+                await t.set_dial_freq(hz)
+                self._update_js8_bar()
+                self._log_system(f"✓ Switched to {best.band}.")
+        elif report.original_band:
+            hz = dial_for_band(report.original_band)
+            if hz:
+                await t.set_dial_freq(hz)
+                self._update_js8_bar()
+
     def _handle_roster_command(self, arg: str) -> None:
         """Show the presence roster (recently-heard callsigns)."""
         from ..core.roster import get_roster
@@ -8958,6 +9098,8 @@ class RadioTUI(App):
             self._handle_sched_command(arg)
         elif cmd == "/roster":
             self._handle_roster_command(arg)
+        elif cmd == "/bandscan":
+            self._handle_bandscan_command(arg)
         elif cmd in ("/subs", "/subscriptions"):
             self._handle_subs_command(arg)
         elif cmd in ("/groups", "/group"):

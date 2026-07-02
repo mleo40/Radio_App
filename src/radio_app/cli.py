@@ -517,6 +517,24 @@ def _build_parser() -> argparse.ArgumentParser:
     p_bridge = sub.add_parser("bridge", help="show active bridge / gateway rules")
     p_bridge.set_defaults(func=_cmd_bridge)
 
+    p_bandscan = sub.add_parser(
+        "bandscan", help="on-demand JS8Call band scan (propagation probe)"
+    )
+    p_bandscan.add_argument("bands", help="comma-separated bands, e.g. 80m,40m,20m")
+    p_bandscan.add_argument(
+        "--dwell", type=float, default=5.0,
+        help="minutes to listen per band (default: 5)",
+    )
+    switch_group = p_bandscan.add_mutually_exclusive_group()
+    switch_group.add_argument(
+        "--switch", action="store_true",
+        help="switch to the best band automatically, no prompt",
+    )
+    switch_group.add_argument(
+        "--no-switch", action="store_true", help="never switch, just report",
+    )
+    p_bandscan.set_defaults(func=_cmd_bandscan)
+
     p_filters = sub.add_parser(
         "filters", help="manage inbound filter rules (list/add/edit/delete/reorder)"
     )
@@ -1602,6 +1620,61 @@ def _cmd_filters(args: argparse.Namespace) -> int:
 
     print(f"unknown action '{sub}'", file=sys.stderr)
     return 2
+
+
+def _cmd_bandscan(args: argparse.Namespace) -> int:
+    """Run an on-demand JS8Call band scan (propagation probe)."""
+    bands = [b.strip() for b in args.bands.split(",") if b.strip()]
+    if not bands:
+        print("error: no bands given", file=sys.stderr)
+        return 2
+
+    async def run(app: App) -> int:
+        from .core.band_scan import run_band_scan
+        from .transports.js8call_transport import dial_for_band
+
+        t = next((x for x in app.transports if x.name == "js8call"), None)
+        if t is None or not getattr(t, "running", False):
+            print("error: JS8Call transport is not enabled/running", file=sys.stderr)
+            return 1
+        unknown = [b for b in bands if dial_for_band(b) is None]
+        if unknown:
+            print(f"error: unknown band(s): {', '.join(unknown)}", file=sys.stderr)
+            return 2
+
+        grid = app.config.station.get("grid_square", "")
+        print(f"Band scan: {', '.join(bands)} ({args.dwell:.0f} min each) ...")
+        report = await run_band_scan(
+            t, app.router, app.radio_interlock,
+            bands, args.dwell * 60, grid=grid, on_progress=print,
+        )
+        if report is None:
+            return 1
+
+        print("\nResults:")
+        for r in report.results:
+            snr = f", avg SNR {r.avg_snr:+.0f} dB" if r.avg_snr is not None else ""
+            print(f"  {r.band}: {r.heard_count} heard{snr}")
+
+        best = report.best()
+        if best is None:
+            print("No replies heard on any band.")
+            return 0
+        print(f"\nBest band: {best.band}")
+
+        if args.switch:
+            hz = dial_for_band(best.band)
+            await t.set_dial_freq(hz)
+            print(f"Switched to {best.band}.")
+        elif not args.no_switch and sys.stdin.isatty():
+            resp = input(f"Switch to {best.band} now? [y/N] ").strip().lower()
+            if resp == "y":
+                hz = dial_for_band(best.band)
+                await t.set_dial_freq(hz)
+                print(f"Switched to {best.band}.")
+        return 0
+
+    return _run(_with_app(args.config, run))
 
 
 def _cmd_roster(args: argparse.Namespace) -> int:

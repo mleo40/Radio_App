@@ -641,6 +641,17 @@ class JS8CallTransport(Transport):
             {"type": "TX.SEND_MESSAGE", "value": f"{JS8_APRS_GATEWAY} NWS {grid4}"}
         )
 
+    async def send_heartbeat(self, grid: str = "") -> bool:
+        """Transmit a JS8Call heartbeat (``@HB HEARTBEAT <GRID>``) to the ``@HB``
+        group, JS8Call's own propagation-probe convention.
+
+        Any JS8Call station with heartbeat acknowledgement enabled auto-replies
+        with our SNR at their end (``HEARTBEAT SNR <value>``) — no cooperating
+        operator needed. Used by :mod:`core.band_scan` to probe each band.
+        """
+        value = f"@HB HEARTBEAT {grid.strip().upper()[:4]}".strip()
+        return await self._send_api({"type": "TX.SEND_MESSAGE", "value": value})
+
     def is_reachable(self, msg: UnifiedMessage) -> bool:
         if not self._running:
             return False
