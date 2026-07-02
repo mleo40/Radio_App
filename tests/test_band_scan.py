@@ -372,8 +372,17 @@ def test_tui_bandscan_accept_switches_band(tui_config, monkeypatch):
             fake_run = AsyncMock(return_value=fake_report)
             monkeypatch.setattr(band_scan_module, "run_band_scan", fake_run)
 
+            notifications: list[str] = []
+            monkeypatch.setattr(
+                app, "notify", lambda msg, **kw: notifications.append(msg)
+            )
+
             await app._handle_command("/bandscan 80m,40m 5")
             await pilot.pause()
+            # A toast fires regardless of which view the operator is on when
+            # the scan finishes — not just the modal, which only shows here
+            # because a good band was actually found.
+            assert any("80m" in n for n in notifications)
             # Modal is up, offering to switch to the best band (80m).
             assert isinstance(app.screen, BandScanResultScreen)
             app.screen.dismiss(True)
@@ -381,6 +390,51 @@ def test_tui_bandscan_accept_switches_band(tui_config, monkeypatch):
 
             set_freq.assert_awaited()
             assert "switched to 80m" in _log_text(app).lower()
+
+    asyncio.run(run())
+
+
+def test_tui_bandscan_no_results_shows_toast(tui_config, monkeypatch):
+    """The 'nothing heard' path has no modal to interrupt with — must toast."""
+    async def run():
+        app = RadioTUI(tui_config)
+        async with app.run_test(size=(120, 30)) as pilot:
+            await pilot.pause()
+            app._select_mode("js8call")
+            await pilot.pause()
+            t = next(x for x in app.core.transports if x.name == "js8call")
+            monkeypatch.setattr(type(t), "running", property(lambda self: True))
+            set_freq = AsyncMock(return_value=True)
+            monkeypatch.setattr(t, "set_dial_freq", set_freq)
+
+            fake_report = band_scan_module.BandScanReport(
+                results=[
+                    band_scan_module.BandResult(band="80m", heard_count=0),
+                    band_scan_module.BandResult(band="40m", heard_count=0),
+                ],
+                original_band="20m",
+            )
+            fake_run = AsyncMock(return_value=fake_report)
+            monkeypatch.setattr(band_scan_module, "run_band_scan", fake_run)
+
+            notifications: list[tuple[str, dict]] = []
+            monkeypatch.setattr(
+                app, "notify", lambda msg, **kw: notifications.append((msg, kw))
+            )
+
+            await app._handle_command("/bandscan 80m,40m 5")
+            await pilot.pause()
+
+            # No modal in this path -- the toast is the only completion signal.
+            assert not isinstance(app.screen, BandScanResultScreen)
+            assert len(notifications) == 1
+            msg, kw = notifications[0]
+            assert "no replies heard" in msg.lower()
+            assert kw.get("severity") == "warning"
+            # Original band is restored automatically since there's nothing
+            # to choose between.
+            from radio_app.transports.js8call_transport import dial_for_band
+            set_freq.assert_awaited_with(dial_for_band("20m"))
 
     asyncio.run(run())
 

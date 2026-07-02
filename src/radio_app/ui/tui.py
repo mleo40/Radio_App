@@ -7939,7 +7939,15 @@ class RadioTUI(App):
 
         best = report.best()
         if best is None:
+            # No modal to interrupt with here, and a multi-minute scan often
+            # finishes while the operator has navigated away (F5) to another
+            # view — a toast is the only thing that reaches them regardless
+            # of what's currently on screen.
             self._log_system("Band scan: no replies heard on any band.")
+            self.notify(
+                "No replies heard on any band.",
+                title="Band scan complete", severity="warning",
+            )
             if report.original_band:
                 hz = dial_for_band(report.original_band)
                 if hz:
@@ -7947,6 +7955,11 @@ class RadioTUI(App):
                     self._update_js8_bar()
             return
 
+        self.notify(
+            f"Best band: {best.band} ({best.heard_count} heard) — "
+            "check the JS8Call pane to switch.",
+            title="Band scan complete",
+        )
         result = await self.push_screen_wait(
             BandScanResultScreen(report.results, best.band)
         )
