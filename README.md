@@ -21,7 +21,54 @@ via Pat), or **WSJT-X** (FT8/FT4 weak-signal via UDP).
 > multi-source clock consensus (GPS/chrony/NTP), position beacon + GPS, battery
 > awareness, offline band-plan, **band tracking** (every HF message stamped with
 > its band; per-band history filters and aggregate stats), scheduled sends, and a
-> presence roster. 967 tests pass; the whole suite runs without radio hardware.
+> presence roster. 993 tests pass; the whole suite runs without radio hardware.
+
+## Field deployment: zero to operating, with no internet
+
+This is the fast path for an operator who just arrived on site, has the radio
+and antenna up, and needs to get on the air — assume the machine has no
+internet connection from here on; everything below works from the local
+checkout alone.
+
+1. **One-time setup** (do this before you're in the field, or once on arrival):
+   `radioapp setup` — an interactive wizard that asks for your callsign, grid
+   square, and per-transport connection details (host/port, launch command),
+   and writes the single config file (`~/.config/radio_app/config.toml`). See
+   [`INSTALL.md`](INSTALL.md) if the app isn't installed yet.
+2. **Launch**: `radioapp tui`. If a transport's backing app (JS8Call, WSJT-X,
+   Pat) isn't already running, press the **⚡ Start** button in its mode panel,
+   or run `radioapp start <transport>` from the CLI.
+3. **Check readiness before transmitting** — press **F5** to cycle to the
+   **Health** view: it shows per-transport reachability, MeshCore battery/LoRa
+   telemetry, host battery, GPS fix, and clock-sync offset (GPS → chrony → NTP
+   → system) all in one screen. A drifted clock silently breaks JS8Call/WSJT-X
+   decoding before you'd otherwise notice why nobody's answering — check this
+   first.
+4. **Discover commands without leaving the app or needing internet**: type
+   `/help` — it prints every universal command plus the ones specific to
+   whichever mode is active, and it's generated from the same code that
+   implements the commands, so it never drifts out of date the way this file
+   can. From the CLI, `radioapp --help` and `radioapp <subcommand> --help` are
+   the same kind of always-current, offline reference.
+5. **Operate**: **F3** cycles the mode selector (one panel per enabled
+   transport). Pick a mode, then `/to <callsign>` or `/to @GROUP` to open a
+   conversation and start typing. `/tmpl` recalls canned messages; Winlink has
+   five built-in report templates (ARRL Radiogram, Health & Welfare, Activity
+   Report, EmComm Spot Report, blank) in its ✎/📧 Compose screen. `/net open`
+   starts a formal net-control/roll-call session if you're running one.
+   On JS8Call, `/bandscan 80m,40m,20m 5` empirically probes which band you're
+   actually being heard on right now (sends a heartbeat + listens per band)
+   instead of guessing — see the JS8Call section below.
+
+**What needs internet, and what doesn't.** Everything above — JS8Call,
+WSJT-X, Winlink over RF, MeshCore, and Reticulum over LoRa/serial — is fully
+offline-capable; Reticulum only needs its own local `rnsd` daemon, not a WAN
+connection. A small number of *optional* extras degrade gracefully (silently
+skip, never crash) with no internet: the 🌐 **Fetch** button on the Weather
+view (Open-Meteo/NWS), the HF propagation-conditions readout on the Health
+view (fetched once at launch from HamQSL's solar feed), and Winlink NWS
+bulletin subscriptions (only if your RMS gateway path needs internet — an
+RF-only gateway path doesn't).
 
 ## Key ideas
 
@@ -301,6 +348,13 @@ and sending a form is currently a **programmatic** step — the transport's
 the next session) — but there is **no interactive form composer in the CLI/TUI
 yet** (queued; see [`FEATURE_REQUESTS.md`](FEATURE_REQUESTS.md)).
 
+**Built-in email templates.** Separately from Pat's RMS Express forms above,
+the **📧 Compose** screen's template picker has five ready-to-fill EmComm report
+formats — **ARRL Radiogram**, **Health & Welfare**, **Activity Report**,
+**EmComm Spot Report**, and a blank — each pre-filling the subject/body with
+your callsign and the current UTC date/time. Selecting "ICS Forms →" from the
+same picker jumps into the RMS Express forms flow described above.
+
 Notes:
 - Outbound messages are posted to Pat's **outbox**; with `auto_connect = false`
   they are delivered on the next session you start (manually in Pat, or by a send
@@ -460,6 +514,22 @@ radioapp roster --transport js8call --since 48h
 
 Run via the installed `radioapp` script or `python -m radio_app`.
 
+**Other CLI utilities** not shown above (run `radioapp <name> --help` for full
+flags — that output is generated from the same code as the command, so it's
+always current even when this file lags):
+
+| Command | Purpose |
+|---|---|
+| `radioapp bandscan <bands> <dwell_min>` | JS8Call propagation probe (see the in-composer command table below) |
+| `radioapp filters [list\|add\|edit\|del\|mv]` | manage inbound filter rules from a script/cron, not just the TUI |
+| `radioapp bridge` | show active cross-mode bridge/gateway rules |
+| `radioapp contacts [list\|add\|link\|unlink\|rename\|delete]` | manage the cross-mode contacts book |
+| `radioapp net [open\|ci\|list\|close\|status\|sessions]` | drive a net-control/roll-call session headlessly |
+| `radioapp favorites [add\|remove\|list\|set\|watch\|import-groups]` | manage favorite peers |
+| `radioapp backup [--out PATH]` / `radioapp restore <archive>` | archive or restore config + database as one `.tar.gz` |
+| `radioapp db [stats\|vacuum\|prune\|cache-prune\|cache-clear]` | database maintenance (size stats, compact, delete old rows) |
+| `radioapp nomad sync` | pre-fetch favorited NomadNet pages for offline browsing |
+
 ## TUI (terminal user interface)
 
 A Textual-based terminal app designed as a **single pane of glass** — one screen
@@ -605,9 +675,17 @@ radioapp tui              # launch it
 ```
 
 Keys: **F3** choose mode · **F4** favorites-only (Watch + every mode) ·
-**F5** cycle Watch/Health/Logs/Chats/Favorites · **Ctrl+R** refresh · **Ctrl+C** quit. The
+**F5** cycle Watch/Health/Logs/Chats/Favorites/Net/Weather · **Ctrl+P** settings ·
+**Ctrl+F** search · **Ctrl+R** refresh · **Ctrl+C** quit. The
 mode chips are tappable on a touchscreen; tap the **⌨/☞** glyph to toggle a
 larger touch layout.
+
+**⚙ Settings modal (Ctrl+P)** has four tabs: **Favorites** (filter/add/remove),
+**Weather** (manage forecast grid squares), **Backup** (back up or restore
+config + database in one action — the TUI equivalent of `radioapp backup`/
+`restore`), and **Database** (vacuum now, prune old messages, size stats — the
+TUI equivalent of `radioapp db`).
+
 In-composer commands:
 
 | Command | Action |
@@ -617,6 +695,9 @@ In-composer commands:
 | `/to <callsign\|@GROUP> <message>` | switch **and** immediately send (e.g. `/to @EMS SNR?`) |
 | `/channel add <index> <#name> [secret]` | (MeshCore) create/join a channel — a `#name` hashtag channel needs no secret |
 | `/channel list` / `/channel rm <index>` | (MeshCore) list channels / drop a saved channel name |
+| `/whoami` | (Reticulum) show your anonymous LXMF address |
+| `/announce` | (Reticulum) re-announce your LXMF identity; (MeshCore) broadcast a node advert |
+| `/path [<id>]` | (Reticulum) request a network path to a contact |
 | `/fav add [type] <id> [label]` | add a favorite (`type` = `node\|peer\|call\|group\|channel\|contact`) |
 | `/fav here [label]` | favorite the **open conversation** (MeshCore channel by `#name`, contact by pubkey) |
 | `/fav list` / `/fav rm <id>` / `/fav only` | list favorites / remove one / toggle the favorites-only filter |
@@ -635,9 +716,13 @@ In-composer commands:
 | `/bands activity [band]` | show recent HF message activity from the store, optionally filtered by band |
 | `/freq` / `/freq <MHz\|Hz>` | (JS8Call) show / set the radio dial frequency |
 | `/band` / `/band <name>` | (JS8Call) list bands / switch band (e.g. `/band 20m`) |
+| `/bandscan <bands> <dwell_min>` | (JS8Call) propagation probe — heartbeat + listen per band (e.g. `/bandscan 80m,40m,20m 5`), reports heard-count/SNR per band, offers to switch to the best one |
+| `/sms <phone> <text>` | (JS8Call) send an SMS via the APRS gateway |
 | `/subject <text>` | (Winlink) set the subject for the next message |
 | `/attach <path>` / `/save` | (Winlink) queue an outbound file / save received attachments |
 | `/connect [CALL]` / `/gateways` / `/gateway <CALL>` | (Winlink) run a session / list & pick RMS gateways |
+| `/net open <name>` / `/net ci [call] [note]` | start a net-control session / log a check-in |
+| `/net list` / `/net close` / `/net status` / `/net sessions` | view the roll-call / end the session / current state / session history |
 | `/monitor` | toggle the Monitor view |
 | `/mode` | reminder to press **F3** to change the active transport |
 | `/refresh` | reload conversations |
